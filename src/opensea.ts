@@ -29,11 +29,13 @@ export function extractOpenSeaSlug(input: string): string {
 
     const collectionIndex = parts.indexOf("collection");
 
-    if (collectionIndex === -1 || !parts[collectionIndex + 1]) {
+    const slug = parts[collectionIndex + 1];
+
+    if (collectionIndex === -1 || !slug) {
       throw new Error("Could not find collection slug in OpenSea URL.");
     }
 
-    return parts[collectionIndex + 1];
+    return slug;
   } catch {
     return cleanInput
       .replace(/^\/+/, "")

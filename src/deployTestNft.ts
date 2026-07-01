@@ -3,7 +3,7 @@ import fs from "fs";
 import path from "path";
 import solc from "solc";
 import { ethers } from "ethers";
-import { getWalletByLabel } from "./vault";
+import { getWalletByLabel } from "./vault.js";
 
 const CONTRACT_SOURCE = `
 // SPDX-License-Identifier: MIT

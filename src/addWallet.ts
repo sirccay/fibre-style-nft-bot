@@ -1,6 +1,6 @@
 import "dotenv/config";
 import { input, password } from "@inquirer/prompts";
-import { addWallet } from "./vault";
+import { addWallet } from "./vault.js";
 
 async function main() {
   console.log("\n🔐 Add wallet to encrypted vault");

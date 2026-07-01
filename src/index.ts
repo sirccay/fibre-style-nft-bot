@@ -4,10 +4,10 @@ import path from "path";
 import { randomUUID } from "crypto";
 import { Telegraf, Markup } from "telegraf";
 import { ethers } from "ethers";
-import { listWallets, getWalletByLabel } from "./vault";
-import { getTelegramUserId, requireAdmin } from "./auth";
-import { extractOpenSeaSlug, getOpenSeaCollectionStats, getOpenSeaBestOffer, getOpenSeaBestListing, getOpenSeaNft, getOpenSeaNftsByAccount } from "./opensea";
-import { checkErc721Ownership, createOpenSeaListing, getMainnetProvider, acceptOpenSeaBestOffer } from "./openseaTrading";
+import { listWallets, getWalletByLabel } from "./vault.js";
+import { getTelegramUserId, requireAdmin } from "./auth.js";
+import { extractOpenSeaSlug, getOpenSeaCollectionStats, getOpenSeaBestOffer, getOpenSeaBestListing, getOpenSeaNft, getOpenSeaNftsByAccount } from "./opensea.js";
+import { checkErc721Ownership, createOpenSeaListing, getMainnetProvider, acceptOpenSeaBestOffer } from "./openseaTrading.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -28,6 +28,20 @@ function getProvider() {
 }
 
 const provider = getProvider();
+
+function parseCommandParts(text: string): string[] {
+  return text.trim().split(/\s+/).filter(Boolean);
+}
+
+function getCommandPart(parts: string[], index: number): string {
+  const part = parts[index]?.trim();
+
+  if (!part) {
+    throw new Error("Missing command argument.");
+  }
+
+  return part;
+}
 
 function loadTestNftContract() {
   const filePath = path.join(process.cwd(), "data", "testNft.json");
@@ -50,6 +64,21 @@ type MintRecord = {
   paidEth: string;
   network: string;
   mintedAt: string;
+};
+
+type TestMintContract = ethers.Contract & {
+  PRICE: () => Promise<bigint>;
+  publicMint: ((quantity: number, overrides: { value: bigint }) => Promise<ethers.ContractTransactionResponse>) & {
+    estimateGas: (quantity: number, overrides: { value: bigint }) => Promise<bigint>;
+  };
+  isApprovedForAll: (owner: string, operator: string) => Promise<boolean>;
+  setApprovalForAll: ((operator: string, approved: boolean) => Promise<ethers.ContractTransactionResponse>) & {
+    estimateGas: (operator: string, approved: boolean) => Promise<bigint>;
+  };
+};
+
+type Erc721OwnerContract = ethers.Contract & {
+  ownerOf: (tokenId: string) => Promise<string>;
 };
 
 const MINTS_PATH = path.join(process.cwd(), "data", "mints.json");
@@ -291,7 +320,7 @@ bot.action("code", async (ctx) => {
 bot.command("code", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  const code = ctx.message.text.split(" ")[1];
+  const code = parseCommandParts(ctx.message.text)[1];
 
   if (!code) {
     await ctx.reply("Please send a code like this:\n\n/code YOUR-CODE-HERE");
@@ -389,7 +418,7 @@ Example:
 bot.command("minttest", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  const parts = ctx.message.text.split(" ");
+  const parts = parseCommandParts(ctx.message.text);
 
   if (parts.length < 3) {
     await ctx.reply(
@@ -401,7 +430,8 @@ Use:
     return;
   }
 
-  const [, walletLabel, quantityRaw] = parts;
+  const walletLabel = getCommandPart(parts, 1);
+  const quantityRaw = getCommandPart(parts, 2);
   const quantity = Number(quantityRaw);
 
   if (!Number.isInteger(quantity) || quantity <= 0) {
@@ -422,7 +452,7 @@ Use:
       testNft.contractAddress,
       testNft.abi,
       wallet
-    );
+    ) as unknown as TestMintContract;
 
     const priceWei: bigint = await contract.PRICE();
     const totalCostWei = priceWei * BigInt(quantity);
@@ -552,7 +582,7 @@ Example:
 bot.command("nfts", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  const parts = ctx.message.text.split(" ");
+  const parts = parseCommandParts(ctx.message.text);
   const walletLabel = parts[1]?.trim().toLowerCase();
 
   if (!walletLabel) {
@@ -621,7 +651,7 @@ Only approve trusted marketplace/operator contracts on mainnet.`
 bot.command("approvalstatus", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  const parts = ctx.message.text.split(" ");
+  const parts = parseCommandParts(ctx.message.text);
 
   if (parts.length < 3) {
     await ctx.reply(
@@ -633,7 +663,8 @@ Use:
     return;
   }
 
-  const [, walletLabel, operator] = parts;
+  const walletLabel = getCommandPart(parts, 1);
+  const operator = getCommandPart(parts, 2);
 
   if (!ethers.isAddress(operator)) {
     await ctx.reply("❌ Invalid operator address.");
@@ -648,7 +679,7 @@ Use:
       testNft.contractAddress,
       testNft.abi,
       wallet
-    );
+    ) as unknown as TestMintContract;
 
     const approved: boolean = await contract.isApprovedForAll(
       wallet.address,
@@ -681,7 +712,7 @@ ${error?.shortMessage || error?.message || "Unknown error"}`
 bot.command("approveall", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  const parts = ctx.message.text.split(" ");
+  const parts = parseCommandParts(ctx.message.text);
 
   if (parts.length < 3) {
     await ctx.reply(
@@ -693,7 +724,8 @@ Use:
     return;
   }
 
-  const [, walletLabel, operator] = parts;
+  const walletLabel = getCommandPart(parts, 1);
+  const operator = getCommandPart(parts, 2);
 
   if (!ethers.isAddress(operator)) {
     await ctx.reply("❌ Invalid operator address.");
@@ -713,7 +745,7 @@ Use:
       testNft.contractAddress,
       testNft.abi,
       wallet
-    );
+    ) as unknown as TestMintContract;
 
     const alreadyApproved: boolean = await contract.isApprovedForAll(
       wallet.address,
@@ -803,7 +835,7 @@ ${error?.shortMessage || error?.reason || error?.message || "Unknown error"}`
 bot.command("revokeall", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  const parts = ctx.message.text.split(" ");
+  const parts = parseCommandParts(ctx.message.text);
 
   if (parts.length < 3) {
     await ctx.reply(
@@ -815,7 +847,8 @@ Use:
     return;
   }
 
-  const [, walletLabel, operator] = parts;
+  const walletLabel = getCommandPart(parts, 1);
+  const operator = getCommandPart(parts, 2);
 
   if (!ethers.isAddress(operator)) {
     await ctx.reply("❌ Invalid operator address.");
@@ -830,7 +863,7 @@ Use:
       testNft.contractAddress,
       testNft.abi,
       wallet
-    );
+    ) as unknown as TestMintContract;
 
     await ctx.reply(
       `🧹 Prepping approval revoke...
@@ -988,7 +1021,7 @@ bot.command("topoffer", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
   const raw = ctx.message.text.replace("/topoffer", "").trim();
-  const parts = raw.split(" ").filter(Boolean);
+  const parts = parseCommandParts(raw);
 
   if (parts.length < 2) {
     await ctx.reply(
@@ -1006,8 +1039,8 @@ Example:
     return;
   }
 
-  const collectionInput = parts[0];
-  const tokenId = parts[1];
+  const collectionInput = getCommandPart(parts, 0);
+  const tokenId = getCommandPart(parts, 1);
 
   try {
     const slug = extractOpenSeaSlug(collectionInput);
@@ -1070,7 +1103,7 @@ bot.command("bestlisting", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
   const raw = ctx.message.text.replace("/bestlisting", "").trim();
-  const parts = raw.split(" ").filter(Boolean);
+  const parts = parseCommandParts(raw);
 
   if (parts.length < 2) {
     await ctx.reply(
@@ -1088,8 +1121,8 @@ Example:
     return;
   }
 
-  const collectionInput = parts[0];
-  const tokenId = parts[1];
+  const collectionInput = getCommandPart(parts, 0);
+  const tokenId = getCommandPart(parts, 1);
 
   try {
     const slug = extractOpenSeaSlug(collectionInput);
@@ -1151,7 +1184,7 @@ ${error?.message || "Unknown OpenSea error"}`
 bot.command("oslistpreview", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  const parts = ctx.message.text.split(" ");
+  const parts = parseCommandParts(ctx.message.text);
 
   if (parts.length < 5) {
     await ctx.reply(
@@ -1166,7 +1199,10 @@ Example:
     return;
   }
 
-  const [, walletLabel, contractAddress, tokenId, priceRaw] = parts;
+  const walletLabel = getCommandPart(parts, 1);
+  const contractAddress = getCommandPart(parts, 2);
+  const tokenId = getCommandPart(parts, 3);
+  const priceRaw = getCommandPart(parts, 4);
   const priceEth = Number(priceRaw);
 
   if (!ethers.isAddress(contractAddress)) {
@@ -1231,7 +1267,7 @@ ${error?.message || "Unknown error"}`
 bot.command("oslist", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  const parts = ctx.message.text.split(" ");
+  const parts = parseCommandParts(ctx.message.text);
 
   if (parts.length < 5) {
     await ctx.reply(
@@ -1246,7 +1282,10 @@ Example:
     return;
   }
 
-  const [, walletLabel, contractAddress, tokenId, priceRaw] = parts;
+  const walletLabel = getCommandPart(parts, 1);
+  const contractAddress = getCommandPart(parts, 2);
+  const tokenId = getCommandPart(parts, 3);
+  const priceRaw = getCommandPart(parts, 4);
   const priceEth = Number(priceRaw);
 
   if (!ethers.isAddress(contractAddress)) {
@@ -1309,7 +1348,7 @@ ALLOW_MAINNET_TRADING=true`
 bot.command("osnft", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  const parts = ctx.message.text.split(" ");
+  const parts = parseCommandParts(ctx.message.text);
 
   if (parts.length < 3) {
     await ctx.reply(
@@ -1324,7 +1363,8 @@ Example:
     return;
   }
 
-  const [, contractAddress, tokenId] = parts;
+  const contractAddress = getCommandPart(parts, 1);
+  const tokenId = getCommandPart(parts, 2);
 
   if (!ethers.isAddress(contractAddress)) {
     await ctx.reply("❌ Invalid contract address.");
@@ -1354,7 +1394,7 @@ Token ID: ${tokenId}`
         contractAddress,
         ["function ownerOf(uint256 tokenId) view returns (address)"],
         mainnetProvider
-      );
+      ) as unknown as Erc721OwnerContract;
 
       onchainOwner = await erc721.ownerOf(tokenId);
     } catch {
@@ -1398,7 +1438,7 @@ ${error?.message || "Unknown OpenSea error"}`
 bot.command("listfloorpreview", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  const parts = ctx.message.text.split(" ");
+  const parts = parseCommandParts(ctx.message.text);
 
   if (parts.length < 5) {
     await ctx.reply(
@@ -1413,7 +1453,10 @@ Example:
     return;
   }
 
-  const [, walletLabel, collectionInput, contractAddress, tokenId] = parts;
+  const walletLabel = getCommandPart(parts, 1);
+  const collectionInput = getCommandPart(parts, 2);
+  const contractAddress = getCommandPart(parts, 3);
+  const tokenId = getCommandPart(parts, 4);
 
   if (!ethers.isAddress(contractAddress)) {
     await ctx.reply("❌ Invalid contract address.");
@@ -1490,7 +1533,7 @@ ${error?.message || "Unknown error"}`
 bot.command("listfloor", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  const parts = ctx.message.text.split(" ");
+  const parts = parseCommandParts(ctx.message.text);
 
   if (parts.length < 5) {
     await ctx.reply(
@@ -1505,7 +1548,10 @@ Example:
     return;
   }
 
-  const [, walletLabel, collectionInput, contractAddress, tokenId] = parts;
+  const walletLabel = getCommandPart(parts, 1);
+  const collectionInput = getCommandPart(parts, 2);
+  const contractAddress = getCommandPart(parts, 3);
+  const tokenId = getCommandPart(parts, 4);
 
   if (!ethers.isAddress(contractAddress)) {
     await ctx.reply("❌ Invalid contract address.");
@@ -1604,7 +1650,7 @@ ALLOW_MAINNET_TRADING=true`
 bot.command("postmint", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  const parts = ctx.message.text.split(" ");
+  const parts = parseCommandParts(ctx.message.text);
 
   if (parts.length < 5) {
     await ctx.reply(
@@ -1619,7 +1665,10 @@ Example:
     return;
   }
 
-  const [, walletLabel, collectionInput, contractAddress, tokenId] = parts;
+  const walletLabel = getCommandPart(parts, 1);
+  const collectionInput = getCommandPart(parts, 2);
+  const contractAddress = getCommandPart(parts, 3);
+  const tokenId = getCommandPart(parts, 4);
 
   if (!ethers.isAddress(contractAddress)) {
     await ctx.reply("❌ Invalid contract address.");
@@ -2142,7 +2191,7 @@ No transaction was sent.`
 bot.command("customprice", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  const parts = ctx.message.text.split(" ");
+  const parts = parseCommandParts(ctx.message.text);
 
   if (parts.length < 3) {
     await ctx.reply(
@@ -2160,7 +2209,8 @@ Click "Custom List Preview" from the post-mint menu and it will show you the cor
     return;
   }
 
-  const [, sessionId, priceRaw] = parts;
+  const sessionId = getCommandPart(parts, 1);
+  const priceRaw = getCommandPart(parts, 2);
   const priceEth = Number(priceRaw);
 
   if (!Number.isFinite(priceEth) || priceEth <= 0) {
@@ -2511,7 +2561,7 @@ After scanning, click any NFT to open the post-mint action menu.`
 bot.command("osportfolio", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  const parts = ctx.message.text.split(" ");
+  const parts = parseCommandParts(ctx.message.text);
   const walletLabel = parts[1]?.trim().toLowerCase();
   const limitRaw = parts[2];
 
