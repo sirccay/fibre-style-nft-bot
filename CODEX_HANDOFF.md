@@ -1,0 +1,351 @@
+
+# NFT Telegram Minting Bot — Codex Handoff
+
+
+
+## Project summary
+
+
+
+This is a Node.js + TypeScript Telegram bot for NFT minting and marketplace actions.
+
+
+
+Core stack:
+
+- Node.js
+
+- TypeScript
+
+- Telegraf
+
+- ethers.js v6
+
+- OpenSea API
+
+- OpenSea SDK
+
+- Express wallet import server
+
+- AWS KMS envelope encryption refactor in progress
+
+
+
+## Current implemented features
+
+
+
+### Telegram bot
+
+- `/start` menu
+
+- Admin lock using `ADMIN_TELEGRAM_ID`
+
+- `/whoami`
+
+- Inline button menus
+
+
+
+### Wallet vault
+
+- Initial local encrypted wallet vault built.
+
+- Wallets stored in `data/vault.json`.
+
+- `.env` and `data/*.json` are gitignored.
+
+- Refactor started toward AWS KMS envelope encryption:
+
+  - per-wallet/user DEK
+
+  - DEK wrapped by AWS KMS KEK
+
+  - private key decrypted only in memory at signing time
+
+  - audit logging in `data/kmsAuditLog.json`
+
+
+
+### Wallet onboarding
+
+- Express wallet import server added.
+
+- Local wallet import page runs at:
+
+  `http://localhost:3000/import?token=...`
+
+- Telegram command:
+
+  `/addwallet`
+
+- Telegram command:
+
+  `/mywallets`
+
+- Telegram command:
+
+  `/claimwallet wallet1`
+
+
+
+### Sepolia minting
+
+- Test NFT contract deployed on Sepolia:
+
+  `0x73Ca24ad5D2Db0f1C5d0457895B06F429468cA92`
+
+- Bot can mint test NFT:
+
+  `/minttest wallet1 1`
+
+- Bot detects minted token IDs from Transfer logs.
+
+- Mint history saved to `data/mints.json`.
+
+- `/nfts wallet1` shows minted test NFTs.
+
+
+
+### OpenSea read modules
+
+Implemented commands:
+
+- `/osfloor collection-slug`
+
+- `/topoffer collection-slug tokenId`
+
+- `/bestlisting collection-slug tokenId`
+
+- `/osnft contractAddress tokenId`
+
+- `/osportfolio wallet1`
+
+
+
+These fetch:
+
+- collection floor
+
+- best offer
+
+- best listing
+
+- NFT metadata
+
+- owned NFTs by wallet
+
+
+
+### Marketplace preview modules
+
+Implemented:
+
+- `/oslistpreview wallet1 contractAddress tokenId priceETH`
+
+- `/listfloorpreview wallet1 collectionSlug contractAddress tokenId`
+
+- `/listfloor wallet1 collectionSlug contractAddress tokenId`
+
+- custom listing confirmation
+
+- floor listing confirmation
+
+- accept top offer confirmation
+
+
+
+Mainnet write actions are locked by:
+
+`ALLOW_MAINNET_TRADING=false`
+
+
+
+### Post-mint action menu
+
+Implemented:
+
+`/postmint wallet1 collectionSlug contractAddress tokenId`
+
+
+
+Buttons:
+
+- View NFT
+
+- Floor / Best Listing
+
+- Top Offer
+
+- List at Floor Preview
+
+- Confirm Floor Listing
+
+- Custom List Preview
+
+- Accept Top Offer
+
+- Hold
+
+
+
+## Important environment variables
+
+
+
+Do NOT commit `.env`.
+
+
+
+Expected env vars:
+
+- `TELEGRAM_BOT_TOKEN`
+
+- `ADMIN_TELEGRAM_ID`
+
+- `OPENSEA_API_KEY`
+
+- `RPC_URL_SEPOLIA`
+
+- `ETH_MAINNET_RPC_URL`
+
+- `ALLOW_MAINNET_TRADING=false`
+
+- `WALLET_IMPORT_PORT=3000`
+
+- `WALLET_IMPORT_BASE_URL=http://localhost:3000`
+
+- `VAULT_SECRET` only for legacy local vault compatibility
+
+- `AWS_REGION`
+
+- `KMS_KEY_ID`
+
+- `AWS_ACCESS_KEY_ID`
+
+- `AWS_SECRET_ACCESS_KEY`
+
+
+
+## Critical security decisions
+
+
+
+If is not advisable to allow users to paste private keys directly into Telegram chat., then you can implement that wallet import should happen through a Telegram Mini App.
+
+
+
+Production wallet storage should use AWS KMS envelope encryption:
+
+- private key encrypted with a per-wallet DEK
+
+- DEK wrapped by AWS KMS KEK
+
+- KEK never leaves KMS
+
+- decrypt only in memory at signing time
+
+- log every decrypt/sign event
+
+- no plaintext private keys in logs/errors/Sentry
+
+
+
+## Current next tasks
+
+
+
+1. Finish AWS KMS vault refactor.
+
+2. Fix any TypeScript errors caused by making `getWalletByLabel` async.
+
+3. Convert all user-facing wallet lookups to owner-scoped access:
+
+   use `getWalletByLabelForOwner(...)` instead of global label lookup.
+
+4. Replace JSON storage with PostgreSQL or SQLite first.
+
+5. Add rate limits around decrypt/sign actions.
+
+6. Add production audit logs separate from main DB.
+
+7. Host wallet import page on HTTPS.
+
+8. Convert wallet import page into Telegram Mini App later.
+
+9. Test real OpenSea listing with a cheap NFT owned by a vault wallet.
+
+10. Test accept top offer flow safely.
+
+11. Add OpenSea mint/drop link parser.
+
+12. Add mint phase detection.
+
+13. Add FCFS speed layer:
+
+    - private RPC
+
+    - prebuilt tx
+
+    - gas strategy
+
+    - retry strategy
+
+    - parallel wallet execution
+
+14. Add subscription/user access system.
+
+15. Deploy backend safely.
+
+
+
+## Important files
+
+
+
+- `src/index.ts` — main Telegram bot
+
+- `src/vault.ts` — wallet vault / KMS encryption
+
+- `src/audit.ts` — audit logging
+
+- `src/walletImport.ts` — local wallet import server
+
+- `src/opensea.ts` — OpenSea read helpers
+
+- `src/openseaTrading.ts` — OpenSea listing/offer write helpers
+
+- `src/deployTestNft.ts` — Sepolia test NFT deploy script
+
+- `src/addWallet.ts` — terminal wallet import script
+
+
+
+## Testing commands
+
+
+
+Run bot:
+
+`npm run dev`
+
+
+
+Deploy Sepolia test NFT:
+
+`npm run deploy:testnft`
+
+
+
+Add wallet through terminal:
+
+`npm run wallet:add`
+
+
+
+TypeScript check:
+
+`npx tsc --noEmit`
+
+
+
