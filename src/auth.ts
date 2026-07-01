@@ -14,7 +14,7 @@ export function isAdmin(ctx: Context): boolean {
   const adminId = process.env.ADMIN_TELEGRAM_ID;
 
   if (!adminId) {
-    return true;
+    return false;
   }
 
   const userId = getTelegramUserId(ctx);
@@ -23,6 +23,13 @@ export function isAdmin(ctx: Context): boolean {
 }
 
 export async function requireAdmin(ctx: Context): Promise<boolean> {
+  if (!process.env.ADMIN_TELEGRAM_ID) {
+    await ctx.reply(
+      "❌ ADMIN_TELEGRAM_ID is not set. Run /whoami in Telegram, then add that ID to your .env before using sensitive commands."
+    );
+    return false;
+  }
+
   if (isAdmin(ctx)) {
     return true;
   }

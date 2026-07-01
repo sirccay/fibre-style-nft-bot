@@ -1,13 +1,17 @@
 import "dotenv/config";
 import { ethers } from "ethers";
 import { OpenSeaSDK, Chain } from "@opensea/sdk";
-import { getWalletByLabel } from "./vault";
-import { getOpenSeaBestOffer } from "./opensea";
+import { getWalletByLabel } from "./vault.js";
+import { getOpenSeaBestOffer } from "./opensea.js";
 
 const ERC721_READ_ABI = [
   "function ownerOf(uint256 tokenId) view returns (address)",
   "function isApprovedForAll(address owner, address operator) view returns (bool)"
 ];
+
+type Erc721ReadContract = ethers.Contract & {
+  ownerOf: (tokenId: string) => Promise<string>;
+};
 
 export function getMainnetProvider() {
   const rpcUrl = process.env.ETH_MAINNET_RPC_URL;
@@ -31,7 +35,7 @@ export async function checkErc721Ownership(params: {
     params.contractAddress,
     ERC721_READ_ABI,
     provider
-  );
+  ) as unknown as Erc721ReadContract;
 
   const owner: string = await contract.ownerOf(params.tokenId);
   const ownsToken = owner.toLowerCase() === wallet.address.toLowerCase();
