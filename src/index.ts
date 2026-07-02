@@ -6,6 +6,7 @@ import type { Context } from "telegraf";
 import { Telegraf, Markup } from "telegraf";
 import { ethers } from "ethers";
 import {
+  addWallet,
   listWalletsForOwner,
   getWalletAddressByLabelForOwner,
   getWalletSignerByLabelForOwner
@@ -13,7 +14,7 @@ import {
 import { getTelegramUserId, requireAdmin } from "./auth.js";
 import { extractOpenSeaSlug, getOpenSeaCollectionStats, getOpenSeaBestOffer, getOpenSeaBestListing, getOpenSeaNft, getOpenSeaNftsByAccount } from "./opensea.js";
 import { checkErc721Ownership, createOpenSeaListing, getMainnetProvider, acceptOpenSeaBestOffer } from "./openseaTrading.js";
-import { appendSessionAuditLog } from "./audit.js";
+import { appendSessionAuditLog, appendWalletAuditLog } from "./audit.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -104,6 +105,328 @@ function getSafeErrorMessage(error: unknown): string {
 
 function logSafeError(context: string, error: unknown) {
   console.error(`${context}: ${getSafeErrorMessage(error)}`);
+}
+
+type TelegramWalletImportContext = Context & {
+  message: {
+    text: string;
+  };
+};
+
+type ParsedWalletImportRow =
+  | {
+      type: "wallet";
+      rowNumber: number;
+      label?: string;
+      privateKey: string;
+    }
+  | {
+      type: "skip";
+      rowNumber: number;
+      reason: string;
+    };
+
+type ImportedTelegramWallet = {
+  label: string;
+  address: string;
+};
+
+type SkippedTelegramWallet = {
+  rowNumber: number;
+  reason: string;
+};
+
+const WALLET_IMPORT_LABEL_PATTERN = /^[A-Za-z0-9_-]{2,32}$/;
+
+function isPrivateChat(ctx: Context): boolean {
+  return ctx.chat?.type === "private";
+}
+
+async function tryDeleteSensitiveTelegramMessage(ctx: Context) {
+  try {
+    await (ctx as any).deleteMessage();
+  } catch {
+    // Best effort only. The bot may lack permission or Telegram may reject it.
+  }
+}
+
+function extractWalletImportPayload(text: string): string {
+  return text.trimStart().replace(
+    /^\/(?:addwallet|importwallet|import_wallet)(?:@[A-Za-z0-9_]+)?(?:\s+|$)/i,
+    ""
+  );
+}
+
+function normalizeWalletImportLabel(label: string): string {
+  return label.trim().toLowerCase();
+}
+
+function isValidWalletImportLabel(label: string): boolean {
+  return WALLET_IMPORT_LABEL_PATTERN.test(label);
+}
+
+function parseWalletImportRows(payload: string): ParsedWalletImportRow[] {
+  const rows: ParsedWalletImportRow[] = [];
+  let rowNumber = 0;
+
+  for (const rawLine of payload.split(/\r?\n/)) {
+    const line = rawLine.trim();
+
+    if (!line) {
+      continue;
+    }
+
+    rowNumber += 1;
+
+    const parts = line.split(/\s+/);
+
+    if (parts.length === 1 && parts[0]) {
+      rows.push({
+        type: "wallet",
+        rowNumber,
+        privateKey: parts[0]
+      });
+      continue;
+    }
+
+    if (parts.length === 2 && parts[0] && parts[1]) {
+      rows.push({
+        type: "wallet",
+        rowNumber,
+        label: parts[0],
+        privateKey: parts[1]
+      });
+      continue;
+    }
+
+    rows.push({
+      type: "skip",
+      rowNumber,
+      reason: "Expected privateKey or label privateKey"
+    });
+  }
+
+  return rows;
+}
+
+function getNextAutoWalletLabel(usedLabels: Set<string>): string {
+  let index = 1;
+
+  while (usedLabels.has(`wallet${index}`)) {
+    index += 1;
+  }
+
+  return `wallet${index}`;
+}
+
+async function auditTelegramWalletImport(
+  ownerTelegramId: string | null,
+  action: string,
+  details: {
+    importedCount?: number;
+    skippedCount?: number;
+    reason?: string;
+  } = {}
+) {
+  await appendWalletAuditLog({
+    ownerTelegramId,
+    action,
+    ...details
+  });
+}
+
+function getWalletImportUsageMessage() {
+  return `Use one of these formats:
+
+/addwallet walletLabel privateKey
+
+Or:
+/addwallet
+privateKey1
+privateKey2
+
+Or:
+/addwallet
+wallet1 privateKey1
+wallet2 privateKey2`;
+}
+
+function buildWalletImportSummary(
+  imported: ImportedTelegramWallet[],
+  skipped: SkippedTelegramWallet[]
+) {
+  const title =
+    skipped.length === 0
+      ? "✅ Wallet import complete."
+      : imported.length > 0
+        ? "⚠️ Wallet import finished with issues."
+        : "❌ Wallet import rejected.";
+
+  const lines = [
+    title,
+    "",
+    `Imported: ${imported.length}`,
+    `Skipped: ${skipped.length}`
+  ];
+
+  if (imported.length > 0) {
+    lines.push("", imported.length === 1 ? "Wallet:" : "Wallets:");
+
+    for (const wallet of imported) {
+      lines.push(`- ${wallet.label}: ${wallet.address}`);
+    }
+
+    lines.push("", "Your wallets were encrypted with Azure Key Vault.");
+  }
+
+  if (skipped.length > 0) {
+    lines.push("", "Skipped:");
+
+    for (const skippedRow of skipped) {
+      lines.push(`- row ${skippedRow.rowNumber}: ${skippedRow.reason}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+async function handleTelegramWalletImport(ctx: TelegramWalletImportContext) {
+  await tryDeleteSensitiveTelegramMessage(ctx);
+
+  if (!isPrivateChat(ctx)) {
+    await ctx.reply("Wallet import only works in private chat.");
+    return;
+  }
+
+  if (!(await requireAdmin(ctx))) return;
+
+  const ownerTelegramId = getRequiredTelegramUserId(ctx);
+
+  await ctx.reply(
+    "Import received. If Telegram did not remove your private key message automatically, please delete it from your chat history."
+  );
+
+  await auditTelegramWalletImport(ownerTelegramId, "wallet_import_from_telegram_started");
+
+  const payload = extractWalletImportPayload(ctx.message.text);
+  const rows = parseWalletImportRows(payload);
+
+  if (rows.length === 0) {
+    await auditTelegramWalletImport(
+      ownerTelegramId,
+      "wallet_import_from_telegram_rejected",
+      {
+        importedCount: 0,
+        skippedCount: 0,
+        reason: "missing_wallet_rows"
+      }
+    );
+    await ctx.reply(getWalletImportUsageMessage());
+    return;
+  }
+
+  const existingWallets = await listWalletsForOwner(ownerTelegramId);
+  const usedLabels = new Set(
+    existingWallets.map((wallet) => normalizeWalletImportLabel(wallet.label))
+  );
+  const addressToLabel = new Map(
+    existingWallets.map((wallet) => [
+      wallet.address.toLowerCase(),
+      normalizeWalletImportLabel(wallet.label)
+    ])
+  );
+  const imported: ImportedTelegramWallet[] = [];
+  const skipped: SkippedTelegramWallet[] = [];
+
+  for (const row of rows) {
+    if (row.type === "skip") {
+      skipped.push({
+        rowNumber: row.rowNumber,
+        reason: row.reason
+      });
+      continue;
+    }
+
+    let parsedWallet: ethers.Wallet;
+
+    try {
+      parsedWallet = new ethers.Wallet(row.privateKey);
+    } catch {
+      skipped.push({
+        rowNumber: row.rowNumber,
+        reason: "Invalid private key"
+      });
+      continue;
+    }
+
+    const walletAddressLower = parsedWallet.address.toLowerCase();
+    const existingLabel = addressToLabel.get(walletAddressLower);
+
+    if (existingLabel) {
+      skipped.push({
+        rowNumber: row.rowNumber,
+        reason: `Wallet address already exists under label ${existingLabel}`
+      });
+      continue;
+    }
+
+    const walletLabel = row.label
+      ? normalizeWalletImportLabel(row.label)
+      : getNextAutoWalletLabel(usedLabels);
+
+    if (!isValidWalletImportLabel(walletLabel)) {
+      skipped.push({
+        rowNumber: row.rowNumber,
+        reason: "Invalid wallet label"
+      });
+      continue;
+    }
+
+    if (usedLabels.has(walletLabel)) {
+      skipped.push({
+        rowNumber: row.rowNumber,
+        reason: "Wallet label already exists"
+      });
+      continue;
+    }
+
+    try {
+      const saved = await addWallet(
+        walletLabel,
+        row.privateKey,
+        ownerTelegramId
+      );
+
+      imported.push({
+        label: saved.label,
+        address: saved.address
+      });
+      usedLabels.add(saved.label);
+      addressToLabel.set(saved.address.toLowerCase(), saved.label);
+    } catch (error) {
+      skipped.push({
+        rowNumber: row.rowNumber,
+        reason: getSafeErrorMessage(error)
+      });
+    }
+  }
+
+  const auditAction =
+    imported.length > 0 && skipped.length === 0
+      ? "wallet_import_from_telegram_success"
+      : imported.length > 0
+        ? "wallet_import_from_telegram_partial"
+        : "wallet_import_from_telegram_rejected";
+
+  await auditTelegramWalletImport(ownerTelegramId, auditAction, {
+    importedCount: imported.length,
+    skippedCount: skipped.length,
+    ...(skipped.length > 0
+      ? { reason: skipped.map((row) => row.reason).join("; ").slice(0, 500) }
+      : {})
+  });
+
+  await ctx.reply(buildWalletImportSummary(imported, skipped));
 }
 
 function loadTestNftContract() {
@@ -653,6 +976,12 @@ bot.command("code", async (ctx) => {
   }
 });
 
+for (const command of ["addwallet", "importwallet", "import_wallet"]) {
+  bot.command(command, async (ctx) => {
+    await handleTelegramWalletImport(ctx as TelegramWalletImportContext);
+  });
+}
+
 bot.action("wallet_status", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
@@ -667,6 +996,8 @@ bot.action("wallet_status", async (ctx) => {
         `❌ No wallets found.
 
 Add one first from Terminal:
+
+Use /addwallet in private chat, or:
 
 npm run wallet:add`
       );
@@ -701,7 +1032,9 @@ bot.command("wallets", async (ctx) => {
     const wallets = await listWalletsForOwner(ownerTelegramId);
 
     if (wallets.length === 0) {
-      await ctx.reply("No wallets found. Add one with:\n\nnpm run wallet:add");
+      await ctx.reply(
+        "No wallets found. Add one with /addwallet in private chat, or:\n\nnpm run wallet:add"
+      );
       return;
     }
 

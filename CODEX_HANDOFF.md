@@ -97,19 +97,31 @@ Core stack:
 
 ### Wallet onboarding
 
-- Express wallet import server added.
+- Telegram private-chat wallet import is the current onboarding path.
 
-- Local wallet import page runs at:
-
-  `http://localhost:3000/import?token=...`
-
-- Telegram command:
+- Commands:
 
   `/addwallet`
 
-- Telegram command:
+  `/importwallet`
 
-  `/mywallets`
+  `/import_wallet`
+
+- Supported Telegram import formats:
+
+  `/addwallet walletLabel privateKey`
+
+  `/addwallet` followed by one private key per line
+
+  `/addwallet` followed by `walletLabel privateKey` rows
+
+- Telegram wallet import only works in private chat, attempts to delete the incoming private-key message, stores each wallet with `ownerTelegramId = ctx.from.id`, and encrypts through Azure Key Vault envelope encryption before writing to `data/vault.json`.
+
+- Invalid rows, duplicate labels, and duplicate wallet addresses for the same owner are skipped without echoing private keys.
+
+- Terminal wallet add remains available:
+
+  `npm run wallet:add`
 
 - Local owner claim command for old vault records:
 
@@ -380,7 +392,7 @@ Runtime testing still needed with real Azure credentials and a real Azure Key Va
 
 - `src/audit.ts` — audit logging
 
-- `src/walletImport.ts` — local wallet import server
+- `src/claimWallet.ts` — local owner claim tool for old ownerless vault records
 
 - `src/opensea.ts` — OpenSea read helpers
 
@@ -411,6 +423,10 @@ Deploy Sepolia test NFT:
 Add wallet through terminal:
 
 `npm run wallet:add`
+
+Add wallet through Telegram private chat:
+
+`/addwallet wallet1 <private-key>`
 
 Claim an old ownerless wallet record:
 
