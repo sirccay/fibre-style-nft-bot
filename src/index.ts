@@ -13,6 +13,7 @@ import {
 import { getTelegramUserId, requireAdmin } from "./auth.js";
 import { extractOpenSeaSlug, getOpenSeaCollectionStats, getOpenSeaBestOffer, getOpenSeaBestListing, getOpenSeaNft, getOpenSeaNftsByAccount } from "./opensea.js";
 import { checkErc721Ownership, createOpenSeaListing, getMainnetProvider, acceptOpenSeaBestOffer } from "./openseaTrading.js";
+import { appendSessionAuditLog } from "./audit.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -62,9 +63,40 @@ function getRequiredTelegramUserId(ctx: Context): string {
   return userId;
 }
 
+function redactSensitiveText(text: string): string {
+  const sensitiveEnvNames = [
+    "AZURE_CLIENT_SECRET",
+    "TELEGRAM_BOT_TOKEN",
+    "SEPOLIA_RPC_URL",
+    "ETH_SEPOLIA_RPC_URL",
+    "ETH_MAINNET_RPC_URL",
+    "OPENSEA_API_KEY",
+    "VAULT_SECRET"
+  ];
+
+  let redacted = text;
+
+  for (const name of sensitiveEnvNames) {
+    const value = process.env[name];
+
+    if (value && value.length >= 8) {
+      redacted = redacted.split(value).join("[REDACTED]");
+    }
+  }
+
+  return redacted
+    .replace(/0x[a-fA-F0-9]{64}/g, "[REDACTED_HEX_SECRET]")
+    .replace(
+      /([?&](?:api[_-]?key|key|token|secret)=)[^&\s]+/gi,
+      "$1[REDACTED]"
+    );
+}
+
 function getSafeErrorMessage(error: unknown): string {
   if (error instanceof Error && error.message) {
-    return (error.message.split("\n")[0] || error.message).slice(0, 300);
+    return redactSensitiveText(
+      (error.message.split("\n")[0] || error.message).slice(0, 300)
+    );
   }
 
   return "Unknown error";
@@ -86,6 +118,7 @@ function loadTestNftContract() {
 }
 
 type MintRecord = {
+  ownerTelegramId?: string;
   walletLabel: string;
   walletAddress: string;
   contractAddress: string;
@@ -186,14 +219,26 @@ function getMintedTokenIdsFromReceipt(
 }
 
 
+type PostMintActionStatus = "active" | "cancelled" | "used" | "expired";
+
 type PostMintActionSession = {
-  id: string;
+  sessionId: string;
+  ownerTelegramId: string;
   walletLabel: string;
+  walletAddress: string;
   collectionSlug: string;
   contractAddress: string;
   tokenId: string;
   network: "ethereum" | "sepolia";
   createdAt: string;
+  expiresAt: string;
+  status: PostMintActionStatus;
+  customPriceEth?: number;
+};
+
+type ValidatedPostMintActionSession = {
+  action: PostMintActionSession;
+  actorTelegramId: string;
 };
 
 const POST_MINT_ACTIONS_PATH = path.join(
@@ -201,26 +246,73 @@ const POST_MINT_ACTIONS_PATH = path.join(
   "data",
   "postMintActions.json"
 );
+const POST_MINT_SESSION_TTL_MS = 30 * 60 * 1000;
+const ACTION_SESSION_EXPIRED_MESSAGE =
+  "This action session has expired. Please open the NFT actions again.";
+const ACTION_ALREADY_USED_OR_CANCELLED_MESSAGE =
+  "This action has already been used or cancelled.";
 
-function loadPostMintActions(): PostMintActionSession[] {
-  if (!fs.existsSync(POST_MINT_ACTIONS_PATH)) {
-    return [];
-  }
-
-  const raw = fs.readFileSync(POST_MINT_ACTIONS_PATH, "utf8");
-
-  if (!raw.trim()) {
-    return [];
-  }
-
-  const parsed = JSON.parse(raw);
-  return parsed.actions || [];
+function isPostMintActionStatus(value: unknown): value is PostMintActionStatus {
+  return (
+    value === "active" ||
+    value === "cancelled" ||
+    value === "used" ||
+    value === "expired"
+  );
 }
 
-function savePostMintAction(action: PostMintActionSession) {
-  const actions = loadPostMintActions();
-  actions.push(action);
+function normalizeStoredPostMintAction(raw: any): PostMintActionSession | null {
+  const sessionId =
+    typeof raw?.sessionId === "string"
+      ? raw.sessionId
+      : typeof raw?.id === "string"
+        ? raw.id
+        : null;
 
+  if (!sessionId) {
+    return null;
+  }
+
+  const createdAt =
+    typeof raw.createdAt === "string" ? raw.createdAt : new Date().toISOString();
+  const createdAtMs = Date.parse(createdAt);
+  const fallbackExpiresAt = new Date(
+    (Number.isFinite(createdAtMs) ? createdAtMs : Date.now()) +
+      POST_MINT_SESSION_TTL_MS
+  ).toISOString();
+  const status = isPostMintActionStatus(raw.status) ? raw.status : "active";
+  const customPriceEth =
+    typeof raw.customPriceEth === "number" && Number.isFinite(raw.customPriceEth)
+      ? raw.customPriceEth
+      : undefined;
+
+  return {
+    sessionId,
+    ownerTelegramId:
+      typeof raw.ownerTelegramId === "string" ? raw.ownerTelegramId : "",
+    walletLabel: typeof raw.walletLabel === "string" ? raw.walletLabel : "",
+    walletAddress:
+      typeof raw.walletAddress === "string" ? raw.walletAddress : "",
+    collectionSlug:
+      typeof raw.collectionSlug === "string" ? raw.collectionSlug : "",
+    contractAddress:
+      typeof raw.contractAddress === "string" ? raw.contractAddress : "",
+    tokenId: typeof raw.tokenId === "string" ? raw.tokenId : "",
+    network: raw.network === "sepolia" ? "sepolia" : "ethereum",
+    createdAt,
+    expiresAt:
+      typeof raw.expiresAt === "string" ? raw.expiresAt : fallbackExpiresAt,
+    status,
+    ...(customPriceEth === undefined ? {} : { customPriceEth })
+  };
+}
+
+function isPostMintActionExpired(action: PostMintActionSession): boolean {
+  const expiresAtMs = Date.parse(action.expiresAt);
+  return !Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now();
+}
+
+function writePostMintActions(actions: PostMintActionSession[]) {
   const dir = path.dirname(POST_MINT_ACTIONS_PATH);
 
   if (!fs.existsSync(dir)) {
@@ -234,30 +326,225 @@ function savePostMintAction(action: PostMintActionSession) {
   );
 }
 
-function createPostMintActionSession(params: {
+function loadPostMintActions(): PostMintActionSession[] {
+  if (!fs.existsSync(POST_MINT_ACTIONS_PATH)) {
+    return [];
+  }
+
+  const raw = fs.readFileSync(POST_MINT_ACTIONS_PATH, "utf8");
+
+  if (!raw.trim()) {
+    return [];
+  }
+
+  const parsed = JSON.parse(raw);
+  const rawActions: any[] = Array.isArray(parsed.actions) ? parsed.actions : [];
+  const actions = rawActions
+    .map(normalizeStoredPostMintAction)
+    .filter((action): action is PostMintActionSession => Boolean(action));
+
+  let changed = actions.length !== rawActions.length;
+
+  for (const action of actions) {
+    if (action.status === "active" && isPostMintActionExpired(action)) {
+      action.status = "expired";
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    writePostMintActions(actions);
+  }
+
+  return actions;
+}
+
+function savePostMintAction(action: PostMintActionSession) {
+  const actions = loadPostMintActions();
+  actions.push(action);
+  writePostMintActions(actions);
+}
+
+function updatePostMintActionSession(updated: PostMintActionSession) {
+  const actions = loadPostMintActions();
+  const index = actions.findIndex(
+    (action) => action.sessionId === updated.sessionId
+  );
+
+  if (index === -1) {
+    actions.push(updated);
+  } else {
+    actions[index] = updated;
+  }
+
+  writePostMintActions(actions);
+}
+
+async function auditPostMintSession(
+  action: PostMintActionSession,
+  auditAction: string,
+  actorTelegramId: string | null,
+  reason?: string
+) {
+  await appendSessionAuditLog({
+    sessionId: action.sessionId,
+    ownerTelegramId: action.ownerTelegramId || null,
+    actorTelegramId,
+    walletLabel: action.walletLabel,
+    walletAddress: action.walletAddress,
+    collectionSlug: action.collectionSlug,
+    contractAddress: action.contractAddress,
+    tokenId: action.tokenId,
+    action: auditAction,
+    status: action.status,
+    ...(reason ? { reason } : {})
+  });
+}
+
+async function createPostMintActionSession(params: {
+  ownerTelegramId: string;
   walletLabel: string;
+  walletAddress: string;
   collectionSlug: string;
   contractAddress: string;
   tokenId: string;
   network?: "ethereum" | "sepolia";
 }) {
+  const createdAt = new Date();
   const action: PostMintActionSession = {
-    id: randomUUID(),
+    sessionId: randomUUID(),
+    ownerTelegramId: params.ownerTelegramId,
     walletLabel: params.walletLabel,
+    walletAddress: params.walletAddress,
     collectionSlug: params.collectionSlug,
     contractAddress: params.contractAddress,
     tokenId: params.tokenId,
     network: params.network || "ethereum",
-    createdAt: new Date().toISOString()
+    createdAt: createdAt.toISOString(),
+    expiresAt: new Date(
+      createdAt.getTime() + POST_MINT_SESSION_TTL_MS
+    ).toISOString(),
+    status: "active"
   };
 
   savePostMintAction(action);
+  await auditPostMintSession(action, "session.created", params.ownerTelegramId);
   return action;
 }
 
 function getPostMintActionSession(id: string) {
   const actions = loadPostMintActions();
-  return actions.find((action) => action.id === id) || null;
+  return actions.find((action) => action.sessionId === id) || null;
+}
+
+async function validatePostMintActionSession(
+  ctx: Context,
+  sessionId: string,
+  actionName: string,
+  options: { finalAction?: boolean } = {}
+): Promise<ValidatedPostMintActionSession | null> {
+  const actorTelegramId = getTelegramUserId(ctx);
+
+  if (!actorTelegramId) {
+    await ctx.reply("❌ Could not verify your Telegram account for this action.");
+    return null;
+  }
+
+  const action = getPostMintActionSession(sessionId);
+
+  if (!action) {
+    await ctx.reply("❌ This post-mint session was not found.");
+    return null;
+  }
+
+  if (!action.ownerTelegramId || !action.walletAddress) {
+    action.status = "expired";
+    updatePostMintActionSession(action);
+    await auditPostMintSession(
+      action,
+      options.finalAction
+        ? "final_action.blocked_expired"
+        : "session.expired_rejected",
+      actorTelegramId,
+      `${actionName}:missing_owner_scope`
+    );
+    await ctx.reply(ACTION_SESSION_EXPIRED_MESSAGE);
+    return null;
+  }
+
+  if (action.ownerTelegramId !== actorTelegramId) {
+    await auditPostMintSession(
+      action,
+      options.finalAction
+        ? "final_action.blocked_wrong_user"
+        : "session_action.blocked_wrong_user",
+      actorTelegramId,
+      actionName
+    );
+    await ctx.reply("❌ This action is not available for your Telegram account.");
+    return null;
+  }
+
+  if (action.status === "expired" || isPostMintActionExpired(action)) {
+    action.status = "expired";
+    updatePostMintActionSession(action);
+    await auditPostMintSession(
+      action,
+      options.finalAction
+        ? "final_action.blocked_expired"
+        : "session.expired_rejected",
+      actorTelegramId,
+      actionName
+    );
+    await ctx.reply(ACTION_SESSION_EXPIRED_MESSAGE);
+    return null;
+  }
+
+  if (action.status === "used" || action.status === "cancelled") {
+    await auditPostMintSession(
+      action,
+      options.finalAction
+        ? "final_action.blocked_already_used"
+        : "session_action.blocked_already_used",
+      actorTelegramId,
+      actionName
+    );
+    await ctx.reply(ACTION_ALREADY_USED_OR_CANCELLED_MESSAGE);
+    return null;
+  }
+
+  return { action, actorTelegramId };
+}
+
+async function markPostMintActionStatus(
+  action: PostMintActionSession,
+  actorTelegramId: string,
+  status: PostMintActionStatus,
+  auditAction: string,
+  reason?: string
+) {
+  const updated = {
+    ...action,
+    status
+  };
+
+  updatePostMintActionSession(updated);
+  await auditPostMintSession(updated, auditAction, actorTelegramId, reason);
+
+  return updated;
+}
+
+function setPostMintCustomPrice(
+  action: PostMintActionSession,
+  priceEth: number
+) {
+  const updated = {
+    ...action,
+    customPriceEth: priceEth
+  };
+
+  updatePostMintActionSession(updated);
+  return updated;
 }
 
 async function sendPostMintActionMenu(ctx: any, action: PostMintActionSession) {
@@ -269,17 +556,18 @@ Collection: ${action.collectionSlug}
 Contract: ${action.contractAddress}
 Token ID: ${action.tokenId}
 Network: ${action.network}
+Expires: ${action.expiresAt}
 
 Choose what you want to do next:`,
     Markup.inlineKeyboard([
-      [Markup.button.callback("🖼 View NFT", `pm:view:${action.id}`)],
-      [Markup.button.callback("📊 Floor / Best Listing", `pm:floor:${action.id}`)],
-      [Markup.button.callback("💰 Top Offer", `pm:offer:${action.id}`)],
-      [Markup.button.callback("🚨 Accept Top Offer", `pm:acceptofferpreview:${action.id}`)],
-      [Markup.button.callback("🏷 List at Floor Preview", `pm:listfloor:${action.id}`)],
-      [Markup.button.callback("✅ Confirm Floor Listing", `pm:floorconfirmpreview:${action.id}`)],
-      [Markup.button.callback("✍️ Custom List Preview", `pm:custom:${action.id}`)],
-      [Markup.button.callback("🧊 Hold", `pm:hold:${action.id}`)]
+      [Markup.button.callback("🖼 View NFT", `pm:view:${action.sessionId}`)],
+      [Markup.button.callback("📊 Floor / Best Listing", `pm:floor:${action.sessionId}`)],
+      [Markup.button.callback("💰 Top Offer", `pm:offer:${action.sessionId}`)],
+      [Markup.button.callback("🚨 Accept Top Offer", `pm:acceptofferpreview:${action.sessionId}`)],
+      [Markup.button.callback("🏷 List at Floor Preview", `pm:listfloor:${action.sessionId}`)],
+      [Markup.button.callback("✅ Confirm Floor Listing", `pm:floorconfirmpreview:${action.sessionId}`)],
+      [Markup.button.callback("✍️ Custom List Preview", `pm:custom:${action.sessionId}`)],
+      [Markup.button.callback("🧊 Hold", `pm:hold:${action.sessionId}`)]
     ])
   );
 }
@@ -559,6 +847,7 @@ ${getSafeErrorMessage(confirmationError)}`
       );
 
       saveMint({
+        ownerTelegramId,
         walletLabel,
         walletAddress: wallet.address,
         contractAddress: testNft.contractAddress,
@@ -648,31 +937,55 @@ Use:
     return;
   }
 
-  const mints = loadMints().filter(
-    (mint) => mint.walletLabel.toLowerCase() === walletLabel
-  );
+  let walletAddress: string;
 
-  if (mints.length === 0) {
-    await ctx.reply(`No minted NFTs found for "${walletLabel}" yet.`);
-    return;
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    walletAddress = await getWalletAddressByLabelForOwner(
+      walletLabel,
+      ownerTelegramId
+    );
+
+    const walletAddressLower = walletAddress.toLowerCase();
+    const mints = loadMints().filter(
+      (mint) =>
+        mint.walletLabel.toLowerCase() === walletLabel &&
+        (mint.ownerTelegramId === ownerTelegramId ||
+          (!mint.ownerTelegramId &&
+            mint.walletAddress.toLowerCase() === walletAddressLower))
+    );
+
+    if (mints.length === 0) {
+      await ctx.reply(`No minted NFTs found for "${walletLabel}" yet.`);
+      return;
+    }
+
+    let message = `🖼 NFTs for ${walletLabel}\n\n`;
+
+    for (const mint of mints) {
+      const tokenText =
+        mint.tokenIds.length > 0
+          ? mint.tokenIds.map((id) => `#${id}`).join(", ")
+          : "Unknown token ID";
+
+      message += `Contract: ${mint.contractAddress}\n`;
+      message += `Token ID(s): ${tokenText}\n`;
+      message += `Qty: ${mint.quantity}\n`;
+      message += `Paid: ${mint.paidEth} ETH\n`;
+      message += `Tx: ${mint.txHash}\n\n`;
+    }
+
+    await ctx.reply(message);
+  } catch (error: any) {
+    logSafeError("Could not list minted NFTs", error);
+
+    await ctx.reply(
+      `❌ Could not load NFTs for this wallet.
+
+Reason:
+${error?.message || "Unknown error"}`
+    );
   }
-
-  let message = `🖼 NFTs for ${walletLabel}\n\n`;
-
-  for (const mint of mints) {
-    const tokenText =
-      mint.tokenIds.length > 0
-        ? mint.tokenIds.map((id) => `#${id}`).join(", ")
-        : "Unknown token ID";
-
-    message += `Contract: ${mint.contractAddress}\n`;
-    message += `Token ID(s): ${tokenText}\n`;
-    message += `Qty: ${mint.quantity}\n`;
-    message += `Paid: ${mint.paidEth} ETH\n`;
-    message += `Tx: ${mint.txHash}\n\n`;
-  }
-
-  await ctx.reply(message);
 });
 
 
@@ -1750,10 +2063,17 @@ Example:
   }
 
   try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
     const collectionSlug = extractOpenSeaSlug(collectionInput);
-
-    const action = createPostMintActionSession({
+    const walletAddress = await getWalletAddressByLabelForOwner(
       walletLabel,
+      ownerTelegramId
+    );
+
+    const action = await createPostMintActionSession({
+      ownerTelegramId,
+      walletLabel,
+      walletAddress,
       collectionSlug,
       contractAddress,
       tokenId,
@@ -1779,12 +2099,13 @@ bot.action(/^pm:view:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
 
   const id = (ctx as any).match[1];
-  const action = getPostMintActionSession(id);
+  const validated = await validatePostMintActionSession(ctx, id, "view-nft");
 
-  if (!action) {
-    await ctx.reply("❌ This post-mint session was not found.");
+  if (!validated) {
     return;
   }
+
+  const { action } = validated;
 
   try {
     if (action.network !== "ethereum") {
@@ -1826,12 +2147,13 @@ bot.action(/^pm:floor:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
 
   const id = (ctx as any).match[1];
-  const action = getPostMintActionSession(id);
+  const validated = await validatePostMintActionSession(ctx, id, "market-snapshot");
 
-  if (!action) {
-    await ctx.reply("❌ This post-mint session was not found.");
+  if (!validated) {
     return;
   }
+
+  const { action } = validated;
 
   try {
     await ctx.reply(
@@ -1890,12 +2212,13 @@ bot.action(/^pm:offer:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
 
   const id = (ctx as any).match[1];
-  const action = getPostMintActionSession(id);
+  const validated = await validatePostMintActionSession(ctx, id, "top-offer");
 
-  if (!action) {
-    await ctx.reply("❌ This post-mint session was not found.");
+  if (!validated) {
     return;
   }
+
+  const { action } = validated;
 
   try {
     await ctx.reply(
@@ -1951,12 +2274,17 @@ bot.action(/^pm:listfloor:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
 
   const id = (ctx as any).match[1];
-  const action = getPostMintActionSession(id);
+  const validated = await validatePostMintActionSession(
+    ctx,
+    id,
+    "list-floor-preview"
+  );
 
-  if (!action) {
-    await ctx.reply("❌ This post-mint session was not found.");
+  if (!validated) {
     return;
   }
+
+  const { action } = validated;
 
   try {
     await ctx.reply(
@@ -1976,7 +2304,7 @@ Token ID: ${action.tokenId}`
 
     const ownership = await checkErc721Ownership({
       walletLabel: action.walletLabel,
-      ownerTelegramId: getRequiredTelegramUserId(ctx),
+      ownerTelegramId: action.ownerTelegramId,
       contractAddress: action.contractAddress,
       tokenId: action.tokenId
     });
@@ -2018,12 +2346,17 @@ bot.action(/^pm:custom:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
 
   const id = (ctx as any).match[1];
-  const action = getPostMintActionSession(id);
+  const validated = await validatePostMintActionSession(
+    ctx,
+    id,
+    "custom-list-preview"
+  );
 
-  if (!action) {
-    await ctx.reply("❌ This post-mint session was not found.");
+  if (!validated) {
     return;
   }
+
+  const { action } = validated;
 
   await ctx.reply(
     `✍️ Custom Listing
@@ -2033,10 +2366,10 @@ ${action.collectionSlug} #${action.tokenId}
 
 Send your custom price like this:
 
-/customprice ${id} PRICE_ETH
+/customprice ${action.sessionId} PRICE_ETH
 
 Example:
-/customprice ${id} 0.03
+/customprice ${action.sessionId} 0.03
 
 The bot will check ownership and then show a final confirmation button before listing.`
   );
@@ -2048,12 +2381,19 @@ bot.action(/^pm:hold:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
 
   const id = (ctx as any).match[1];
-  const action = getPostMintActionSession(id);
+  const validated = await validatePostMintActionSession(ctx, id, "hold");
 
-  if (!action) {
-    await ctx.reply("❌ This post-mint session was not found.");
+  if (!validated) {
     return;
   }
+
+  const action = await markPostMintActionStatus(
+    validated.action,
+    validated.actorTelegramId,
+    "cancelled",
+    "session.cancelled",
+    "hold"
+  );
 
   await ctx.reply(
     `🧊 Holding NFT.
@@ -2073,12 +2413,17 @@ bot.action(/^pm:floorconfirmpreview:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
 
   const id = (ctx as any).match[1];
-  const action = getPostMintActionSession(id);
+  const validated = await validatePostMintActionSession(
+    ctx,
+    id,
+    "floor-confirm-preview"
+  );
 
-  if (!action) {
-    await ctx.reply("❌ This post-mint session was not found.");
+  if (!validated) {
     return;
   }
+
+  const { action } = validated;
 
   try {
     await ctx.reply(
@@ -2101,7 +2446,7 @@ Checking floor price and ownership again...`
 
     const ownership = await checkErc721Ownership({
       walletLabel: action.walletLabel,
-      ownerTelegramId: getRequiredTelegramUserId(ctx),
+      ownerTelegramId: action.ownerTelegramId,
       contractAddress: action.contractAddress,
       tokenId: action.tokenId
     });
@@ -2136,8 +2481,8 @@ ALLOW_MAINNET_TRADING=${process.env.ALLOW_MAINNET_TRADING || "false"}
 
 If live trading is false, the next button will NOT create a listing.`,
       Markup.inlineKeyboard([
-        [Markup.button.callback("🚨 Confirm Live List at Floor", `pm:floorlistfinal:${action.id}`)],
-        [Markup.button.callback("❌ Cancel", `pm:cancel:${action.id}`)]
+        [Markup.button.callback("🚨 Confirm Live List at Floor", `pm:floorlistfinal:${action.sessionId}`)],
+        [Markup.button.callback("❌ Cancel", `pm:cancel:${action.sessionId}`)]
       ])
     );
   } catch (error: any) {
@@ -2158,12 +2503,24 @@ bot.action(/^pm:floorlistfinal:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
 
   const id = (ctx as any).match[1];
-  const action = getPostMintActionSession(id);
+  const validated = await validatePostMintActionSession(
+    ctx,
+    id,
+    "floor-list-final",
+    { finalAction: true }
+  );
 
-  if (!action) {
-    await ctx.reply("❌ This post-mint session was not found.");
+  if (!validated) {
     return;
   }
+
+  const action = await markPostMintActionStatus(
+    validated.action,
+    validated.actorTelegramId,
+    "used",
+    "final_action.confirmed",
+    "floor-list-final"
+  );
 
   try {
     await ctx.reply(
@@ -2181,7 +2538,7 @@ Re-checking current floor price and wallet ownership before listing...`
 
     const ownership = await checkErc721Ownership({
       walletLabel: action.walletLabel,
-      ownerTelegramId: getRequiredTelegramUserId(ctx),
+      ownerTelegramId: action.ownerTelegramId,
       contractAddress: action.contractAddress,
       tokenId: action.tokenId
     });
@@ -2209,7 +2566,7 @@ Price: ${stats.floorPrice} ETH`
 
     const result = await createOpenSeaListing({
       walletLabel: action.walletLabel,
-      ownerTelegramId: getRequiredTelegramUserId(ctx),
+      ownerTelegramId: action.ownerTelegramId,
       contractAddress: action.contractAddress,
       tokenId: action.tokenId,
       priceEth: Number(stats.floorPrice)
@@ -2247,12 +2604,19 @@ bot.action(/^pm:cancel:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
 
   const id = (ctx as any).match[1];
-  const action = getPostMintActionSession(id);
+  const validated = await validatePostMintActionSession(ctx, id, "cancel");
 
-  if (!action) {
-    await ctx.reply("Cancelled.");
+  if (!validated) {
     return;
   }
+
+  const action = await markPostMintActionStatus(
+    validated.action,
+    validated.actorTelegramId,
+    "cancelled",
+    "session.cancelled",
+    "cancel"
+  );
 
   await ctx.reply(
     `❌ Action cancelled.
@@ -2301,14 +2665,19 @@ Click "Custom List Preview" from the post-mint menu and it will show you the cor
     return;
   }
 
-  const action = getPostMintActionSession(sessionId);
+  const validated = await validatePostMintActionSession(
+    ctx,
+    sessionId,
+    "custom-price"
+  );
 
-  if (!action) {
-    await ctx.reply("❌ This post-mint session was not found.");
+  if (!validated) {
     return;
   }
 
   try {
+    const action = setPostMintCustomPrice(validated.action, priceEth);
+
     await ctx.reply(
       `✍️ Preparing custom listing confirmation...
 
@@ -2323,7 +2692,7 @@ Checking ownership...`
 
     const ownership = await checkErc721Ownership({
       walletLabel: action.walletLabel,
-      ownerTelegramId: getRequiredTelegramUserId(ctx),
+      ownerTelegramId: action.ownerTelegramId,
       contractAddress: action.contractAddress,
       tokenId: action.tokenId
     });
@@ -2358,7 +2727,7 @@ ALLOW_MAINNET_TRADING=${process.env.ALLOW_MAINNET_TRADING || "false"}
 
 If live trading is false, the confirm button will NOT create a listing.`,
       Markup.inlineKeyboard([
-        [Markup.button.callback("🚨 Confirm Custom Listing", `pm:customlistfinal:${sessionId}:${priceEth}`)],
+        [Markup.button.callback("🚨 Confirm Custom Listing", `pm:customlistfinal:${sessionId}`)],
         [Markup.button.callback("❌ Cancel", `pm:cancel:${sessionId}`)]
       ])
     );
@@ -2374,26 +2743,37 @@ ${error?.message || "Unknown error"}`
   }
 });
 
-bot.action(/^pm:customlistfinal:([^:]+):(.+)$/, async (ctx) => {
+bot.action(/^pm:customlistfinal:(.+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
   await ctx.answerCbQuery();
 
   const sessionId = (ctx as any).match[1];
-  const priceRaw = (ctx as any).match[2];
-  const priceEth = Number(priceRaw);
+  const validated = await validatePostMintActionSession(
+    ctx,
+    sessionId,
+    "custom-list-final",
+    { finalAction: true }
+  );
 
-  if (!Number.isFinite(priceEth) || priceEth <= 0) {
-    await ctx.reply("❌ Invalid custom listing price.");
+  if (!validated) {
     return;
   }
 
-  const action = getPostMintActionSession(sessionId);
+  const priceEth = validated.action.customPriceEth;
 
-  if (!action) {
-    await ctx.reply("❌ This post-mint session was not found.");
+  if (!Number.isFinite(priceEth) || !priceEth || priceEth <= 0) {
+    await ctx.reply("❌ Invalid custom listing price. Please open the custom listing preview again.");
     return;
   }
+
+  const action = await markPostMintActionStatus(
+    validated.action,
+    validated.actorTelegramId,
+    "used",
+    "final_action.confirmed",
+    "custom-list-final"
+  );
 
   try {
     await ctx.reply(
@@ -2404,7 +2784,7 @@ Re-checking ownership before submitting...`
 
     const ownership = await checkErc721Ownership({
       walletLabel: action.walletLabel,
-      ownerTelegramId: getRequiredTelegramUserId(ctx),
+      ownerTelegramId: action.ownerTelegramId,
       contractAddress: action.contractAddress,
       tokenId: action.tokenId
     });
@@ -2432,7 +2812,7 @@ Price: ${priceEth} ETH`
 
     const result = await createOpenSeaListing({
       walletLabel: action.walletLabel,
-      ownerTelegramId: getRequiredTelegramUserId(ctx),
+      ownerTelegramId: action.ownerTelegramId,
       contractAddress: action.contractAddress,
       tokenId: action.tokenId,
       priceEth
@@ -2472,12 +2852,17 @@ bot.action(/^pm:acceptofferpreview:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
 
   const id = (ctx as any).match[1];
-  const action = getPostMintActionSession(id);
+  const validated = await validatePostMintActionSession(
+    ctx,
+    id,
+    "accept-offer-preview"
+  );
 
-  if (!action) {
-    await ctx.reply("❌ This post-mint session was not found.");
+  if (!validated) {
     return;
   }
+
+  const { action } = validated;
 
   try {
     await ctx.reply(
@@ -2508,7 +2893,7 @@ Token ID: ${action.tokenId}`
 
     const ownership = await checkErc721Ownership({
       walletLabel: action.walletLabel,
-      ownerTelegramId: getRequiredTelegramUserId(ctx),
+      ownerTelegramId: action.ownerTelegramId,
       contractAddress: action.contractAddress,
       tokenId: action.tokenId
     });
@@ -2546,8 +2931,8 @@ ALLOW_MAINNET_TRADING=${process.env.ALLOW_MAINNET_TRADING || "false"}
 
 If you confirm, this will sell the NFT for the top offer when live trading is enabled.`,
       Markup.inlineKeyboard([
-        [Markup.button.callback("🚨 Confirm Accept Top Offer", `pm:acceptofferfinal:${action.id}`)],
-        [Markup.button.callback("❌ Cancel", `pm:cancel:${action.id}`)]
+        [Markup.button.callback("🚨 Confirm Accept Top Offer", `pm:acceptofferfinal:${action.sessionId}`)],
+        [Markup.button.callback("❌ Cancel", `pm:cancel:${action.sessionId}`)]
       ])
     );
   } catch (error: any) {
@@ -2568,12 +2953,24 @@ bot.action(/^pm:acceptofferfinal:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
 
   const id = (ctx as any).match[1];
-  const action = getPostMintActionSession(id);
+  const validated = await validatePostMintActionSession(
+    ctx,
+    id,
+    "accept-offer-final",
+    { finalAction: true }
+  );
 
-  if (!action) {
-    await ctx.reply("❌ This post-mint session was not found.");
+  if (!validated) {
     return;
   }
+
+  const action = await markPostMintActionStatus(
+    validated.action,
+    validated.actorTelegramId,
+    "used",
+    "final_action.confirmed",
+    "accept-offer-final"
+  );
 
   try {
     await ctx.reply(
@@ -2584,7 +2981,7 @@ Re-checking ownership and latest top offer before submitting...`
 
     const result = await acceptOpenSeaBestOffer({
       walletLabel: action.walletLabel,
-      ownerTelegramId: getRequiredTelegramUserId(ctx),
+      ownerTelegramId: action.ownerTelegramId,
       collectionSlug: action.collectionSlug,
       contractAddress: action.contractAddress,
       tokenId: action.tokenId
@@ -2669,9 +3066,10 @@ Or:
   }
 
   try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
     const walletAddress = await getWalletAddressByLabelForOwner(
       walletLabel,
-      getRequiredTelegramUserId(ctx)
+      ownerTelegramId
     );
 
     await ctx.reply(
@@ -2704,8 +3102,10 @@ ${walletAddress}`
     const buttons: any[] = [];
 
     for (const nft of portfolio.nfts) {
-      const action = createPostMintActionSession({
+      const action = await createPostMintActionSession({
+        ownerTelegramId,
         walletLabel,
+        walletAddress,
         collectionSlug: nft.collectionSlug,
         contractAddress: nft.contractAddress,
         tokenId: nft.identifier,
@@ -2722,7 +3122,7 @@ ${walletAddress}`
       buttons.push([
         Markup.button.callback(
           `🖼 ${shortName}`,
-          `pf:open:${action.id}`
+          `pf:open:${action.sessionId}`
         )
       ]);
     }
@@ -2748,14 +3148,17 @@ bot.action(/^pf:open:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
 
   const id = (ctx as any).match[1];
-  const action = getPostMintActionSession(id);
+  const validated = await validatePostMintActionSession(
+    ctx,
+    id,
+    "portfolio-open"
+  );
 
-  if (!action) {
-    await ctx.reply("❌ Portfolio session not found.");
+  if (!validated) {
     return;
   }
 
-  await sendPostMintActionMenu(ctx, action);
+  await sendPostMintActionMenu(ctx, validated.action);
 });
 
 
