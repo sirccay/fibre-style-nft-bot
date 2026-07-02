@@ -23,6 +23,10 @@ type WalletAuditEvent = {
   chain?: string;
   functionSignature?: string;
   quantity?: number;
+  candidateFunctions?: string[];
+  phaseStatus?: string;
+  phaseTypeEstimate?: string;
+  phaseTypeConfidence?: string;
   txHash?: string;
   reason?: string;
 };
@@ -46,6 +50,10 @@ type SessionAuditEvent = {
   chain?: string;
   functionSignature?: string;
   quantity?: number;
+  candidateFunctions?: string[];
+  phaseStatus?: string;
+  phaseTypeEstimate?: string;
+  phaseTypeConfidence?: string;
   txHash?: string;
   action: string;
   status?: string;

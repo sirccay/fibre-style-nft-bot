@@ -248,6 +248,73 @@ Core stack:
 - Mint audit events include `mint_previewed`, `mint_confirmation_created`, `mint_blocked`, `mint_submitted`, `mint_confirmed`, `mint_failed`, `mint_target_created`, `mint_target_updated`, `mint_target_archived`, and `mint_run_viewed`.
 
 
+### Mint parser and phase detector
+
+- Mint link parser command:
+
+  - `/parsemintlink URL_OR_TEXT`
+
+- Draft target creation from parser:
+
+  - `/addmintfromlink URL_OR_TEXT mintName`
+
+- Function detection commands:
+
+  - `/detectmintfunction 0xCONTRACT mainnet`
+
+  - `/detecttargetfunction targetId`
+
+- Phase and readiness commands:
+
+  - `/checkmintphase targetId`
+
+  - `/checkminteligibility targetId wallet1`
+
+  - `/checkmintreadiness targetId wallet1`
+
+- Target metadata refresh:
+
+  - `/refreshtarget targetId`
+
+- Parser status:
+
+  - `/parserstatus`
+
+- Supported parser inputs:
+
+  - OpenSea collection URLs
+
+  - OpenSea asset URLs
+
+  - Zora collect URLs where chain/address is visible
+
+  - Etherscan, Basescan, Arbiscan, and Polygonscan address links
+
+  - raw `0x...` contract addresses
+
+  - generic URL/text with a visible contract address
+
+- Function detection is read-only and scans runtime bytecode for selectors of the supported mint functions. Selector presence is not proof the function is callable.
+
+- Phase detection is read-only and probes common boolean, time, price, and supply view functions with `eth_call`.
+
+- Phase type estimates support team, holder, GTD, FCFS, and public phase aliases. These are evidence-based estimates only.
+
+- Parser-created mint targets may be incomplete. Complete them with `/updateminttarget targetId functionSignature quantity priceEth chain` before `/minttargetpreview` or `/minttargetnow`.
+
+- Parser commands do not send transactions, do not schedule mints, and do not bypass project mint rules.
+
+- Future parser upgrades still needed:
+
+  - Reservoir mint stages
+
+  - Etherscan ABI lookup
+
+  - 4byte selector lookup
+
+  - transaction-history price inference
+
+
 
 ### OpenSea read modules
 
