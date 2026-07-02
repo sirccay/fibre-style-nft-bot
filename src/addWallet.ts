@@ -20,7 +20,7 @@ async function main() {
   console.log("\n✅ Wallet added successfully.");
   console.log(`Label: ${saved.label}`);
   console.log(`Address: ${saved.address}`);
-  console.log("\nPrivate key was encrypted with AWS KMS envelope encryption into data/vault.json");
+  console.log("\nPrivate key was encrypted with Azure Key Vault envelope encryption into data/vault.json");
 }
 
 main().catch((error) => {
