@@ -3,7 +3,7 @@ import fs from "fs";
 import path from "path";
 import solc from "solc";
 import { ethers } from "ethers";
-import { getWalletSignerByLabel } from "./vault.js";
+import { getWalletSignerByLabelForOwner } from "./vault.js";
 
 const CONTRACT_SOURCE = `
 // SPDX-License-Identifier: MIT
@@ -88,6 +88,32 @@ contract TestMintNFT {
 }
 `;
 
+function getSafeErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : "Unknown error";
+  const sensitiveEnvNames = [
+    "AZURE_CLIENT_SECRET",
+    "SEPOLIA_RPC_URL",
+    "ETH_SEPOLIA_RPC_URL"
+  ];
+
+  let redacted = message;
+
+  for (const name of sensitiveEnvNames) {
+    const value = process.env[name];
+
+    if (value && value.length >= 8) {
+      redacted = redacted.split(value).join("[REDACTED]");
+    }
+  }
+
+  return redacted
+    .replace(/0x[a-fA-F0-9]{64}/g, "[REDACTED_HEX_SECRET]")
+    .replace(
+      /([?&](?:api[_-]?key|key|token|secret)=)[^&\s]+/gi,
+      "$1[REDACTED]"
+    );
+}
+
 function compileContract() {
   const input = {
     language: "Solidity",
@@ -136,13 +162,25 @@ function getSepoliaRpcUrl(): string {
   return rpcUrl;
 }
 
+function getDeployOwnerTelegramId(): string {
+  const ownerTelegramId =
+    process.env.WALLET_OWNER_TELEGRAM_ID || process.env.ADMIN_TELEGRAM_ID;
+
+  if (!ownerTelegramId) {
+    throw new Error("Missing WALLET_OWNER_TELEGRAM_ID or ADMIN_TELEGRAM_ID in .env");
+  }
+
+  return ownerTelegramId;
+}
+
 async function main() {
   const walletLabel = process.argv[2] || "wallet1";
 
   const provider = new ethers.JsonRpcProvider(getSepoliaRpcUrl());
 
-  const wallet = await getWalletSignerByLabel(
+  const wallet = await getWalletSignerByLabelForOwner(
     walletLabel,
+    getDeployOwnerTelegramId(),
     provider,
     "deploy-test-nft"
   );
@@ -199,6 +237,6 @@ async function main() {
 
 main().catch((error) => {
   console.error("\n❌ Deployment failed:");
-  console.error(error instanceof Error ? error.message : "Unknown error");
+  console.error(getSafeErrorMessage(error));
   process.exit(1);
 });
