@@ -194,17 +194,13 @@ function saveVault(wallets: WalletRecord[]) {
   );
 }
 
-function recordMatchesOwner(record: WalletRecord, ownerTelegramId?: string) {
-  if (!ownerTelegramId) {
-    return true;
-  }
-
-  return record.ownerTelegramId === ownerTelegramId || !record.ownerTelegramId;
+function recordMatchesOwner(record: WalletRecord, ownerTelegramId: string) {
+  return record.ownerTelegramId === ownerTelegramId;
 }
 
 function findWalletRecordByLabel(
   label: string,
-  ownerTelegramId?: string
+  ownerTelegramId: string
 ): WalletRecord {
   const normalizedLabel = normalizeLabel(label);
 
@@ -214,24 +210,14 @@ function findWalletRecordByLabel(
 
   const wallets = loadVault();
 
-  const ownerScopedRecord = ownerTelegramId
-    ? wallets.find(
-        (wallet) =>
-          wallet.label === normalizedLabel &&
-          wallet.ownerTelegramId === ownerTelegramId
-      )
-    : null;
-
-  const fallbackRecord = wallets.find(
+  const record = wallets.find(
     (wallet) =>
       wallet.label === normalizedLabel &&
       recordMatchesOwner(wallet, ownerTelegramId)
   );
 
-  const record = ownerScopedRecord || fallbackRecord;
-
   if (!record) {
-    throw new Error(`Wallet "${normalizedLabel}" not found.`);
+    throw new Error(`Wallet "${normalizedLabel}" not found for this Telegram user.`);
   }
 
   return record;
@@ -252,13 +238,17 @@ function toWalletSummary(wallet: WalletRecord): WalletSummary {
 export async function addWallet(
   label: string,
   privateKey: string,
-  ownerTelegramId?: string
+  ownerTelegramId: string
 ) {
   const normalizedLabel = normalizeLabel(label);
   const normalizedOwnerTelegramId = normalizeOwnerTelegramId(ownerTelegramId);
 
   if (!normalizedLabel) {
     throw new Error("Wallet label is required.");
+  }
+
+  if (!normalizedOwnerTelegramId) {
+    throw new Error("Owner Telegram ID is required.");
   }
 
   const wallet = new ethers.Wallet(privateKey);
@@ -269,14 +259,7 @@ export async function addWallet(
       return false;
     }
 
-    if (!normalizedOwnerTelegramId) {
-      return true;
-    }
-
-    return (
-      savedWallet.ownerTelegramId === normalizedOwnerTelegramId ||
-      !savedWallet.ownerTelegramId
-    );
+    return savedWallet.ownerTelegramId === normalizedOwnerTelegramId;
   });
 
   if (labelExists) {
@@ -298,9 +281,7 @@ export async function addWallet(
     id: randomUUID(),
     label: normalizedLabel,
     address: wallet.address,
-    ...(normalizedOwnerTelegramId
-      ? { ownerTelegramId: normalizedOwnerTelegramId }
-      : {}),
+    ownerTelegramId: normalizedOwnerTelegramId,
     encryptedPrivateKey: encrypted.encryptedPrivateKey,
     wrappedDek: encrypted.wrappedDek,
     kmsProvider: encrypted.kmsProvider,
@@ -320,8 +301,12 @@ export async function addWallet(
   };
 }
 
-export async function listWallets(ownerTelegramId?: string) {
+export async function listWallets(ownerTelegramId: string) {
   const normalizedOwnerTelegramId = normalizeOwnerTelegramId(ownerTelegramId);
+
+  if (!normalizedOwnerTelegramId) {
+    throw new Error("Owner Telegram ID is required.");
+  }
 
   return loadVault()
     .filter((wallet) => recordMatchesOwner(wallet, normalizedOwnerTelegramId))
@@ -352,11 +337,6 @@ export async function getWalletAddressByLabelForOwner(
   return record.address;
 }
 
-export async function getWalletAddressByLabel(label: string) {
-  const record = findWalletRecordByLabel(label);
-  return record.address;
-}
-
 export async function getWalletSignerByLabelForOwner(
   label: string,
   ownerTelegramId: string,
@@ -376,27 +356,6 @@ export async function getWalletSignerByLabelForOwner(
     walletLabel: record.label,
     walletAddress: record.address,
     ownerTelegramId: record.ownerTelegramId || normalizedOwnerTelegramId,
-    action,
-    encryptionVersion
-  });
-
-  const privateKey = await decryptPrivateKeyForRecord(record);
-
-  return new ethers.Wallet(privateKey, provider);
-}
-
-export async function getWalletSignerByLabel(
-  label: string,
-  provider: ethers.Provider,
-  action: string
-) {
-  const record = findWalletRecordByLabel(label);
-  const encryptionVersion = getRecordEncryptionVersion(record);
-
-  await appendWalletAuditLog({
-    walletLabel: record.label,
-    walletAddress: record.address,
-    ownerTelegramId: record.ownerTelegramId || null,
     action,
     encryptionVersion
   });

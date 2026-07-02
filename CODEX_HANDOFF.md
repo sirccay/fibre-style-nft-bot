@@ -77,11 +77,21 @@ Core stack:
 
   - private key decrypted only in memory at signing time
 
-  - `ownerTelegramId` stored on new wallet records when available
+  - `ownerTelegramId` is required on new wallet records
 
   - decrypt/sign audit logging in `data/kmsAuditLog.json`
 
   - temporary legacy local vault read support remains for old records that require `VAULT_SECRET`
+
+- Old ownerless wallet records can be claimed locally without re-importing private keys:
+
+  `npm run wallet:claim -- azuretest1 7558749410`
+
+- If a wallet already has an owner, use `--force` only after verifying the reassignment:
+
+  `npm run wallet:claim -- azuretest1 7558749410 --force`
+
+- The claim script updates only `ownerTelegramId`, writes a `wallet_owner_claimed` audit entry, and does not decrypt, unwrap, re-encrypt, or modify `encryptedPrivateKey`, `wrappedDek`, `kmsProvider`, or `kmsKeyRef`.
 
 
 
@@ -101,9 +111,9 @@ Core stack:
 
   `/mywallets`
 
-- Telegram command:
+- Local owner claim command for old vault records:
 
-  `/claimwallet wallet1`
+  `npm run wallet:claim -- walletLabel ownerTelegramId`
 
 
 
@@ -223,7 +233,7 @@ Expected env vars:
 
 - `OPENSEA_API_KEY`
 
-- `RPC_URL_SEPOLIA`
+- `SEPOLIA_RPC_URL` or `ETH_SEPOLIA_RPC_URL`
 
 - `ETH_MAINNET_RPC_URL`
 
@@ -300,6 +310,8 @@ Runtime testing still needed with real Azure credentials and a real Azure Key Va
 
 - `npm run wallet:add`
 
+- `npm run wallet:claim -- oldOwnerlessWalletLabel 7558749410`
+
 - `/wallets`
 
 - wallet status button
@@ -316,11 +328,9 @@ Runtime testing still needed with real Azure credentials and a real Azure Key Va
 
 1. Runtime-test Azure Key Vault envelope encryption with real Azure credentials.
 
-2. Migrate or re-save any legacy local vault records into `kms-envelope-v1`.
+2. Claim old ownerless wallet records with `npm run wallet:claim -- walletLabel ownerTelegramId`.
 
-3. Convert all user-facing wallet lookups to owner-scoped access:
-
-   use `getWalletByLabelForOwner(...)` instead of global label lookup.
+3. Migrate or re-save any legacy local vault records into `kms-envelope-v1`.
 
 4. Replace JSON storage with PostgreSQL or SQLite first.
 
@@ -401,6 +411,10 @@ Deploy Sepolia test NFT:
 Add wallet through terminal:
 
 `npm run wallet:add`
+
+Claim an old ownerless wallet record:
+
+`npm run wallet:claim -- azuretest1 7558749410`
 
 
 
