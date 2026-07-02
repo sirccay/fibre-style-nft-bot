@@ -3,7 +3,7 @@ import fs from "fs";
 import path from "path";
 import solc from "solc";
 import { ethers } from "ethers";
-import { getWalletByLabel } from "./vault.js";
+import { getWalletSignerByLabel } from "./vault.js";
 
 const CONTRACT_SOURCE = `
 // SPDX-License-Identifier: MIT
@@ -134,7 +134,11 @@ async function main() {
     ? new ethers.JsonRpcProvider(rpcUrl)
     : ethers.getDefaultProvider("sepolia");
 
-  const wallet = getWalletByLabel(walletLabel, provider);
+  const wallet = await getWalletSignerByLabel(
+    walletLabel,
+    provider,
+    "deploy-test-nft"
+  );
 
   console.log("\n🚀 Deploying TestMintNFT to Sepolia...");
   console.log(`Using wallet: ${walletLabel}`);
@@ -188,6 +192,6 @@ async function main() {
 
 main().catch((error) => {
   console.error("\n❌ Deployment failed:");
-  console.error(error);
+  console.error(error instanceof Error ? error.message : "Unknown error");
   process.exit(1);
 });
