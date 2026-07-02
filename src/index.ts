@@ -4230,7 +4230,12 @@ async function startBot() {
     await registerTelegramCommandMenu();
   }
 
-  await bot.launch();
+  const launchPromise = bot.launch();
+
+  launchPromise.catch((error) => {
+    logSafeError("Bot launch failed", error);
+    process.exit(1);
+  });
 
   console.log("Bot is running...");
   console.log("Admin lock + NFT mint module loaded.");
