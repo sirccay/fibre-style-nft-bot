@@ -10,6 +10,10 @@ type WalletAuditEvent = {
   encryptionVersion?: string;
   importedCount?: number;
   skippedCount?: number;
+  network?: string;
+  newWalletLabel?: string;
+  sessionId?: string;
+  status?: string;
   reason?: string;
 };
 
