@@ -22,14 +22,18 @@ if (!token) {
 
 const bot = new Telegraf(token);
 
-function getProvider() {
-  const rpcUrl = process.env.RPC_URL_SEPOLIA;
+function getSepoliaRpcUrl(): string {
+  const rpcUrl = process.env.SEPOLIA_RPC_URL || process.env.ETH_SEPOLIA_RPC_URL;
 
-  if (rpcUrl) {
-    return new ethers.JsonRpcProvider(rpcUrl);
+  if (!rpcUrl) {
+    throw new Error("Missing SEPOLIA_RPC_URL or ETH_SEPOLIA_RPC_URL");
   }
 
-  return ethers.getDefaultProvider("sepolia");
+  return rpcUrl;
+}
+
+function getProvider() {
+  return new ethers.JsonRpcProvider(getSepoliaRpcUrl());
 }
 
 const provider = getProvider();
@@ -520,15 +524,30 @@ Estimating gas...`
     });
 
     await ctx.reply(
-      `⏳ Mint transaction sent.
+      `✅ Mint transaction sent.
+
+Tx:
+${tx.hash}`
+    );
+
+    let receipt: ethers.TransactionReceipt | null;
+
+    try {
+      receipt = await tx.wait();
+    } catch (confirmationError) {
+      logSafeError("Mint confirmation wait failed", confirmationError);
+
+      await ctx.reply(
+        `⚠️ Mint transaction was sent, but confirmation could not be verified yet.
 
 Tx:
 ${tx.hash}
 
-Waiting for confirmation...`
-    );
-
-    const receipt = await tx.wait();
+Reason:
+${getSafeErrorMessage(confirmationError)}`
+      );
+      return;
+    }
 
     if (receipt?.status === 1) {
       const contractInterface = new ethers.Interface(testNft.abi);
