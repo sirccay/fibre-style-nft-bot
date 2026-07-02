@@ -49,7 +49,9 @@ Core stack:
 
 - Inline button menus
 
-- Telegram slash command menu registration on startup with safe warning-only failure handling
+- Telegram slash command menu should be managed manually through BotFather.
+
+- Automatic startup registration is disabled by default. Set `REGISTER_TELEGRAM_COMMANDS=true` only if you want the bot to attempt `setMyCommands` on startup.
 
 - `/help` command with command examples
 

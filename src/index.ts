@@ -153,6 +153,10 @@ function logSafeError(context: string, error: unknown) {
   console.error(`${context}: ${getSafeErrorMessage(error)}`);
 }
 
+function shouldRegisterTelegramCommands(): boolean {
+  return process.env.REGISTER_TELEGRAM_COMMANDS?.trim().toLowerCase() === "true";
+}
+
 function withTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
@@ -4222,11 +4226,20 @@ bot.action(/^pf:open:(.+)$/, async (ctx) => {
 });
 
 async function startBot() {
-  await registerTelegramCommandMenu();
+  if (shouldRegisterTelegramCommands()) {
+    await registerTelegramCommandMenu();
+  }
+
   await bot.launch();
 
   console.log("Bot is running...");
   console.log("Admin lock + NFT mint module loaded.");
+
+  if (!shouldRegisterTelegramCommands()) {
+    console.log(
+      "Telegram command menu registration skipped. Manage slash commands through BotFather, or set REGISTER_TELEGRAM_COMMANDS=true to enable startup registration."
+    );
+  }
 }
 
 startBot().catch((error) => {
