@@ -20,6 +20,7 @@ import { checkErc721Ownership, createOpenSeaListing, getMainnetProvider, acceptO
 import { appendSessionAuditLog, appendWalletAuditLog } from "./audit.js";
 import {
   MAINNET_MINTING_DISABLED_MESSAGE,
+  getMintProvider,
   getMintRpcStatus,
   isMainnetMintingEnabled,
   normalizeMintChain,
@@ -37,9 +38,12 @@ import type {
 } from "./mintEngine.js";
 import {
   archiveMintTargetForOwner,
+  calculateMintTargetCompleteness,
   createMintTarget,
+  getMintTargetMissingFields,
   getMintTargetForOwner,
   listMintTargetsForOwner,
+  updateMintTargetDetectedMetadataForOwner,
   updateMintTargetForOwner
 } from "./mintTargets.js";
 import type { MintTarget } from "./mintTargets.js";
@@ -50,6 +54,18 @@ import {
   updateMintRunForOwner
 } from "./mintRuns.js";
 import type { MintRun, MintRunStatus } from "./mintRuns.js";
+import {
+  detectMint,
+  detectMintFunctions,
+  toSupportedMintChain
+} from "./mintDetector.js";
+import type {
+  DetectedChainName,
+  MintDetectionResult,
+  MintFunctionCandidate
+} from "./mintDetector.js";
+import { detectMintPhase } from "./mintPhaseDetector.js";
+import type { MintPhaseDetectionResult } from "./mintPhaseDetector.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -88,6 +104,15 @@ const BOT_COMMANDS = [
   { command: "minthistory", description: "Show mint history" },
   { command: "mintstatus", description: "Show mint run status" },
   { command: "mintingstatus", description: "Show minting lock status" },
+  { command: "parsemintlink", description: "Parse mint link" },
+  { command: "addmintfromlink", description: "Create mint target from link" },
+  { command: "detectmintfunction", description: "Detect mint functions" },
+  { command: "detecttargetfunction", description: "Detect target functions" },
+  { command: "checkmintphase", description: "Check mint phase" },
+  { command: "checkminteligibility", description: "Estimate mint eligibility" },
+  { command: "checkmintreadiness", description: "Check mint readiness" },
+  { command: "refreshtarget", description: "Refresh mint target metadata" },
+  { command: "parserstatus", description: "Show parser status" },
   { command: "help", description: "Show commands" }
 ];
 
@@ -309,6 +334,15 @@ Minting:
 /minthistory
 /mintstatus runId
 /mintingstatus
+/parsemintlink https://opensea.io/collection/collectionSlug
+/addmintfromlink https://opensea.io/collection/collectionSlug mintName
+/detectmintfunction 0xCONTRACT mainnet
+/detecttargetfunction targetId
+/checkmintphase targetId
+/checkminteligibility targetId wallet1
+/checkmintreadiness targetId wallet1
+/refreshtarget targetId
+/parserstatus
 
 Testing:
 /minttest wallet1 1`;
@@ -697,15 +731,20 @@ async function auditMintAction(details: {
   targetId?: string | undefined;
   runId?: string | undefined;
   chain?: string | undefined;
+  collectionSlug?: string | undefined;
   contractAddress?: string | undefined;
   functionSignature?: string | undefined;
   quantity?: number | undefined;
+  candidateFunctions?: string[] | undefined;
+  phaseStatus?: string | undefined;
+  phaseTypeEstimate?: string | undefined;
+  phaseTypeConfidence?: string | undefined;
   priceEth?: string | undefined;
   txHash?: string | undefined;
   status?: string | undefined;
   reason?: string | undefined;
 }) {
-  const event: Record<string, string | number | null> = {
+  const event: Record<string, string | number | null | string[]> = {
     ownerTelegramId: details.ownerTelegramId,
     action: details.action
   };
@@ -934,18 +973,298 @@ async function validateMintConfirmationSession(
 }
 
 function formatMintTarget(target: MintTarget) {
+  const missing = getMintTargetMissingFields(target);
+  const metadata = target.detectedMetadata;
   return [
     `Name: ${target.name}`,
     `Target ID: ${target.targetId}`,
-    `Status: ${target.status}`,
+    `Status: ${target.targetCompleteness === "complete" ? target.status : "Incomplete"}`,
+    ...(target.targetCompleteness === "incomplete"
+      ? [`Missing: ${missing.join(", ") || "Unknown"}`]
+      : []),
     `Chain: ${target.chain}`,
     `Contract: ${formatShortAddress(target.contractAddress)}`,
-    `Function: ${target.functionSignature}`,
+    `Function: ${target.functionSignature || "Unknown"}`,
     `Qty: ${target.quantity}`,
-    `Price: ${target.priceEth} ETH`,
+    `Price: ${target.priceEth === undefined ? "Unknown" : `${target.priceEth} ETH`}`,
+    ...(target.collectionSlug ? [`Collection Slug: ${target.collectionSlug}`] : []),
+    ...(target.sourceUrl ? [`Source: ${target.sourceUrl}`] : []),
+    ...(metadata?.collectionName ? [`Detected Collection: ${metadata.collectionName}`] : []),
+    ...(metadata?.candidateFunctions?.length
+      ? [`Detected Functions: ${metadata.candidateFunctions.join(", ")}`]
+      : []),
+    ...(metadata?.phaseStatus ? [`Detected Phase Status: ${metadata.phaseStatus}`] : []),
+    ...(metadata?.phaseTypeEstimate
+      ? [`Detected Phase Type: ${metadata.phaseTypeEstimate} (${metadata.phaseTypeConfidence || "unknown"})`]
+      : []),
     `Created: ${target.createdAt}`,
     `Updated: ${target.updatedAt}`
   ].join("\n");
+}
+
+function requireCompleteMintTarget(target: MintTarget) {
+  const missing = getMintTargetMissingFields(target);
+
+  if (missing.length > 0 || !target.functionSignature || target.priceEth === undefined) {
+    throw new Error(
+      `Mint target is incomplete. Missing: ${missing.join(", ") || "unknown"}. Complete it with /updateminttarget.`
+    );
+  }
+
+  return {
+    ...target,
+    functionSignature: target.functionSignature,
+    priceEth: target.priceEth,
+    targetCompleteness: calculateMintTargetCompleteness(target)
+  };
+}
+
+function getCommandRemainder(text: string): string {
+  return text.trim().split(/\s+/).slice(1).join(" ").trim();
+}
+
+function getDetectedChainForTarget(chainName: DetectedChainName): {
+  chain: MintChain;
+  warning?: string;
+} {
+  const supported = toSupportedMintChain(chainName);
+
+  if (supported) {
+    return { chain: supported };
+  }
+
+  return {
+    chain: "mainnet",
+    warning:
+      chainName === "unknown"
+        ? "Chain was not detected; target defaulted to mainnet."
+        : `Detected chain "${chainName}" is not supported by the mint engine yet; target defaulted to mainnet.`
+  };
+}
+
+function toSafeMintTargetName(rawName: string): string {
+  const cleaned = rawName
+    .trim()
+    .replace(/[^A-Za-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 40);
+
+  if (cleaned.length >= 2) {
+    return cleaned;
+  }
+
+  return "mintTarget";
+}
+
+function generateMintTargetName(
+  ownerTelegramId: string,
+  detection: MintDetectionResult,
+  providedName?: string
+) {
+  if (providedName?.trim()) {
+    return sanitizeMintTargetName(toSafeMintTargetName(providedName));
+  }
+
+  const existingNames = new Set(
+    listMintTargetsForOwner(ownerTelegramId).map((target) => target.name.toLowerCase())
+  );
+  const base = toSafeMintTargetName(
+    detection.contract.collectionSlug ||
+      detection.contract.collectionName ||
+      "mintTarget"
+  ).slice(0, 32);
+
+  for (let index = 1; index <= 1000; index++) {
+    const candidate = index === 1 ? base : `${base}${index}`;
+
+    if (!existingNames.has(candidate.toLowerCase())) {
+      return sanitizeMintTargetName(candidate);
+    }
+  }
+
+  return `mintTarget${Date.now()}`;
+}
+
+function getFoundFunctionCandidates(candidates: MintFunctionCandidate[]) {
+  return candidates.filter((candidate) => candidate.foundInBytecode);
+}
+
+function formatFunctionCandidates(candidates: MintFunctionCandidate[]) {
+  if (candidates.length === 0) {
+    return "None checked.";
+  }
+
+  const found = getFoundFunctionCandidates(candidates);
+
+  if (found.length === 0) {
+    return candidates
+      .map(
+        (candidate) =>
+          `- ${candidate.signature}: selector not found (${candidate.confidence})`
+      )
+      .join("\n");
+  }
+
+  return found
+    .map(
+      (candidate) =>
+        `- ${candidate.signature}: selector ${candidate.selector} found (${candidate.confidence})`
+    )
+    .join("\n");
+}
+
+function getDetectionMetadata(detection: MintDetectionResult) {
+  return {
+    lastCheckedAt: detection.detectedAt,
+    ...(detection.contract.collectionName
+      ? { collectionName: detection.contract.collectionName }
+      : {}),
+    ...(detection.contract.collectionSlug
+      ? { collectionSlug: detection.contract.collectionSlug }
+      : {}),
+    ...(detection.contract.address
+      ? { detectedContractAddress: detection.contract.address }
+      : {}),
+    detectedChain: detection.chain.name,
+    candidateFunctions: getFoundFunctionCandidates(detection.mint.candidateFunctions).map(
+      (candidate) => candidate.signature
+    ),
+    phaseStatus: detection.mint.phaseStatus,
+    phaseTypeEstimate: detection.mint.phaseTypeEstimate,
+    phaseTypeConfidence: detection.mint.phaseTypeConfidence,
+    phaseTypeEvidence: detection.mint.phaseTypeEvidence,
+    phaseConfidence: detection.mint.confidence,
+    warnings: detection.warnings.slice(0, 10)
+  };
+}
+
+function formatMintDetectionResult(detection: MintDetectionResult) {
+  const detected: string[] = [];
+  const notDetected: string[] = [];
+
+  if (detection.contract.collectionSlug) {
+    detected.push("Collection slug");
+  } else {
+    notDetected.push("Collection slug");
+  }
+
+  if (detection.contract.address) {
+    detected.push("Contract address");
+  } else {
+    notDetected.push("Contract address");
+  }
+
+  if (getFoundFunctionCandidates(detection.mint.candidateFunctions).length > 0) {
+    detected.push("Mint function candidate");
+  } else {
+    notDetected.push("Mint function");
+  }
+
+  if (detection.mint.priceEth) {
+    detected.push("Mint price");
+  } else {
+    notDetected.push("Mint price");
+  }
+
+  if (detection.mint.phaseStatus !== "unknown") {
+    detected.push("Mint phase");
+  } else {
+    notDetected.push("Mint phase");
+  }
+
+  if (detection.mint.startTime) {
+    detected.push("Mint start time");
+  } else {
+    notDetected.push("Mint start time");
+  }
+
+  return [
+    "Mint Link Parsed",
+    "",
+    `Source: ${detection.source.platform}`,
+    ...(detection.contract.collectionName
+      ? [`Collection: ${detection.contract.collectionName}`]
+      : []),
+    ...(detection.contract.collectionSlug
+      ? [`Slug: ${detection.contract.collectionSlug}`]
+      : []),
+    `Chain: ${detection.chain.name}`,
+    ...(detection.contract.address
+      ? [`Contract: ${formatShortAddress(detection.contract.address)}`]
+      : ["Contract: Unknown"]),
+    ...(detection.contract.tokenId ? [`Token ID: ${detection.contract.tokenId}`] : []),
+    "",
+    "Detected:",
+    ...(detected.length > 0 ? detected.map((item) => `- ${item}`) : ["- None"]),
+    "",
+    "Not detected:",
+    ...(notDetected.length > 0 ? notDetected.map((item) => `- ${item}`) : ["- None"]),
+    "",
+    "Function candidates:",
+    formatFunctionCandidates(detection.mint.candidateFunctions),
+    "",
+    "Phase:",
+    `- Status: ${detection.mint.phaseStatus}`,
+    `- Type: ${detection.mint.phaseTypeEstimate} (${detection.mint.phaseTypeConfidence})`,
+    `- Evidence: ${detection.mint.phaseTypeEvidence}`,
+    "",
+    "Confidence:",
+    `- Contract: ${detection.contract.confidence}`,
+    `- Chain: ${detection.chain.confidence}`,
+    `- Mint: ${detection.mint.confidence}`,
+    ...(detection.warnings.length > 0
+      ? ["", "Warnings:", ...detection.warnings.map((warning) => `- ${warning}`)]
+      : []),
+    "",
+    "Next:",
+    "Use /addmintfromlink URL to save this as a draft target."
+  ].join("\n");
+}
+
+function formatPhaseDetectionResult(phase: MintPhaseDetectionResult) {
+  return [
+    "Mint Phase Check",
+    "",
+    `Chain: ${phase.chain}`,
+    `Contract: ${formatShortAddress(phase.contractAddress)}`,
+    `Phase Status: ${phase.phaseStatus}`,
+    `Phase Type: ${phase.phaseTypeEstimate} (${phase.phaseTypeConfidence})`,
+    `Evidence: ${phase.phaseTypeEvidence}`,
+    `Confidence: ${phase.confidence}`,
+    "",
+    "Booleans:",
+    ...(phase.detectedBooleans.length > 0
+      ? phase.detectedBooleans.map((field) => `- ${field.name}: ${field.value}`)
+      : ["- None"]),
+    "",
+    "Times:",
+    ...(phase.detectedTimes.length > 0
+      ? phase.detectedTimes.map(
+          (field) => `- ${field.name}: ${field.iso || field.value}`
+        )
+      : ["- None"]),
+    "",
+    "Prices:",
+    ...(phase.detectedPrices.length > 0
+      ? phase.detectedPrices.map((field) => `- ${field.name}: ${field.eth} ETH`)
+      : ["- None"]),
+    "",
+    "Supply:",
+    ...(phase.detectedSupply.length > 0
+      ? phase.detectedSupply.map((field) => `- ${field.name}: ${field.value}`)
+      : ["- None"]),
+    "",
+    phase.summary,
+    ...(phase.warnings.length > 0
+      ? ["", "Warnings:", ...phase.warnings.map((warning) => `- ${warning}`)]
+      : [])
+  ].join("\n");
+}
+
+async function getContractExists(chain: MintChain, contractAddress: string) {
+  const provider = getMintProvider(chain);
+  const code = await provider.getCode(contractAddress);
+  return code !== "0x";
 }
 
 function formatMintRun(run: MintRun) {
@@ -2278,6 +2597,566 @@ Mainnet minting uses real ETH. Keep this disabled until you are ready for live m
   );
 });
 
+bot.command("parserstatus", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const rpcStatus = getMintRpcStatus();
+
+  await ctx.reply(
+    `Parser Status
+
+OPENSEA_API_KEY configured: ${getConfiguredStatus(process.env.OPENSEA_API_KEY)}
+ETH_MAINNET_RPC_URL configured: ${rpcStatus.mainnetRpcConfigured ? "yes" : "no"}
+SEPOLIA_RPC_URL or ETH_SEPOLIA_RPC_URL configured: ${rpcStatus.sepoliaRpcConfigured ? "yes" : "no"}
+
+Supported platforms:
+- OpenSea collection and asset URLs
+- Zora collect URL parsing
+- Explorer address links
+- Raw addresses
+- Generic URL/text address detection
+
+Supported function detection:
+- Selector scan for supported mint functions
+
+Supported phase detection:
+- Common read-only contract fields
+
+Future upgrades:
+- Reservoir mint stages
+- Etherscan ABI lookup
+- 4byte selector lookup
+- transaction-history price inference`
+  );
+});
+
+bot.command("parsemintlink", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const input = getCommandRemainder(ctx.message.text);
+
+  if (!input) {
+    await ctx.reply("Use:\n/parsemintlink URL_OR_TEXT");
+    return;
+  }
+
+  try {
+    const detection = await detectMint(input);
+
+    await auditMintAction({
+      ownerTelegramId: getTelegramUserId(ctx),
+      action: "mint_link_parsed",
+      contractAddress: detection.contract.address,
+      chain: detection.chain.name,
+      collectionSlug: detection.contract.collectionSlug,
+      candidateFunctions: getFoundFunctionCandidates(detection.mint.candidateFunctions).map(
+        (candidate) => candidate.signature
+      ),
+      phaseStatus: detection.mint.phaseStatus,
+      phaseTypeEstimate: detection.mint.phaseTypeEstimate,
+      phaseTypeConfidence: detection.mint.phaseTypeConfidence,
+      reason: detection.warnings[0]
+    });
+
+    await ctx.reply(formatMintDetectionResult(detection));
+  } catch (error) {
+    logSafeError("Could not parse mint link", error);
+    await ctx.reply(`❌ Could not parse mint link.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("addmintfromlink", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const input = parts[1]?.trim();
+  const providedName = parts.slice(2).join("_").trim();
+
+  if (!input) {
+    await ctx.reply("Use:\n/addmintfromlink URL_OR_TEXT mintName");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const detection = await detectMint(input);
+
+    if (!detection.contract.address) {
+      await auditMintAction({
+        ownerTelegramId,
+        action: "mint_target_created_from_link",
+        chain: detection.chain.name,
+        collectionSlug: detection.contract.collectionSlug,
+        status: "blocked",
+        reason: "contract_not_detected"
+      });
+      await ctx.reply(
+        "I could not safely detect the contract address. Please create the target manually with /addminttarget."
+      );
+      return;
+    }
+
+    const detectedChain = getDetectedChainForTarget(detection.chain.name);
+    const foundCandidates = getFoundFunctionCandidates(detection.mint.candidateFunctions);
+    const target = createMintTarget({
+      ownerTelegramId,
+      name: generateMintTargetName(ownerTelegramId, detection, providedName),
+      chain: detectedChain.chain,
+      contractAddress: detection.contract.address,
+      ...(foundCandidates.length === 1
+        ? { functionSignature: foundCandidates[0]!.signature }
+        : {}),
+      quantity: 1,
+      ...(detection.mint.priceEth ? { priceEth: detection.mint.priceEth } : {}),
+      ...(detection.contract.collectionSlug
+        ? { collectionSlug: detection.contract.collectionSlug }
+        : {}),
+      ...(detection.source.sourceUrl ? { sourceUrl: detection.source.sourceUrl } : {}),
+      detectedMetadata: getDetectionMetadata(detection)
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_target_created_from_link",
+      targetId: target.targetId,
+      contractAddress: target.contractAddress,
+      chain: target.chain,
+      collectionSlug: target.collectionSlug,
+      candidateFunctions: foundCandidates.map((candidate) => candidate.signature),
+      phaseStatus: detection.mint.phaseStatus,
+      phaseTypeEstimate: detection.mint.phaseTypeEstimate,
+      phaseTypeConfidence: detection.mint.phaseTypeConfidence,
+      status: target.targetCompleteness,
+      reason: detectedChain.warning
+    });
+
+    await ctx.reply(
+      `✅ Mint target draft saved.
+
+${formatMintTarget(target)}
+
+${detectedChain.warning ? `Warning: ${detectedChain.warning}\n\n` : ""}${
+        target.targetCompleteness === "incomplete"
+          ? `Complete it with:\n/updateminttarget ${target.targetId} publicMint(uint256) 1 0.03 ${target.chain}`
+          : "Target appears complete, but preview before minting."
+      }`
+    );
+  } catch (error) {
+    logSafeError("Could not add mint target from link", error);
+    await ctx.reply(`❌ Could not add mint target from link.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("detectmintfunction", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const contractAddress = parts[1]?.trim();
+
+  if (!contractAddress) {
+    await ctx.reply("Use:\n/detectmintfunction 0xCONTRACT mainnet");
+    return;
+  }
+
+  if (!ethers.isAddress(contractAddress)) {
+    await ctx.reply("❌ Invalid contract address.");
+    return;
+  }
+
+  try {
+    const chain = normalizeMintChain(parts[2]);
+    const result = await detectMintFunctions({
+      contractAddress,
+      chain
+    });
+    const found = getFoundFunctionCandidates(result.candidateFunctions);
+
+    await auditMintAction({
+      ownerTelegramId: getTelegramUserId(ctx),
+      action: "mint_function_detected",
+      contractAddress: ethers.getAddress(contractAddress),
+      chain,
+      candidateFunctions: found.map((candidate) => candidate.signature),
+      reason: result.warnings[0]
+    });
+
+    if (!result.contractExists) {
+      await ctx.reply(
+        `No contract code found for ${formatShortAddress(contractAddress)} on ${chain}.`
+      );
+      return;
+    }
+
+    await ctx.reply(
+      `Mint Function Detection
+
+Chain: ${chain}
+Contract: ${formatShortAddress(contractAddress)}
+
+Candidate functions:
+${formatFunctionCandidates(result.candidateFunctions)}
+
+Selector presence is not proof the function is callable. Use /mainmintpreview or /checkminteligibility before minting.`
+    );
+  } catch (error) {
+    logSafeError("Could not detect mint functions", error);
+    await ctx.reply(`❌ Could not detect mint functions.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("detecttargetfunction", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const targetId = parseCommandParts(ctx.message.text)[1]?.trim();
+
+  if (!targetId) {
+    await ctx.reply("Use:\n/detecttargetfunction targetId");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const target = getMintTargetForOwner(targetId, ownerTelegramId);
+    const result = await detectMintFunctions({
+      contractAddress: target.contractAddress,
+      chain: target.chain
+    });
+    const found = getFoundFunctionCandidates(result.candidateFunctions);
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_function_detected",
+      targetId: target.targetId,
+      contractAddress: target.contractAddress,
+      chain: target.chain,
+      candidateFunctions: found.map((candidate) => candidate.signature),
+      reason: result.warnings[0]
+    });
+
+    await ctx.reply(
+      `Target Function Detection
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+Chain: ${target.chain}
+Contract: ${formatShortAddress(target.contractAddress)}
+
+Candidate functions:
+${formatFunctionCandidates(result.candidateFunctions)}
+
+${
+  found.length === 1
+    ? `You can update the target with:\n/updateminttarget ${target.targetId} ${found[0]!.signature} 1 PRICE_ETH ${target.chain}`
+    : "No single supported function could be safely selected."
+}`
+    );
+  } catch (error) {
+    logSafeError("Could not detect target function", error);
+    await ctx.reply(`❌ Could not detect target function.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("checkmintphase", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const targetId = parseCommandParts(ctx.message.text)[1]?.trim();
+
+  if (!targetId) {
+    await ctx.reply("Use:\n/checkmintphase targetId");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const target = getMintTargetForOwner(targetId, ownerTelegramId);
+    const phase = await detectMintPhase({
+      contractAddress: target.contractAddress,
+      chain: target.chain,
+      evidenceTexts: [
+        target.name,
+        target.collectionSlug || "",
+        target.sourceUrl || "",
+        target.notes || ""
+      ]
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_phase_checked",
+      targetId: target.targetId,
+      contractAddress: target.contractAddress,
+      chain: target.chain,
+      collectionSlug: target.collectionSlug,
+      phaseStatus: phase.phaseStatus,
+      phaseTypeEstimate: phase.phaseTypeEstimate,
+      phaseTypeConfidence: phase.phaseTypeConfidence,
+      reason: phase.warnings[0]
+    });
+
+    await ctx.reply(formatPhaseDetectionResult(phase));
+  } catch (error) {
+    logSafeError("Could not check mint phase", error);
+    await ctx.reply(`❌ Could not check mint phase.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("checkminteligibility", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const targetId = parts[1]?.trim();
+  const walletLabel = parts[2]?.trim();
+
+  if (!targetId || !walletLabel) {
+    await ctx.reply("Use:\n/checkminteligibility targetId wallet1");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const target = requireCompleteMintTarget(
+      getMintTargetForOwner(targetId, ownerTelegramId)
+    );
+    const preview = await previewMint({
+      ownerTelegramId,
+      walletLabel,
+      contractAddress: target.contractAddress,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      chain: target.chain
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_eligibility_checked",
+      targetId: target.targetId,
+      walletLabel: preview.walletLabel,
+      walletAddress: preview.walletAddress,
+      contractAddress: target.contractAddress,
+      chain: target.chain,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      status: preview.gasEstimateFailed ? "unknown_or_not_eligible" : "likely_callable",
+      reason: preview.gasEstimateError
+    });
+
+    await ctx.reply(
+      `Mint Eligibility Estimate
+
+Target: ${target.name}
+Wallet: ${preview.walletLabel}
+Address: ${formatShortAddress(preview.walletAddress)}
+Gas Estimate: ${preview.gasEstimate || "Not available"}
+
+Result: ${
+  preview.gasEstimateFailed
+    ? "unknown or not eligible. Mint may not be live, function/price may be wrong, wallet may not be eligible, or contract may reject the call."
+    : "likely callable/eligible, but not guaranteed."
+}
+${preview.gasEstimateError ? `\nReason:\n${preview.gasEstimateError}` : ""}
+
+This is only an estimate. It is not guaranteed eligibility.`
+    );
+  } catch (error) {
+    logSafeError("Could not check mint eligibility", error);
+    await ctx.reply(`❌ Could not check mint eligibility.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("checkmintreadiness", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const targetId = parts[1]?.trim();
+  const walletLabel = parts[2]?.trim();
+
+  if (!targetId || !walletLabel) {
+    await ctx.reply("Use:\n/checkmintreadiness targetId wallet1");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const target = getMintTargetForOwner(targetId, ownerTelegramId);
+    const targetMissing = getMintTargetMissingFields(target);
+    const wallet = await getWalletSummaryByLabelForOwner(walletLabel, ownerTelegramId);
+    const contractExists = await getContractExists(target.chain, target.contractAddress);
+    const functionSupported = Boolean(target.functionSignature);
+    const phase = await detectMintPhase({
+      contractAddress: target.contractAddress,
+      chain: target.chain,
+      evidenceTexts: [
+        target.name,
+        target.collectionSlug || "",
+        target.sourceUrl || "",
+        target.notes || ""
+      ]
+    });
+    let balanceEnough: boolean | null = null;
+    let gasEstimate: string | null = null;
+    let gasError: string | undefined;
+
+    if (target.priceEth !== undefined) {
+      const provider = getMintProvider(target.chain);
+      const balanceWei = await provider.getBalance(wallet.address);
+      const totalCostWei = ethers.parseEther(target.priceEth) * BigInt(target.quantity);
+      balanceEnough = balanceWei >= totalCostWei;
+    }
+
+    if (targetMissing.length === 0 && target.functionSignature && target.priceEth !== undefined) {
+      const preview = await previewMint({
+        ownerTelegramId,
+        walletLabel,
+        contractAddress: target.contractAddress,
+        functionSignature: target.functionSignature,
+        quantity: target.quantity,
+        priceEth: target.priceEth,
+        chain: target.chain
+      });
+      gasEstimate = preview.gasEstimate;
+      gasError = preview.gasEstimateError;
+    }
+
+    const mainnetLockAllows =
+      target.chain !== "mainnet" || isMainnetMintingEnabled();
+    const finalStatus =
+      targetMissing.length > 0 ||
+      !contractExists ||
+      !functionSupported ||
+      balanceEnough === false ||
+      !mainnetLockAllows
+        ? "no"
+        : gasEstimate
+          ? "yes"
+          : "unknown";
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_readiness_checked",
+      targetId: target.targetId,
+      walletLabel: wallet.label,
+      walletAddress: wallet.address,
+      contractAddress: target.contractAddress,
+      chain: target.chain,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      phaseStatus: phase.phaseStatus,
+      phaseTypeEstimate: phase.phaseTypeEstimate,
+      phaseTypeConfidence: phase.phaseTypeConfidence,
+      status: finalStatus,
+      reason: gasError
+    });
+
+    await ctx.reply(
+      `Ready Check
+
+Target complete: ${targetMissing.length === 0 ? "yes" : "no"}
+Contract exists: ${contractExists ? "yes" : "no"}
+Supported function: ${functionSupported ? "yes" : "no"}
+Wallet active: yes
+Balance enough for mint price: ${balanceEnough === null ? "unknown" : balanceEnough ? "yes" : "no"}
+Gas estimate: ${gasEstimate ? gasEstimate : "no"}
+Phase status: ${phase.phaseStatus}
+Phase type estimate: ${phase.phaseTypeEstimate}
+Mainnet minting lock: ${isMainnetMintingEnabled() ? "enabled" : "disabled"}
+
+Final:
+Ready for manual mint: ${finalStatus}
+${targetMissing.length > 0 ? `\nMissing: ${targetMissing.join(", ")}` : ""}${
+        gasError ? `\nGas reason: ${gasError}` : ""
+      }${
+        phase.phaseTypeEstimate === "holder_phase"
+          ? "\nHolder phase note: holder eligibility verification is limited unless the required collection contract is known."
+          : ""
+      }`
+    );
+  } catch (error) {
+    logSafeError("Could not check mint readiness", error);
+    await ctx.reply(`❌ Could not check mint readiness.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("refreshtarget", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const targetId = parseCommandParts(ctx.message.text)[1]?.trim();
+
+  if (!targetId) {
+    await ctx.reply("Use:\n/refreshtarget targetId");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const target = getMintTargetForOwner(targetId, ownerTelegramId);
+    const detection = await detectMint(target.sourceUrl || target.contractAddress);
+    const functionResult = await detectMintFunctions({
+      contractAddress: target.contractAddress,
+      chain: target.chain
+    });
+    const foundCandidates = getFoundFunctionCandidates(functionResult.candidateFunctions);
+    const phase = await detectMintPhase({
+      contractAddress: target.contractAddress,
+      chain: target.chain,
+      evidenceTexts: [
+        target.name,
+        target.collectionSlug || "",
+        detection.contract.collectionSlug || "",
+        target.sourceUrl || "",
+        target.notes || ""
+      ]
+    });
+    const detectedMetadata = {
+      ...getDetectionMetadata(detection),
+      lastCheckedAt: new Date().toISOString(),
+      detectedContractAddress: target.contractAddress,
+      detectedChain: target.chain,
+      candidateFunctions: foundCandidates.map((candidate) => candidate.signature),
+      phaseStatus: phase.phaseStatus,
+      phaseTypeEstimate: phase.phaseTypeEstimate,
+      phaseTypeConfidence: phase.phaseTypeConfidence,
+      phaseTypeEvidence: phase.phaseTypeEvidence,
+      phaseConfidence: phase.confidence,
+      warnings: [...detection.warnings, ...functionResult.warnings, ...phase.warnings].slice(0, 10)
+    };
+    const updated = updateMintTargetDetectedMetadataForOwner(
+      target.targetId,
+      ownerTelegramId,
+      {
+        ...(target.sourceUrl || detection.source.sourceUrl
+          ? { sourceUrl: target.sourceUrl || detection.source.sourceUrl }
+          : {}),
+        ...(detection.contract.collectionSlug
+          ? { collectionSlug: detection.contract.collectionSlug }
+          : {}),
+        detectedMetadata
+      }
+    );
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_target_refreshed",
+      targetId: updated.targetId,
+      contractAddress: updated.contractAddress,
+      chain: updated.chain,
+      collectionSlug: updated.collectionSlug,
+      candidateFunctions: updated.detectedMetadata?.candidateFunctions,
+      phaseStatus: updated.detectedMetadata?.phaseStatus,
+      phaseTypeEstimate: updated.detectedMetadata?.phaseTypeEstimate,
+      phaseTypeConfidence: updated.detectedMetadata?.phaseTypeConfidence,
+      reason: updated.detectedMetadata?.warnings?.[0]
+    });
+
+    await ctx.reply(`✅ Mint target refreshed.\n\n${formatMintTarget(updated)}`);
+  } catch (error) {
+    logSafeError("Could not refresh mint target", error);
+    await ctx.reply(`❌ Could not refresh mint target.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
 bot.command("mainmintpreview", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
@@ -2712,9 +3591,10 @@ bot.command("minttargets", async (ctx) => {
           `Target ID: ${target.targetId}`,
           `Chain: ${target.chain}`,
           `Contract: ${formatShortAddress(target.contractAddress)}`,
-          `Function: ${target.functionSignature}`,
+          `Completeness: ${target.targetCompleteness}`,
+          `Function: ${target.functionSignature || "Unknown"}`,
           `Qty: ${target.quantity}`,
-          `Price: ${target.priceEth} ETH`
+          `Price: ${target.priceEth === undefined ? "Unknown" : `${target.priceEth} ETH`}`
         ].join("\n")
       )
       .join("\n\n");
@@ -2910,7 +3790,9 @@ bot.command("minttargetpreview", async (ctx) => {
       return;
     }
 
-    const target = getMintTargetForOwner(targetId, ownerTelegramId);
+    const target = requireCompleteMintTarget(
+      getMintTargetForOwner(targetId, ownerTelegramId)
+    );
     const preview = await previewMint({
       ownerTelegramId,
       walletLabel,
@@ -2970,7 +3852,9 @@ bot.command("minttargetnow", async (ctx) => {
       return;
     }
 
-    const target = getMintTargetForOwner(targetId, ownerTelegramId);
+    const target = requireCompleteMintTarget(
+      getMintTargetForOwner(targetId, ownerTelegramId)
+    );
     const preview = await previewMint({
       ownerTelegramId,
       walletLabel,

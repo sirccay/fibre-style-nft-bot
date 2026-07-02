@@ -66,7 +66,7 @@ type BuiltMintTransaction = {
   totalCostEth: string;
 };
 
-const SUPPORTED_SIGNATURES: SupportedMintFunctionSignature[] = [
+export const SUPPORTED_MINT_FUNCTION_SIGNATURES: SupportedMintFunctionSignature[] = [
   "mint(uint256)",
   "publicMint(uint256)",
   "mintPublic(uint256)",
@@ -100,7 +100,7 @@ export function normalizeMintFunctionSignature(
 ): SupportedMintFunctionSignature {
   const normalized = rawSignature.trim().replace(/\s+/g, "");
 
-  if (SUPPORTED_SIGNATURES.includes(normalized as SupportedMintFunctionSignature)) {
+  if (SUPPORTED_MINT_FUNCTION_SIGNATURES.includes(normalized as SupportedMintFunctionSignature)) {
     return normalized as SupportedMintFunctionSignature;
   }
 

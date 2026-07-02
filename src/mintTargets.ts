@@ -7,6 +7,22 @@ import type {
 } from "./mintEngine.js";
 
 export type MintTargetStatus = "active" | "archived";
+export type MintTargetCompleteness = "complete" | "incomplete";
+
+export type MintTargetDetectedMetadata = {
+  lastCheckedAt?: string;
+  collectionName?: string;
+  collectionSlug?: string;
+  detectedContractAddress?: string;
+  detectedChain?: string;
+  candidateFunctions?: string[];
+  phaseStatus?: string;
+  phaseTypeEstimate?: string;
+  phaseTypeConfidence?: string;
+  phaseTypeEvidence?: string;
+  phaseConfidence?: string;
+  warnings?: string[];
+};
 
 export type MintTarget = {
   targetId: string;
@@ -14,15 +30,17 @@ export type MintTarget = {
   name: string;
   chain: MintChain;
   contractAddress: string;
-  functionSignature: SupportedMintFunctionSignature;
+  functionSignature?: SupportedMintFunctionSignature;
   quantity: number;
-  priceEth: string;
+  priceEth?: string;
   createdAt: string;
   updatedAt: string;
   status: MintTargetStatus;
+  targetCompleteness: MintTargetCompleteness;
   collectionSlug?: string;
   sourceUrl?: string;
   notes?: string;
+  detectedMetadata?: MintTargetDetectedMetadata;
 };
 
 type MintTargetsFile = {
@@ -34,12 +52,14 @@ type CreateMintTargetParams = {
   name: string;
   chain: MintChain;
   contractAddress: string;
-  functionSignature: SupportedMintFunctionSignature;
-  quantity: number;
-  priceEth: string;
+  functionSignature?: SupportedMintFunctionSignature;
+  quantity?: number;
+  priceEth?: string;
+  targetCompleteness?: MintTargetCompleteness;
   collectionSlug?: string;
   sourceUrl?: string;
   notes?: string;
+  detectedMetadata?: MintTargetDetectedMetadata;
 };
 
 type UpdateMintTargetParams = {
@@ -47,6 +67,14 @@ type UpdateMintTargetParams = {
   functionSignature: SupportedMintFunctionSignature;
   quantity: number;
   priceEth: string;
+};
+
+type UpdateMintTargetMetadataParams = {
+  sourceUrl?: string;
+  collectionSlug?: string;
+  contractAddress?: string;
+  chain?: MintChain;
+  detectedMetadata: MintTargetDetectedMetadata;
 };
 
 const MINT_TARGETS_PATH = path.join(process.cwd(), "data", "mintTargets.json");
@@ -62,6 +90,12 @@ function isMintTargetStatus(value: unknown): value is MintTargetStatus {
   return value === "active" || value === "archived";
 }
 
+function isMintTargetCompleteness(
+  value: unknown
+): value is MintTargetCompleteness {
+  return value === "complete" || value === "incomplete";
+}
+
 function isSupportedStoredMintFunctionSignature(
   value: unknown
 ): value is SupportedMintFunctionSignature {
@@ -70,32 +104,127 @@ function isSupportedStoredMintFunctionSignature(
   );
 }
 
+function normalizeQuantity(value: unknown) {
+  const quantity = Number(value ?? 1);
+
+  if (!Number.isInteger(quantity) || quantity <= 0) {
+    return 1;
+  }
+
+  return quantity;
+}
+
+export function getMintTargetMissingFields(target: {
+  contractAddress?: string;
+  functionSignature?: string;
+  priceEth?: string;
+  quantity?: number;
+}) {
+  const missing: string[] = [];
+
+  if (!target.contractAddress) {
+    missing.push("contractAddress");
+  }
+
+  if (!target.functionSignature) {
+    missing.push("functionSignature");
+  }
+
+  if (target.priceEth === undefined || target.priceEth === "") {
+    missing.push("priceEth");
+  }
+
+  if (!target.quantity || target.quantity <= 0) {
+    missing.push("quantity");
+  }
+
+  return missing;
+}
+
+export function calculateMintTargetCompleteness(target: {
+  contractAddress?: string;
+  functionSignature?: string;
+  priceEth?: string;
+  quantity?: number;
+}): MintTargetCompleteness {
+  return getMintTargetMissingFields(target).length === 0
+    ? "complete"
+    : "incomplete";
+}
+
+function normalizeDetectedMetadata(raw: any): MintTargetDetectedMetadata | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+
+  const metadata: MintTargetDetectedMetadata = {
+    ...(typeof raw.lastCheckedAt === "string" ? { lastCheckedAt: raw.lastCheckedAt } : {}),
+    ...(typeof raw.collectionName === "string" ? { collectionName: raw.collectionName } : {}),
+    ...(typeof raw.collectionSlug === "string" ? { collectionSlug: raw.collectionSlug } : {}),
+    ...(typeof raw.detectedContractAddress === "string"
+      ? { detectedContractAddress: raw.detectedContractAddress }
+      : {}),
+    ...(typeof raw.detectedChain === "string" ? { detectedChain: raw.detectedChain } : {}),
+    ...(Array.isArray(raw.candidateFunctions)
+      ? {
+          candidateFunctions: raw.candidateFunctions
+            .filter((value: unknown) => typeof value === "string")
+            .slice(0, 20)
+        }
+      : {}),
+    ...(typeof raw.phaseStatus === "string" ? { phaseStatus: raw.phaseStatus } : {}),
+    ...(typeof raw.phaseTypeEstimate === "string"
+      ? { phaseTypeEstimate: raw.phaseTypeEstimate }
+      : {}),
+    ...(typeof raw.phaseTypeConfidence === "string"
+      ? { phaseTypeConfidence: raw.phaseTypeConfidence }
+      : {}),
+    ...(typeof raw.phaseTypeEvidence === "string"
+      ? { phaseTypeEvidence: raw.phaseTypeEvidence }
+      : {}),
+    ...(typeof raw.phaseConfidence === "string"
+      ? { phaseConfidence: raw.phaseConfidence }
+      : {}),
+    ...(Array.isArray(raw.warnings)
+      ? {
+          warnings: raw.warnings
+            .filter((value: unknown) => typeof value === "string")
+            .slice(0, 20)
+        }
+      : {})
+  };
+
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
+}
+
 function normalizeStoredMintTarget(raw: any): MintTarget | null {
   if (
     typeof raw?.targetId !== "string" ||
     typeof raw?.ownerTelegramId !== "string" ||
     typeof raw?.name !== "string" ||
     typeof raw?.chain !== "string" ||
-    typeof raw?.contractAddress !== "string" ||
-    typeof raw?.functionSignature !== "string" ||
-    typeof raw?.priceEth !== "string"
+    typeof raw?.contractAddress !== "string"
   ) {
     return null;
   }
 
-  const quantity = Number(raw.quantity);
-
-  if (!Number.isInteger(quantity) || quantity <= 0) {
-    return null;
-  }
-
-  if (!isSupportedStoredMintFunctionSignature(raw.functionSignature)) {
-    return null;
-  }
-
+  const quantity = normalizeQuantity(raw.quantity);
+  const functionSignature = isSupportedStoredMintFunctionSignature(raw.functionSignature)
+    ? raw.functionSignature
+    : undefined;
+  const priceEth = typeof raw.priceEth === "string" ? raw.priceEth : undefined;
   const createdAt =
     typeof raw.createdAt === "string" ? raw.createdAt : new Date().toISOString();
   const updatedAt = typeof raw.updatedAt === "string" ? raw.updatedAt : createdAt;
+  const targetCompleteness = isMintTargetCompleteness(raw.targetCompleteness)
+    ? raw.targetCompleteness
+    : calculateMintTargetCompleteness({
+        contractAddress: raw.contractAddress,
+        functionSignature,
+        priceEth,
+        quantity
+      });
+  const detectedMetadata = normalizeDetectedMetadata(raw.detectedMetadata);
 
   return {
     targetId: raw.targetId,
@@ -103,17 +232,19 @@ function normalizeStoredMintTarget(raw: any): MintTarget | null {
     name: raw.name,
     chain: raw.chain === "sepolia" ? "sepolia" : "mainnet",
     contractAddress: raw.contractAddress,
-    functionSignature: raw.functionSignature,
+    ...(functionSignature ? { functionSignature } : {}),
     quantity,
-    priceEth: raw.priceEth,
+    ...(priceEth === undefined ? {} : { priceEth }),
     createdAt,
     updatedAt,
     status: isMintTargetStatus(raw.status) ? raw.status : "active",
+    targetCompleteness,
     ...(typeof raw.collectionSlug === "string"
       ? { collectionSlug: raw.collectionSlug }
       : {}),
     ...(typeof raw.sourceUrl === "string" ? { sourceUrl: raw.sourceUrl } : {}),
-    ...(typeof raw.notes === "string" ? { notes: raw.notes } : {})
+    ...(typeof raw.notes === "string" ? { notes: raw.notes } : {}),
+    ...(detectedMetadata ? { detectedMetadata } : {})
   };
 }
 
@@ -158,21 +289,31 @@ function loadMintTargetsFile(): MintTargetsFile {
 export function createMintTarget(params: CreateMintTargetParams): MintTarget {
   const file = loadMintTargetsFile();
   const now = new Date().toISOString();
+  const quantity = params.quantity || 1;
   const target: MintTarget = {
     targetId: randomUUID(),
     ownerTelegramId: params.ownerTelegramId,
     name: params.name,
     chain: params.chain,
     contractAddress: params.contractAddress,
-    functionSignature: params.functionSignature,
-    quantity: params.quantity,
-    priceEth: params.priceEth,
+    ...(params.functionSignature ? { functionSignature: params.functionSignature } : {}),
+    quantity,
+    ...(params.priceEth === undefined ? {} : { priceEth: params.priceEth }),
     createdAt: now,
     updatedAt: now,
     status: "active",
+    targetCompleteness:
+      params.targetCompleteness ||
+      calculateMintTargetCompleteness({
+        contractAddress: params.contractAddress,
+        ...(params.functionSignature ? { functionSignature: params.functionSignature } : {}),
+        ...(params.priceEth === undefined ? {} : { priceEth: params.priceEth }),
+        quantity
+      }),
     ...(params.collectionSlug ? { collectionSlug: params.collectionSlug } : {}),
     ...(params.sourceUrl ? { sourceUrl: params.sourceUrl } : {}),
-    ...(params.notes ? { notes: params.notes } : {})
+    ...(params.notes ? { notes: params.notes } : {}),
+    ...(params.detectedMetadata ? { detectedMetadata: params.detectedMetadata } : {})
   };
 
   file.targets.push(target);
@@ -233,6 +374,51 @@ export function updateMintTargetForOwner(
   target.functionSignature = updates.functionSignature;
   target.quantity = updates.quantity;
   target.priceEth = updates.priceEth;
+  target.targetCompleteness = calculateMintTargetCompleteness(target);
+  target.updatedAt = new Date().toISOString();
+
+  writeMintTargets(file.targets);
+  return target;
+}
+
+export function updateMintTargetDetectedMetadataForOwner(
+  targetId: string,
+  ownerTelegramId: string,
+  updates: UpdateMintTargetMetadataParams
+) {
+  const file = loadMintTargetsFile();
+  const target = file.targets.find(
+    (savedTarget) =>
+      savedTarget.targetId === targetId &&
+      savedTarget.ownerTelegramId === ownerTelegramId
+  );
+
+  if (!target) {
+    throw new Error("Mint target not found for this Telegram user.");
+  }
+
+  if (target.status === "archived") {
+    throw new Error("Mint target is archived and cannot be refreshed.");
+  }
+
+  if (updates.sourceUrl) {
+    target.sourceUrl = updates.sourceUrl;
+  }
+
+  if (updates.collectionSlug) {
+    target.collectionSlug = updates.collectionSlug;
+  }
+
+  if (updates.contractAddress) {
+    target.contractAddress = updates.contractAddress;
+  }
+
+  if (updates.chain) {
+    target.chain = updates.chain;
+  }
+
+  target.detectedMetadata = updates.detectedMetadata;
+  target.targetCompleteness = calculateMintTargetCompleteness(target);
   target.updatedAt = new Date().toISOString();
 
   writeMintTargets(file.targets);
