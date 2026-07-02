@@ -5,6 +5,10 @@ import type {
   MintChain,
   SupportedMintFunctionSignature
 } from "./mintEngine.js";
+import type {
+  OpenSeaMintMetadata,
+  OpenSeaMintStage
+} from "./mintDetector.js";
 
 export type MintTargetStatus = "active" | "archived";
 export type MintTargetCompleteness = "complete" | "incomplete";
@@ -21,6 +25,7 @@ export type MintTargetDetectedMetadata = {
   phaseTypeConfidence?: string;
   phaseTypeEvidence?: string;
   phaseConfidence?: string;
+  openSeaMint?: OpenSeaMintMetadata;
   warnings?: string[];
 };
 
@@ -114,6 +119,100 @@ function normalizeQuantity(value: unknown) {
   return quantity;
 }
 
+function normalizeNumberField(value: unknown): number | undefined {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+function normalizeOpenSeaMintStage(raw: any): OpenSeaMintStage | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+
+  const limitPerWallet = normalizeNumberField(raw.limitPerWallet);
+
+  return {
+    ...(typeof raw.stageName === "string" ? { stageName: raw.stageName.slice(0, 80) } : {}),
+    phaseTypeEstimate:
+      typeof raw.phaseTypeEstimate === "string"
+        ? raw.phaseTypeEstimate
+        : "unknown",
+    phaseTypeConfidence:
+      typeof raw.phaseTypeConfidence === "string"
+        ? raw.phaseTypeConfidence
+        : "unknown",
+    status: typeof raw.status === "string" ? raw.status : "unknown",
+    ...(typeof raw.startTimeText === "string"
+      ? { startTimeText: raw.startTimeText.slice(0, 160) }
+      : {}),
+    ...(typeof raw.endTimeText === "string"
+      ? { endTimeText: raw.endTimeText.slice(0, 160) }
+      : {}),
+    ...(typeof raw.priceText === "string" ? { priceText: raw.priceText.slice(0, 80) } : {}),
+    ...(typeof raw.priceEth === "string" ? { priceEth: raw.priceEth.slice(0, 40) } : {}),
+    ...(limitPerWallet !== undefined ? { limitPerWallet } : {}),
+    ...(typeof raw.eligibilityText === "string"
+      ? { eligibilityText: raw.eligibilityText.slice(0, 80) }
+      : {}),
+    ...(typeof raw.evidence === "string" ? { evidence: raw.evidence.slice(0, 240) } : {})
+  };
+}
+
+function normalizeOpenSeaMintMetadata(raw: any): OpenSeaMintMetadata | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+
+  const mintSchedule = Array.isArray(raw.mintSchedule)
+    ? raw.mintSchedule
+        .map(normalizeOpenSeaMintStage)
+        .filter((stage: OpenSeaMintStage | null): stage is OpenSeaMintStage => Boolean(stage))
+        .slice(0, 10)
+    : [];
+  const mintedCount = normalizeNumberField(raw.mintedCount);
+  const maxSupply = normalizeNumberField(raw.maxSupply);
+  const currentStageLimitPerWallet = normalizeNumberField(raw.currentStageLimitPerWallet);
+  const metadata: OpenSeaMintMetadata = {
+    ...(typeof raw.collectionName === "string"
+      ? { collectionName: raw.collectionName.slice(0, 100) }
+      : {}),
+    ...(typeof raw.mintStatusText === "string"
+      ? { mintStatusText: raw.mintStatusText.slice(0, 80) }
+      : {}),
+    ...(mintedCount !== undefined ? { mintedCount } : {}),
+    ...(maxSupply !== undefined ? { maxSupply } : {}),
+    ...(typeof raw.currentStageName === "string"
+      ? { currentStageName: raw.currentStageName.slice(0, 80) }
+      : {}),
+    ...(typeof raw.currentStagePriceText === "string"
+      ? { currentStagePriceText: raw.currentStagePriceText.slice(0, 80) }
+      : {}),
+    ...(typeof raw.currentStagePriceEth === "string"
+      ? { currentStagePriceEth: raw.currentStagePriceEth.slice(0, 40) }
+      : {}),
+    ...(currentStageLimitPerWallet !== undefined ? { currentStageLimitPerWallet } : {}),
+    mintSchedule,
+    ...(typeof raw.rawTimeZoneText === "string"
+      ? { rawTimeZoneText: raw.rawTimeZoneText.slice(0, 40) }
+      : {}),
+    metadataSource:
+      typeof raw.metadataSource === "string" ? raw.metadataSource : "unknown",
+    confidence: typeof raw.confidence === "string" ? raw.confidence : "unknown",
+    ...(Array.isArray(raw.warnings)
+      ? {
+          warnings: raw.warnings
+            .filter((value: unknown) => typeof value === "string")
+            .map((value: string) => value.slice(0, 240))
+            .slice(0, 10)
+        }
+      : {})
+  };
+
+  return Object.keys(metadata).length > 3 || mintSchedule.length > 0
+    ? metadata
+    : undefined;
+}
+
 export function getMintTargetMissingFields(target: {
   contractAddress?: string;
   functionSignature?: string;
@@ -157,6 +256,7 @@ function normalizeDetectedMetadata(raw: any): MintTargetDetectedMetadata | undef
     return undefined;
   }
 
+  const openSeaMint = normalizeOpenSeaMintMetadata(raw.openSeaMint);
   const metadata: MintTargetDetectedMetadata = {
     ...(typeof raw.lastCheckedAt === "string" ? { lastCheckedAt: raw.lastCheckedAt } : {}),
     ...(typeof raw.collectionName === "string" ? { collectionName: raw.collectionName } : {}),
@@ -185,6 +285,7 @@ function normalizeDetectedMetadata(raw: any): MintTargetDetectedMetadata | undef
     ...(typeof raw.phaseConfidence === "string"
       ? { phaseConfidence: raw.phaseConfidence }
       : {}),
+    ...(openSeaMint ? { openSeaMint } : {}),
     ...(Array.isArray(raw.warnings)
       ? {
           warnings: raw.warnings

@@ -284,6 +284,8 @@ Core stack:
 
   - OpenSea collection URLs
 
+  - OpenSea collection overview/mint URLs, including `/collection/{slug}/overview` and `/collection/{slug}/mint`
+
   - OpenSea asset URLs
 
   - Zora collect URLs where chain/address is visible
@@ -300,13 +302,23 @@ Core stack:
 
 - Phase type estimates support team, holder, GTD, FCFS, and public phase aliases. These are evidence-based estimates only.
 
+- OpenSea mint page metadata fallback is enabled. For public OpenSea collection/mint pages, the parser now attempts safe public HTML/embedded JSON extraction with no cookies, no auth, no headless browser, and a short timeout. It can store/display mint status, minted supply progress, current stage, stage schedule, raw time text, price text, wallet limit text, and eligibility text when the public page exposes them.
+
+- If `RESERVOIR_API_KEY` is configured, the parser attempts a best-effort Reservoir mint-stage lookup before falling back to OpenSea page metadata. Reservoir is optional and failures/401/403/429 responses should not stop the bot.
+
+- Parser-created targets save OpenSea mint schedule metadata under `target.detectedMetadata.openSeaMint`. If OpenSea only exposes a USD price, `priceEth` is not guessed or stored; complete the ETH price manually with `/updateminttarget`.
+
+- Regression check for OpenSea mint stage parsing:
+
+  `/parsemintlink https://opensea.io/collection/fuzzlingss/overview`
+
+  Expected: when OpenSea public page metadata is available, the reply should include Fuzzlings mint status, minted supply progress, current Public stage price/limit, and Team/GTD/Public schedule rows. If OpenSea blocks or omits public metadata, the reply should stay safe and show unknown/warnings instead of failing.
+
 - Parser-created mint targets may be incomplete. Complete them with `/updateminttarget targetId functionSignature quantity priceEth chain` before `/minttargetpreview` or `/minttargetnow`.
 
 - Parser commands do not send transactions, do not schedule mints, and do not bypass project mint rules.
 
 - Future parser upgrades still needed:
-
-  - Reservoir mint stages
 
   - Etherscan ABI lookup
 
