@@ -15,16 +15,16 @@ async function main() {
     mask: "*"
   });
 
-  const saved = addWallet(label, privateKey);
+  const saved = await addWallet(label, privateKey);
 
   console.log("\n✅ Wallet added successfully.");
   console.log(`Label: ${saved.label}`);
   console.log(`Address: ${saved.address}`);
-  console.log("\nPrivate key was encrypted into data/vault.json");
+  console.log("\nPrivate key was encrypted with AWS KMS envelope encryption into data/vault.json");
 }
 
 main().catch((error) => {
   console.error("\n❌ Failed to add wallet:");
-  console.error(error.message);
+  console.error(error instanceof Error ? error.message : "Unknown error");
   process.exit(1);
 });

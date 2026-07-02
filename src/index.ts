@@ -2,9 +2,14 @@ import "dotenv/config";
 import fs from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
+import type { Context } from "telegraf";
 import { Telegraf, Markup } from "telegraf";
 import { ethers } from "ethers";
-import { listWallets, getWalletByLabel } from "./vault.js";
+import {
+  listWalletsForOwner,
+  getWalletAddressByLabelForOwner,
+  getWalletSignerByLabelForOwner
+} from "./vault.js";
 import { getTelegramUserId, requireAdmin } from "./auth.js";
 import { extractOpenSeaSlug, getOpenSeaCollectionStats, getOpenSeaBestOffer, getOpenSeaBestListing, getOpenSeaNft, getOpenSeaNftsByAccount } from "./opensea.js";
 import { checkErc721Ownership, createOpenSeaListing, getMainnetProvider, acceptOpenSeaBestOffer } from "./openseaTrading.js";
@@ -41,6 +46,28 @@ function getCommandPart(parts: string[], index: number): string {
   }
 
   return part;
+}
+
+function getRequiredTelegramUserId(ctx: Context): string {
+  const userId = getTelegramUserId(ctx);
+
+  if (!userId) {
+    throw new Error("Could not read Telegram user ID from this request.");
+  }
+
+  return userId;
+}
+
+function getSafeErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return (error.message.split("\n")[0] || error.message).slice(0, 300);
+  }
+
+  return "Unknown error";
+}
+
+function logSafeError(context: string, error: unknown) {
+  console.error(`${context}: ${getSafeErrorMessage(error)}`);
 }
 
 function loadTestNftContract() {
@@ -340,7 +367,8 @@ bot.action("wallet_status", async (ctx) => {
   await ctx.answerCbQuery();
 
   try {
-    const wallets = listWallets();
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const wallets = await listWalletsForOwner(ownerTelegramId);
 
     if (wallets.length === 0) {
       await ctx.reply(
@@ -356,12 +384,11 @@ npm run wallet:add`
     let message = `⚙️ Wallet Status\n\nNetwork: Sepolia Testnet\n\n`;
 
     for (const savedWallet of wallets) {
-      const wallet = getWalletByLabel(savedWallet.label, provider);
-      const balanceWei = await provider.getBalance(wallet.address);
+      const balanceWei = await provider.getBalance(savedWallet.address);
       const balanceEth = ethers.formatEther(balanceWei);
 
       message += `👛 ${savedWallet.label}\n`;
-      message += `Address: ${wallet.address}\n`;
+      message += `Address: ${savedWallet.address}\n`;
       message += `Balance: ${balanceEth} ETH\n\n`;
     }
 
@@ -369,7 +396,7 @@ npm run wallet:add`
 
     await ctx.reply(message);
   } catch (error) {
-    console.error(error);
+    logSafeError("Could not load wallet status", error);
     await ctx.reply("❌ Could not load wallet status. Check Terminal for the error.");
   }
 });
@@ -378,7 +405,8 @@ bot.command("wallets", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
   try {
-    const wallets = listWallets();
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const wallets = await listWalletsForOwner(ownerTelegramId);
 
     if (wallets.length === 0) {
       await ctx.reply("No wallets found. Add one with:\n\nnpm run wallet:add");
@@ -391,7 +419,7 @@ bot.command("wallets", async (ctx) => {
 
     await ctx.reply(`Saved wallets:\n\n${message}`);
   } catch (error) {
-    console.error(error);
+    logSafeError("Could not list wallets", error);
     await ctx.reply("❌ Could not list wallets.");
   }
 });
@@ -445,8 +473,14 @@ Use:
   }
 
   try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
     const testNft = loadTestNftContract();
-    const wallet = getWalletByLabel(walletLabel, provider);
+    const wallet = await getWalletSignerByLabelForOwner(
+      walletLabel,
+      ownerTelegramId,
+      provider,
+      "minttest"
+    );
 
     const contract = new ethers.Contract(
       testNft.contractAddress,
@@ -546,7 +580,7 @@ ${tx.hash}`
       );
     }
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Mint failed", error);
 
     const errorMessage =
       error?.shortMessage ||
@@ -672,17 +706,21 @@ Use:
   }
 
   try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
     const testNft = loadTestNftContract();
-    const wallet = getWalletByLabel(walletLabel, provider);
+    const walletAddress = await getWalletAddressByLabelForOwner(
+      walletLabel,
+      ownerTelegramId
+    );
 
     const contract = new ethers.Contract(
       testNft.contractAddress,
       testNft.abi,
-      wallet
+      provider
     ) as unknown as TestMintContract;
 
     const approved: boolean = await contract.isApprovedForAll(
-      wallet.address,
+      walletAddress,
       operator
     );
 
@@ -691,14 +729,14 @@ Use:
 
 Network: Sepolia
 Wallet: ${walletLabel}
-Wallet Address: ${wallet.address}
+Wallet Address: ${walletAddress}
 NFT Contract: ${testNft.contractAddress}
 Operator: ${operator}
 
 Approved: ${approved ? "YES ✅" : "NO ❌"}`
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Could not check approval", error);
 
     await ctx.reply(
       `❌ Could not check approval.
@@ -738,8 +776,14 @@ Use:
   }
 
   try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
     const testNft = loadTestNftContract();
-    const wallet = getWalletByLabel(walletLabel, provider);
+    const wallet = await getWalletSignerByLabelForOwner(
+      walletLabel,
+      ownerTelegramId,
+      provider,
+      "approveall"
+    );
 
     const contract = new ethers.Contract(
       testNft.contractAddress,
@@ -821,7 +865,7 @@ ${tx.hash}`
       );
     }
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Approval failed", error);
 
     await ctx.reply(
       `❌ Approval failed.
@@ -856,8 +900,14 @@ Use:
   }
 
   try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
     const testNft = loadTestNftContract();
-    const wallet = getWalletByLabel(walletLabel, provider);
+    const wallet = await getWalletSignerByLabelForOwner(
+      walletLabel,
+      ownerTelegramId,
+      provider,
+      "revokeall"
+    );
 
     const contract = new ethers.Contract(
       testNft.contractAddress,
@@ -908,7 +958,7 @@ ${tx.hash}`
       );
     }
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Approval revoke failed", error);
 
     await ctx.reply(
       `❌ Revoke failed.
@@ -1004,7 +1054,7 @@ Next later:
 • Accept top offer`
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Could not fetch OpenSea floor.
@@ -1086,7 +1136,7 @@ Next later:
 • Send accept-offer transaction`
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Could not fetch top offer.
@@ -1168,7 +1218,7 @@ Next:
 • List at custom price`
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Could not fetch best listing.
@@ -1229,6 +1279,7 @@ Checking ownership on Ethereum mainnet...`
 
     const ownership = await checkErc721Ownership({
       walletLabel,
+      ownerTelegramId: getRequiredTelegramUserId(ctx),
       contractAddress,
       tokenId
     });
@@ -1253,7 +1304,7 @@ When ready, use:
 /oslist ${walletLabel} ${contractAddress} ${tokenId} ${priceEth}`
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Listing preview failed.
@@ -1312,6 +1363,7 @@ Submitting to OpenSea...`
 
     const result = await createOpenSeaListing({
       walletLabel,
+      ownerTelegramId: getRequiredTelegramUserId(ctx),
       contractAddress,
       tokenId,
       priceEth
@@ -1329,7 +1381,7 @@ OpenSea SDK response:
 ${JSON.stringify(result.listing, null, 2).slice(0, 2500)}`
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ OpenSea listing failed.
@@ -1422,7 +1474,7 @@ Useful next commands:
 /oslistpreview wallet1 ${contractAddress} ${tokenId} 0.01`
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ NFT lookup failed.
@@ -1491,6 +1543,7 @@ Try:
 
     const ownership = await checkErc721Ownership({
       walletLabel,
+      ownerTelegramId: getRequiredTelegramUserId(ctx),
       contractAddress,
       tokenId
     });
@@ -1519,7 +1572,7 @@ When ready, use:
 /listfloor ${walletLabel} ${slug} ${contractAddress} ${tokenId}`
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Floor listing preview failed.
@@ -1589,6 +1642,7 @@ Checking ownership before listing...`
 
     const ownership = await checkErc721Ownership({
       walletLabel,
+      ownerTelegramId: getRequiredTelegramUserId(ctx),
       contractAddress,
       tokenId
     });
@@ -1614,6 +1668,7 @@ ${stats.floorPrice} ETH`
 
     const result = await createOpenSeaListing({
       walletLabel,
+      ownerTelegramId: getRequiredTelegramUserId(ctx),
       contractAddress,
       tokenId,
       priceEth: Number(stats.floorPrice)
@@ -1631,7 +1686,7 @@ OpenSea SDK response:
 ${JSON.stringify(result.listing, null, 2).slice(0, 2500)}`
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Floor listing failed.
@@ -1688,7 +1743,7 @@ Example:
 
     await sendPostMintActionMenu(ctx, action);
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Could not create post-mint menu.
@@ -1735,7 +1790,7 @@ Standard: ${nft.tokenStandard}
 OpenSea URL: ${nft.openseaUrl || "Not available"}`
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Could not view NFT.
@@ -1799,7 +1854,7 @@ Useful:
 • Use "Top Offer" to check if there is an offer to accept.`
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Could not fetch market snapshot.
@@ -1860,7 +1915,7 @@ Next module:
 [Accept Top Offer] with confirmation before sending the transaction.`
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Could not fetch top offer.
@@ -1902,6 +1957,7 @@ Token ID: ${action.tokenId}`
 
     const ownership = await checkErc721Ownership({
       walletLabel: action.walletLabel,
+      ownerTelegramId: getRequiredTelegramUserId(ctx),
       contractAddress: action.contractAddress,
       tokenId: action.tokenId
     });
@@ -1926,7 +1982,7 @@ Live listing lock:
 ALLOW_MAINNET_TRADING=${process.env.ALLOW_MAINNET_TRADING || "false"}`
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ List-at-floor preview failed.
@@ -2026,6 +2082,7 @@ Checking floor price and ownership again...`
 
     const ownership = await checkErc721Ownership({
       walletLabel: action.walletLabel,
+      ownerTelegramId: getRequiredTelegramUserId(ctx),
       contractAddress: action.contractAddress,
       tokenId: action.tokenId
     });
@@ -2065,7 +2122,7 @@ If live trading is false, the next button will NOT create a listing.`,
       ])
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Final listing confirmation failed.
@@ -2105,6 +2162,7 @@ Re-checking current floor price and wallet ownership before listing...`
 
     const ownership = await checkErc721Ownership({
       walletLabel: action.walletLabel,
+      ownerTelegramId: getRequiredTelegramUserId(ctx),
       contractAddress: action.contractAddress,
       tokenId: action.tokenId
     });
@@ -2132,6 +2190,7 @@ Price: ${stats.floorPrice} ETH`
 
     const result = await createOpenSeaListing({
       walletLabel: action.walletLabel,
+      ownerTelegramId: getRequiredTelegramUserId(ctx),
       contractAddress: action.contractAddress,
       tokenId: action.tokenId,
       priceEth: Number(stats.floorPrice)
@@ -2149,7 +2208,7 @@ OpenSea SDK response:
 ${JSON.stringify(result.listing, null, 2).slice(0, 2500)}`
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Live floor listing failed.
@@ -2245,6 +2304,7 @@ Checking ownership...`
 
     const ownership = await checkErc721Ownership({
       walletLabel: action.walletLabel,
+      ownerTelegramId: getRequiredTelegramUserId(ctx),
       contractAddress: action.contractAddress,
       tokenId: action.tokenId
     });
@@ -2284,7 +2344,7 @@ If live trading is false, the confirm button will NOT create a listing.`,
       ])
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Custom listing confirmation failed.
@@ -2325,6 +2385,7 @@ Re-checking ownership before submitting...`
 
     const ownership = await checkErc721Ownership({
       walletLabel: action.walletLabel,
+      ownerTelegramId: getRequiredTelegramUserId(ctx),
       contractAddress: action.contractAddress,
       tokenId: action.tokenId
     });
@@ -2352,6 +2413,7 @@ Price: ${priceEth} ETH`
 
     const result = await createOpenSeaListing({
       walletLabel: action.walletLabel,
+      ownerTelegramId: getRequiredTelegramUserId(ctx),
       contractAddress: action.contractAddress,
       tokenId: action.tokenId,
       priceEth
@@ -2369,7 +2431,7 @@ OpenSea SDK response:
 ${JSON.stringify(result.listing, null, 2).slice(0, 2500)}`
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Custom listing failed.
@@ -2427,6 +2489,7 @@ Token ID: ${action.tokenId}`
 
     const ownership = await checkErc721Ownership({
       walletLabel: action.walletLabel,
+      ownerTelegramId: getRequiredTelegramUserId(ctx),
       contractAddress: action.contractAddress,
       tokenId: action.tokenId
     });
@@ -2469,7 +2532,7 @@ If you confirm, this will sell the NFT for the top offer when live trading is en
       ])
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Accept-offer preview failed.
@@ -2502,6 +2565,7 @@ Re-checking ownership and latest top offer before submitting...`
 
     const result = await acceptOpenSeaBestOffer({
       walletLabel: action.walletLabel,
+      ownerTelegramId: getRequiredTelegramUserId(ctx),
       collectionSlug: action.collectionSlug,
       contractAddress: action.contractAddress,
       tokenId: action.tokenId
@@ -2523,7 +2587,7 @@ Tx:
 ${result.txHash}`
     );
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Accept top offer failed.
@@ -2586,21 +2650,23 @@ Or:
   }
 
   try {
-    const mainnetProvider = getMainnetProvider();
-    const wallet = getWalletByLabel(walletLabel, mainnetProvider);
+    const walletAddress = await getWalletAddressByLabelForOwner(
+      walletLabel,
+      getRequiredTelegramUserId(ctx)
+    );
 
     await ctx.reply(
       `📦 Scanning OpenSea portfolio...
 
 Wallet: ${walletLabel}
-Address: ${wallet.address}
+Address: ${walletAddress}
 Chain: Ethereum
 Limit: ${limit}`
     );
 
     const portfolio = await getOpenSeaNftsByAccount({
       chain: "ethereum",
-      address: wallet.address,
+      address: walletAddress,
       limit
     });
 
@@ -2609,12 +2675,12 @@ Limit: ${limit}`
         `No NFTs found for ${walletLabel} on OpenSea.
 
 Wallet:
-${wallet.address}`
+${walletAddress}`
       );
       return;
     }
 
-    let message = `📦 OpenSea Portfolio\n\nWallet: ${walletLabel}\nAddress: ${wallet.address}\n\n`;
+    let message = `📦 OpenSea Portfolio\n\nWallet: ${walletLabel}\nAddress: ${walletAddress}\n\n`;
 
     const buttons: any[] = [];
 
@@ -2646,7 +2712,7 @@ ${wallet.address}`
 
     await ctx.reply(message, Markup.inlineKeyboard(buttons));
   } catch (error: any) {
-    console.error(error);
+    logSafeError("Bot handler failed", error);
 
     await ctx.reply(
       `❌ Portfolio scan failed.

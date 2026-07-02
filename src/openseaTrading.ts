@@ -1,7 +1,12 @@
 import "dotenv/config";
 import { ethers } from "ethers";
 import { OpenSeaSDK, Chain } from "@opensea/sdk";
-import { getWalletByLabel } from "./vault.js";
+import {
+  getWalletAddressByLabel,
+  getWalletAddressByLabelForOwner,
+  getWalletSignerByLabel,
+  getWalletSignerByLabelForOwner
+} from "./vault.js";
 import { getOpenSeaBestOffer } from "./opensea.js";
 
 const ERC721_READ_ABI = [
@@ -25,11 +30,17 @@ export function getMainnetProvider() {
 
 export async function checkErc721Ownership(params: {
   walletLabel: string;
+  ownerTelegramId?: string;
   contractAddress: string;
   tokenId: string;
 }) {
   const provider = getMainnetProvider();
-  const wallet = getWalletByLabel(params.walletLabel, provider);
+  const walletAddress = params.ownerTelegramId
+    ? await getWalletAddressByLabelForOwner(
+        params.walletLabel,
+        params.ownerTelegramId
+      )
+    : await getWalletAddressByLabel(params.walletLabel);
 
   const contract = new ethers.Contract(
     params.contractAddress,
@@ -38,11 +49,11 @@ export async function checkErc721Ownership(params: {
   ) as unknown as Erc721ReadContract;
 
   const owner: string = await contract.ownerOf(params.tokenId);
-  const ownsToken = owner.toLowerCase() === wallet.address.toLowerCase();
+  const ownsToken = owner.toLowerCase() === walletAddress.toLowerCase();
 
   return {
     walletLabel: params.walletLabel,
-    walletAddress: wallet.address,
+    walletAddress,
     contractAddress: params.contractAddress,
     tokenId: params.tokenId,
     owner,
@@ -52,6 +63,7 @@ export async function checkErc721Ownership(params: {
 
 export async function createOpenSeaListing(params: {
   walletLabel: string;
+  ownerTelegramId?: string;
   contractAddress: string;
   tokenId: string;
   priceEth: number;
@@ -69,10 +81,22 @@ export async function createOpenSeaListing(params: {
   }
 
   const provider = getMainnetProvider();
-  const wallet = getWalletByLabel(params.walletLabel, provider);
+  const wallet = params.ownerTelegramId
+    ? await getWalletSignerByLabelForOwner(
+        params.walletLabel,
+        params.ownerTelegramId,
+        provider,
+        "opensea-create-listing"
+      )
+    : await getWalletSignerByLabel(
+        params.walletLabel,
+        provider,
+        "opensea-create-listing"
+      );
 
   const ownership = await checkErc721Ownership({
     walletLabel: params.walletLabel,
+    ...(params.ownerTelegramId ? { ownerTelegramId: params.ownerTelegramId } : {}),
     contractAddress: params.contractAddress,
     tokenId: params.tokenId
   });
@@ -109,6 +133,7 @@ export async function createOpenSeaListing(params: {
 
 export async function acceptOpenSeaBestOffer(params: {
   walletLabel: string;
+  ownerTelegramId?: string;
   collectionSlug: string;
   contractAddress: string;
   tokenId: string;
@@ -126,10 +151,22 @@ export async function acceptOpenSeaBestOffer(params: {
   }
 
   const provider = getMainnetProvider();
-  const wallet = getWalletByLabel(params.walletLabel, provider);
+  const wallet = params.ownerTelegramId
+    ? await getWalletSignerByLabelForOwner(
+        params.walletLabel,
+        params.ownerTelegramId,
+        provider,
+        "opensea-accept-best-offer"
+      )
+    : await getWalletSignerByLabel(
+        params.walletLabel,
+        provider,
+        "opensea-accept-best-offer"
+      );
 
   const ownership = await checkErc721Ownership({
     walletLabel: params.walletLabel,
+    ...(params.ownerTelegramId ? { ownerTelegramId: params.ownerTelegramId } : {}),
     contractAddress: params.contractAddress,
     tokenId: params.tokenId
   });
