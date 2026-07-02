@@ -8,13 +8,14 @@ import {
   createDecipheriv,
   scryptSync
 } from "crypto";
-import {
-  KMSClient,
-  GenerateDataKeyCommand,
-  DecryptCommand
-} from "@aws-sdk/client-kms";
 import { ethers } from "ethers";
 import { appendWalletAuditLog } from "./audit.js";
+import {
+  KMS_PROVIDER,
+  getKmsKeyRef,
+  wrapDek,
+  unwrapDek
+} from "./kms.js";
 
 const KMS_ENVELOPE_VERSION = "kms-envelope-v1";
 const LEGACY_LOCAL_VERSION = "legacy-local-v1";
@@ -36,6 +37,8 @@ type WalletRecord = {
   ownerTelegramId?: string;
   encryptedPrivateKey: EncryptedPrivateKey;
   wrappedDek?: string;
+  kmsProvider?: typeof KMS_PROVIDER;
+  kmsKeyRef?: string;
   encryptionVersion?: EncryptionVersion;
   createdAt: string;
 };
@@ -44,6 +47,8 @@ type WalletSummary = {
   label: string;
   address: string;
   ownerTelegramId?: string;
+  kmsProvider?: typeof KMS_PROVIDER;
+  kmsKeyRef?: string;
   encryptionVersion: EncryptionVersion;
   createdAt: string;
 };
@@ -61,26 +66,6 @@ function normalizeOwnerTelegramId(ownerTelegramId?: string | null): string | und
 
 function getRecordEncryptionVersion(record: WalletRecord): EncryptionVersion {
   return record.encryptionVersion || LEGACY_LOCAL_VERSION;
-}
-
-function getKmsClient() {
-  const region = process.env.AWS_REGION;
-
-  if (!region) {
-    throw new Error("Missing AWS_REGION in .env.");
-  }
-
-  return new KMSClient({ region });
-}
-
-function getKmsKeyId(): string {
-  const keyId = process.env.KMS_KEY_ID;
-
-  if (!keyId) {
-    throw new Error("Missing KMS_KEY_ID in .env.");
-  }
-
-  return keyId;
 }
 
 function getLegacyVaultKey(): Buffer {
@@ -141,43 +126,18 @@ function decryptLegacyPrivateKey(encrypted: EncryptedPrivateKey): string {
 }
 
 async function createEncryptedPrivateKey(privateKey: string) {
-  const kms = getKmsClient();
-  const response = await kms.send(
-    new GenerateDataKeyCommand({
-      KeyId: getKmsKeyId(),
-      KeySpec: "AES_256"
-    })
-  );
-
-  if (!response.Plaintext || !response.CiphertextBlob) {
-    throw new Error("AWS KMS did not return a usable data key.");
-  }
-
-  const dek = Buffer.from(response.Plaintext);
+  const dek = randomBytes(32);
 
   try {
     return {
       encryptedPrivateKey: encryptPrivateKeyWithDek(privateKey, dek),
-      wrappedDek: Buffer.from(response.CiphertextBlob).toString("base64")
+      wrappedDek: await wrapDek(dek),
+      kmsProvider: KMS_PROVIDER,
+      kmsKeyRef: getKmsKeyRef()
     };
   } finally {
     dek.fill(0);
   }
-}
-
-async function unwrapDek(wrappedDek: string): Promise<Buffer> {
-  const kms = getKmsClient();
-  const response = await kms.send(
-    new DecryptCommand({
-      CiphertextBlob: Buffer.from(wrappedDek, "base64")
-    })
-  );
-
-  if (!response.Plaintext) {
-    throw new Error("AWS KMS did not return a usable plaintext data key.");
-  }
-
-  return Buffer.from(response.Plaintext);
 }
 
 async function decryptPrivateKeyForRecord(record: WalletRecord): Promise<string> {
@@ -189,6 +149,10 @@ async function decryptPrivateKeyForRecord(record: WalletRecord): Promise<string>
 
   if (!record.wrappedDek) {
     throw new Error(`Wallet "${record.label}" is missing its wrapped DEK.`);
+  }
+
+  if (record.kmsProvider && record.kmsProvider !== KMS_PROVIDER) {
+    throw new Error(`Wallet "${record.label}" uses an unsupported KMS provider.`);
   }
 
   const dek = await unwrapDek(record.wrappedDek);
@@ -278,6 +242,8 @@ function toWalletSummary(wallet: WalletRecord): WalletSummary {
     label: wallet.label,
     address: wallet.address,
     ...(wallet.ownerTelegramId ? { ownerTelegramId: wallet.ownerTelegramId } : {}),
+    ...(wallet.kmsProvider ? { kmsProvider: wallet.kmsProvider } : {}),
+    ...(wallet.kmsKeyRef ? { kmsKeyRef: wallet.kmsKeyRef } : {}),
     encryptionVersion: getRecordEncryptionVersion(wallet),
     createdAt: wallet.createdAt
   };
@@ -337,6 +303,8 @@ export async function addWallet(
       : {}),
     encryptedPrivateKey: encrypted.encryptedPrivateKey,
     wrappedDek: encrypted.wrappedDek,
+    kmsProvider: encrypted.kmsProvider,
+    kmsKeyRef: encrypted.kmsKeyRef,
     encryptionVersion: KMS_ENVELOPE_VERSION,
     createdAt: new Date().toISOString()
   };
