@@ -756,6 +756,10 @@ function formatMintPreviewMessage(
       "",
       "Gas estimation failed. The mint may not be live, wallet may not be eligible, function may be wrong, or contract may reject the call."
     );
+
+    if (preview.gasEstimateError) {
+      lines.push(`Reason: ${preview.gasEstimateError}`);
+    }
   }
 
   return lines.join("\n");
@@ -2447,7 +2451,9 @@ bot.action(/^mint:confirm:([0-9a-f-]+)$/, async (ctx) => {
         reason: "gas_estimation_failed"
       });
       await ctx.reply(
-        "Gas estimation failed. The mint may not be live, wallet may not be eligible, function may be wrong, or contract may reject the call."
+        `Gas estimation failed. The mint may not be live, wallet may not be eligible, function may be wrong, or contract may reject the call.${
+          preview.gasEstimateError ? `\n\nReason:\n${preview.gasEstimateError}` : ""
+        }`
       );
       return;
     }
