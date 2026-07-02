@@ -268,6 +268,7 @@ export async function addWallet(
 
   const addressExists = wallets.some(
     (savedWallet) =>
+      savedWallet.ownerTelegramId === normalizedOwnerTelegramId &&
       savedWallet.address.toLowerCase() === wallet.address.toLowerCase()
   );
 

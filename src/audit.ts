@@ -2,12 +2,15 @@ import fs from "fs/promises";
 import path from "path";
 
 type WalletAuditEvent = {
-  walletLabel: string;
-  walletAddress: string;
+  walletLabel?: string;
+  walletAddress?: string;
   ownerTelegramId: string | null;
   action: string;
   timestamp: string;
-  encryptionVersion: string;
+  encryptionVersion?: string;
+  importedCount?: number;
+  skippedCount?: number;
+  reason?: string;
 };
 
 type WalletAuditLog = {
