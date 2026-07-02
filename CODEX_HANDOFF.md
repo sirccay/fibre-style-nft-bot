@@ -184,6 +184,8 @@ Implemented commands:
 
 - `/osportfolio wallet1`
 
+- `/tradingstatus`
+
 
 
 These fetch:
@@ -222,6 +224,17 @@ Mainnet write actions are locked by:
 
 `ALLOW_MAINNET_TRADING=false`
 
+- Live OpenSea listing and accept-offer actions stay blocked unless `ALLOW_MAINNET_TRADING=true`.
+
+- Read-only floor/listing/offer previews continue to work while live trading is disabled.
+
+- Post-mint marketplace actions validate the session owner, session status/TTL, saved wallet ownership, archived-wallet status, and on-chain NFT ownership before previews and final actions.
+
+- Final live buttons are single-use once the live action begins. If mainnet trading is disabled, the action is blocked before the session is consumed.
+
+- OpenSea result replies summarize public tx/order hashes only; raw SDK payloads and signed data are not echoed.
+
+- Marketplace audit events include `opensea_listing_previewed`, `opensea_custom_listing_previewed`, `opensea_listing_confirmed`, `opensea_listing_blocked`, `opensea_top_offer_checked`, `opensea_accept_offer_previewed`, `opensea_accept_offer_confirmed`, `opensea_accept_offer_blocked`, and `opensea_action_failed`.
 
 
 ### Post-mint action menu
@@ -474,6 +487,10 @@ Rename wallet:
 Archive wallet inside bot:
 
 `/deletewallet mintwallet`
+
+Check live trading lock/config:
+
+`/tradingstatus`
 
 Claim an old ownerless wallet record:
 

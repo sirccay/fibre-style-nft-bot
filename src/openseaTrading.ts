@@ -7,6 +7,9 @@ import {
 } from "./vault.js";
 import { getOpenSeaBestOffer } from "./opensea.js";
 
+const MAINNET_TRADING_DISABLED_MESSAGE =
+  "Mainnet trading is disabled. Set ALLOW_MAINNET_TRADING=true only when you are ready for live testing.";
+
 const ERC721_READ_ABI = [
   "function ownerOf(uint256 tokenId) view returns (address)",
   "function isApprovedForAll(address owner, address operator) view returns (bool)"
@@ -65,9 +68,7 @@ export async function createOpenSeaListing(params: {
   priceEth: number;
 }) {
   if (process.env.ALLOW_MAINNET_TRADING !== "true") {
-    throw new Error(
-      "Mainnet trading is locked. Set ALLOW_MAINNET_TRADING=true in .env only when you are ready."
-    );
+    throw new Error(MAINNET_TRADING_DISABLED_MESSAGE);
   }
 
   const apiKey = process.env.OPENSEA_API_KEY;
@@ -129,9 +130,7 @@ export async function acceptOpenSeaBestOffer(params: {
   tokenId: string;
 }) {
   if (process.env.ALLOW_MAINNET_TRADING !== "true") {
-    throw new Error(
-      "Mainnet trading is locked. Set ALLOW_MAINNET_TRADING=true in .env only when you are ready."
-    );
+    throw new Error(MAINNET_TRADING_DISABLED_MESSAGE);
   }
 
   const apiKey = process.env.OPENSEA_API_KEY;

@@ -14,6 +14,11 @@ type WalletAuditEvent = {
   newWalletLabel?: string;
   sessionId?: string;
   status?: string;
+  collectionSlug?: string;
+  contractAddress?: string;
+  tokenId?: string;
+  priceEth?: number;
+  txHash?: string;
   reason?: string;
 };
 
@@ -30,6 +35,8 @@ type SessionAuditEvent = {
   collectionSlug?: string;
   contractAddress?: string;
   tokenId?: string;
+  priceEth?: number;
+  txHash?: string;
   action: string;
   status?: string;
   reason?: string;
