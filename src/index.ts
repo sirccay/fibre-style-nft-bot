@@ -62,7 +62,8 @@ import {
 import type {
   DetectedChainName,
   MintDetectionResult,
-  MintFunctionCandidate
+  MintFunctionCandidate,
+  OpenSeaMintMetadata
 } from "./mintDetector.js";
 import { detectMintPhase } from "./mintPhaseDetector.js";
 import type { MintPhaseDetectionResult } from "./mintPhaseDetector.js";
@@ -204,6 +205,7 @@ function redactSensitiveText(text: string): string {
     "ETH_SEPOLIA_RPC_URL",
     "ETH_MAINNET_RPC_URL",
     "OPENSEA_API_KEY",
+    "RESERVOIR_API_KEY",
     "VAULT_SECRET"
   ];
 
@@ -997,6 +999,7 @@ function formatMintTarget(target: MintTarget) {
     ...(metadata?.phaseTypeEstimate
       ? [`Detected Phase Type: ${metadata.phaseTypeEstimate} (${metadata.phaseTypeConfidence || "unknown"})`]
       : []),
+    ...(metadata?.openSeaMint ? ["", ...formatOpenSeaMintMetadata(metadata.openSeaMint)] : []),
     `Created: ${target.createdAt}`,
     `Updated: ${target.updatedAt}`
   ].join("\n");
@@ -1113,6 +1116,105 @@ function formatFunctionCandidates(candidates: MintFunctionCandidate[]) {
     .join("\n");
 }
 
+function getOpenSeaMintCurrentStage(openSeaMint?: OpenSeaMintMetadata) {
+  if (!openSeaMint) {
+    return undefined;
+  }
+
+  if (openSeaMint.currentStageName) {
+    const byName = openSeaMint.mintSchedule.find(
+      (stage) =>
+        stage.stageName?.toLowerCase() ===
+        openSeaMint.currentStageName?.toLowerCase()
+    );
+
+    if (byName) {
+      return byName;
+    }
+  }
+
+  return openSeaMint.mintSchedule.find((stage) => stage.status === "live");
+}
+
+function formatOpenSeaMintMetadata(openSeaMint?: OpenSeaMintMetadata) {
+  if (!openSeaMint) {
+    return [];
+  }
+
+  const lines: string[] = [
+    "OpenSea Mint Metadata:",
+    ...(openSeaMint.mintStatusText ? [`Mint Status: ${openSeaMint.mintStatusText}`] : []),
+    ...(openSeaMint.mintedCount !== undefined || openSeaMint.maxSupply !== undefined
+      ? [
+          `Items Minted: ${
+            openSeaMint.mintedCount !== undefined ? openSeaMint.mintedCount : "Unknown"
+          } / ${openSeaMint.maxSupply !== undefined ? openSeaMint.maxSupply : "Unknown"}`
+        ]
+      : [])
+  ];
+  const currentStage = getOpenSeaMintCurrentStage(openSeaMint);
+
+  if (
+    openSeaMint.currentStageName ||
+    openSeaMint.currentStagePriceText ||
+    openSeaMint.currentStageLimitPerWallet !== undefined ||
+    currentStage
+  ) {
+    lines.push(
+      "",
+      "Current Stage:",
+      openSeaMint.currentStageName || currentStage?.stageName || "Unknown",
+      ...(openSeaMint.currentStagePriceText || currentStage?.priceText
+        ? [`Price: ${openSeaMint.currentStagePriceText || currentStage?.priceText}`]
+        : []),
+      ...(openSeaMint.currentStageLimitPerWallet !== undefined ||
+      currentStage?.limitPerWallet !== undefined
+        ? [
+            `Limit: ${
+              openSeaMint.currentStageLimitPerWallet ??
+              currentStage?.limitPerWallet
+            } per wallet`
+          ]
+        : []),
+      ...(currentStage?.eligibilityText
+        ? [`Eligibility: ${currentStage.eligibilityText}`]
+        : []),
+      ...(currentStage?.status ? [`Status: ${currentStage.status}`] : [])
+    );
+  }
+
+  if (openSeaMint.mintSchedule.length > 0) {
+    lines.push("", "Mint Schedule:");
+
+    for (const [index, stage] of openSeaMint.mintSchedule.entries()) {
+      lines.push(
+        `${index + 1}. ${stage.stageName || "Unknown stage"}`,
+        `Status: ${stage.status}`,
+        `Phase Type: ${stage.phaseTypeEstimate} (${stage.phaseTypeConfidence})`,
+        ...(stage.startTimeText ? [`Time: ${stage.startTimeText}`] : []),
+        ...(stage.endTimeText ? [`Ends: ${stage.endTimeText}`] : []),
+        ...(stage.priceText ? [`Price: ${stage.priceText}`] : []),
+        ...(stage.limitPerWallet !== undefined
+          ? [`Limit: ${stage.limitPerWallet} per wallet`]
+          : []),
+        ...(stage.eligibilityText ? [`Eligibility: ${stage.eligibilityText}`] : []),
+        ""
+      );
+    }
+  }
+
+  lines.push(
+    `Metadata Source: ${openSeaMint.metadataSource}`,
+    `Mint Schedule Confidence: ${openSeaMint.confidence}`
+  );
+
+  if (openSeaMint.rawTimeZoneText) {
+    lines.push(`Time Zone Text: ${openSeaMint.rawTimeZoneText}`);
+  }
+
+  return lines;
+}
+
 function getDetectionMetadata(detection: MintDetectionResult) {
   return {
     lastCheckedAt: detection.detectedAt,
@@ -1134,6 +1236,7 @@ function getDetectionMetadata(detection: MintDetectionResult) {
     phaseTypeConfidence: detection.mint.phaseTypeConfidence,
     phaseTypeEvidence: detection.mint.phaseTypeEvidence,
     phaseConfidence: detection.mint.confidence,
+    ...(detection.mint.openSeaMint ? { openSeaMint: detection.mint.openSeaMint } : {}),
     warnings: detection.warnings.slice(0, 10)
   };
 }
@@ -1141,6 +1244,7 @@ function getDetectionMetadata(detection: MintDetectionResult) {
 function formatMintDetectionResult(detection: MintDetectionResult) {
   const detected: string[] = [];
   const notDetected: string[] = [];
+  const openSeaMint = detection.mint.openSeaMint;
 
   if (detection.contract.collectionSlug) {
     detected.push("Collection slug");
@@ -1160,22 +1264,33 @@ function formatMintDetectionResult(detection: MintDetectionResult) {
     notDetected.push("Mint function");
   }
 
-  if (detection.mint.priceEth) {
+  if (detection.mint.priceEth || openSeaMint?.currentStagePriceText) {
     detected.push("Mint price");
   } else {
     notDetected.push("Mint price");
   }
 
-  if (detection.mint.phaseStatus !== "unknown") {
+  if (detection.mint.phaseStatus !== "unknown" || openSeaMint?.mintStatusText) {
     detected.push("Mint phase");
   } else {
     notDetected.push("Mint phase");
   }
 
-  if (detection.mint.startTime) {
+  if (
+    detection.mint.startTime ||
+    openSeaMint?.mintSchedule.some((stage) => stage.startTimeText)
+  ) {
     detected.push("Mint start time");
   } else {
     notDetected.push("Mint start time");
+  }
+
+  if (openSeaMint?.mintSchedule.length) {
+    detected.push("Mint schedule");
+  }
+
+  if (openSeaMint?.mintedCount !== undefined || openSeaMint?.maxSupply !== undefined) {
+    detected.push("Minted supply");
   }
 
   return [
@@ -1192,7 +1307,11 @@ function formatMintDetectionResult(detection: MintDetectionResult) {
     ...(detection.contract.address
       ? [`Contract: ${formatShortAddress(detection.contract.address)}`]
       : ["Contract: Unknown"]),
+    ...(detection.contract.tokenStandard
+      ? [`Token Standard: ${detection.contract.tokenStandard}`]
+      : []),
     ...(detection.contract.tokenId ? [`Token ID: ${detection.contract.tokenId}`] : []),
+    ...(openSeaMint ? ["", ...formatOpenSeaMintMetadata(openSeaMint)] : []),
     "",
     "Detected:",
     ...(detected.length > 0 ? detected.map((item) => `- ${item}`) : ["- None"]),
@@ -1212,6 +1331,7 @@ function formatMintDetectionResult(detection: MintDetectionResult) {
     `- Contract: ${detection.contract.confidence}`,
     `- Chain: ${detection.chain.confidence}`,
     `- Mint: ${detection.mint.confidence}`,
+    ...(openSeaMint ? [`- Mint schedule: ${openSeaMint.confidence}`] : []),
     ...(detection.warnings.length > 0
       ? ["", "Warnings:", ...detection.warnings.map((warning) => `- ${warning}`)]
       : []),
@@ -2606,8 +2726,11 @@ bot.command("parserstatus", async (ctx) => {
     `Parser Status
 
 OPENSEA_API_KEY configured: ${getConfiguredStatus(process.env.OPENSEA_API_KEY)}
+RESERVOIR_API_KEY configured: ${getConfiguredStatus(process.env.RESERVOIR_API_KEY)}
 ETH_MAINNET_RPC_URL configured: ${rpcStatus.mainnetRpcConfigured ? "yes" : "no"}
 SEPOLIA_RPC_URL or ETH_SEPOLIA_RPC_URL configured: ${rpcStatus.sepoliaRpcConfigured ? "yes" : "no"}
+OpenSea page metadata fallback: enabled
+Reservoir mint-stage lookup: ${getConfiguredStatus(process.env.RESERVOIR_API_KEY) === "yes" ? "enabled" : "disabled"}
 
 Supported platforms:
 - OpenSea collection and asset URLs
@@ -2623,7 +2746,6 @@ Supported phase detection:
 - Common read-only contract fields
 
 Future upgrades:
-- Reservoir mint stages
 - Etherscan ABI lookup
 - 4byte selector lookup
 - transaction-history price inference`
@@ -2893,7 +3015,21 @@ bot.command("checkmintphase", async (ctx) => {
       reason: phase.warnings[0]
     });
 
-    await ctx.reply(formatPhaseDetectionResult(phase));
+    await ctx.reply(
+      [
+        ...(target.detectedMetadata?.openSeaMint
+          ? [
+              "Stored OpenSea Mint Schedule",
+              "",
+              ...formatOpenSeaMintMetadata(target.detectedMetadata.openSeaMint),
+              "",
+              "On-chain Phase Probe",
+              ""
+            ]
+          : []),
+        formatPhaseDetectionResult(phase)
+      ].join("\n")
+    );
   } catch (error) {
     logSafeError("Could not check mint phase", error);
     await ctx.reply(`❌ Could not check mint phase.\n\nReason:\n${getSafeErrorMessage(error)}`);
@@ -2981,6 +3117,26 @@ bot.command("checkmintreadiness", async (ctx) => {
     const ownerTelegramId = getRequiredTelegramUserId(ctx);
     const target = getMintTargetForOwner(targetId, ownerTelegramId);
     const targetMissing = getMintTargetMissingFields(target);
+    const openSeaMint = target.detectedMetadata?.openSeaMint;
+    const openSeaCurrentStage = getOpenSeaMintCurrentStage(openSeaMint);
+    const openSeaPhaseStatus =
+      openSeaCurrentStage?.status ||
+      (openSeaMint?.mintStatusText?.toLowerCase().includes("minting now")
+        ? "live"
+        : openSeaMint?.mintStatusText?.toLowerCase().includes("minting soon")
+          ? "not_live_yet"
+          : openSeaMint?.mintStatusText?.toLowerCase().includes("sold out") ||
+              openSeaMint?.mintStatusText?.toLowerCase().includes("mint ended")
+            ? "ended"
+            : "unknown");
+    const pagePriceIsNotEth =
+      Boolean(openSeaMint?.currentStagePriceText) &&
+      !openSeaMint?.currentStagePriceEth &&
+      target.priceEth === undefined;
+    const openSeaPhaseBlocksReadiness =
+      openSeaPhaseStatus === "not_live_yet" ||
+      openSeaPhaseStatus === "ended" ||
+      openSeaPhaseStatus === "paused";
     const wallet = await getWalletSummaryByLabelForOwner(walletLabel, ownerTelegramId);
     const contractExists = await getContractExists(target.chain, target.contractAddress);
     const functionSupported = Boolean(target.functionSignature);
@@ -3026,6 +3182,8 @@ bot.command("checkmintreadiness", async (ctx) => {
       !contractExists ||
       !functionSupported ||
       balanceEnough === false ||
+      pagePriceIsNotEth ||
+      openSeaPhaseBlocksReadiness ||
       !mainnetLockAllows
         ? "no"
         : gasEstimate
@@ -3061,11 +3219,22 @@ Balance enough for mint price: ${balanceEnough === null ? "unknown" : balanceEno
 Gas estimate: ${gasEstimate ? gasEstimate : "no"}
 Phase status: ${phase.phaseStatus}
 Phase type estimate: ${phase.phaseTypeEstimate}
+Detected OpenSea mint status: ${openSeaMint?.mintStatusText || "unknown"}
+Detected current stage: ${openSeaCurrentStage?.stageName || openSeaMint?.currentStageName || "unknown"}
+Detected page price: ${openSeaMint?.currentStagePriceText || "unknown"}
 Mainnet minting lock: ${isMainnetMintingEnabled() ? "enabled" : "disabled"}
 
 Final:
 Ready for manual mint: ${finalStatus}
 ${targetMissing.length > 0 ? `\nMissing: ${targetMissing.join(", ")}` : ""}${
+        pagePriceIsNotEth
+          ? `\nDetected page price is not an ETH value. Set priceEth with /updateminttarget before minting.`
+          : ""
+      }${
+        openSeaPhaseBlocksReadiness
+          ? `\nDetected page phase is ${openSeaPhaseStatus}; treat this target as not ready.`
+          : ""
+      }${
         gasError ? `\nGas reason: ${gasError}` : ""
       }${
         phase.phaseTypeEstimate === "holder_phase"

@@ -199,6 +199,7 @@ const PHASE_ALIAS_CONFIGS: PhaseAliasConfig[] = [
     aliases: [
       "public",
       "public sale",
+      "public stage",
       "public mint",
       "open mint",
       "open sale",
