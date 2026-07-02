@@ -9,7 +9,10 @@ import {
   addWallet,
   listWalletsForOwner,
   getWalletAddressByLabelForOwner,
-  getWalletSignerByLabelForOwner
+  getWalletSignerByLabelForOwner,
+  getWalletSummaryByLabelForOwner,
+  renameWalletForOwner,
+  archiveWalletForOwner
 } from "./vault.js";
 import { getTelegramUserId, requireAdmin } from "./auth.js";
 import { extractOpenSeaSlug, getOpenSeaCollectionStats, getOpenSeaBestOffer, getOpenSeaBestListing, getOpenSeaNft, getOpenSeaNftsByAccount } from "./opensea.js";
@@ -24,6 +27,32 @@ if (!token) {
 
 const bot = new Telegraf(token);
 
+const BOT_COMMANDS = [
+  { command: "start", description: "Open bot menu" },
+  { command: "addwallet", description: "Import wallet" },
+  { command: "importwallet", description: "Import wallet alias" },
+  { command: "wallets", description: "Show your wallets" },
+  { command: "wallet", description: "View wallet details" },
+  { command: "balance", description: "Check wallet balance" },
+  { command: "renamewallet", description: "Rename wallet" },
+  { command: "deletewallet", description: "Remove wallet" },
+  { command: "minttest", description: "Test Sepolia mint" },
+  { command: "nfts", description: "Show wallet NFTs" },
+  { command: "osportfolio", description: "Show OpenSea portfolio" },
+  { command: "postmint", description: "Open NFT action menu" },
+  { command: "osfloor", description: "Check collection floor" },
+  { command: "topoffer", description: "Check top offer" },
+  { command: "bestlisting", description: "Check best listing" },
+  { command: "help", description: "Show commands" }
+];
+
+type SupportedBalanceNetwork = "sepolia" | "mainnet";
+
+const BALANCE_NETWORK_LABELS: Record<SupportedBalanceNetwork, string> = {
+  sepolia: "Sepolia",
+  mainnet: "Mainnet"
+};
+
 function getSepoliaRpcUrl(): string {
   const rpcUrl = process.env.SEPOLIA_RPC_URL || process.env.ETH_SEPOLIA_RPC_URL;
 
@@ -34,11 +63,27 @@ function getSepoliaRpcUrl(): string {
   return rpcUrl;
 }
 
+function getMainnetRpcUrl(): string {
+  const rpcUrl = process.env.ETH_MAINNET_RPC_URL;
+
+  if (!rpcUrl) {
+    throw new Error("Missing ETH_MAINNET_RPC_URL");
+  }
+
+  return rpcUrl;
+}
+
 function getProvider() {
   return new ethers.JsonRpcProvider(getSepoliaRpcUrl());
 }
 
-const provider = getProvider();
+function getBalanceProvider(network: SupportedBalanceNetwork) {
+  if (network === "mainnet") {
+    return new ethers.JsonRpcProvider(getMainnetRpcUrl());
+  }
+
+  return getProvider();
+}
 
 function parseCommandParts(text: string): string[] {
   return text.trim().split(/\s+/).filter(Boolean);
@@ -105,6 +150,371 @@ function getSafeErrorMessage(error: unknown): string {
 
 function logSafeError(context: string, error: unknown) {
   console.error(`${context}: ${getSafeErrorMessage(error)}`);
+}
+
+function formatShortAddress(address: string): string {
+  if (address.length <= 12) {
+    return address;
+  }
+
+  return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+function normalizeWalletLabel(label: string): string {
+  return label.trim().toLowerCase();
+}
+
+function isValidWalletLabel(label: string): boolean {
+  return WALLET_IMPORT_LABEL_PATTERN.test(label);
+}
+
+function formatWalletStatus(status?: string): string {
+  return status === "archived" ? "Archived" : "Active";
+}
+
+function formatWalletEncryption(kmsProvider?: string): string {
+  return kmsProvider === "azure-key-vault" ? "Azure Key Vault" : "Legacy local";
+}
+
+function getHelpMessage() {
+  return `Commands
+
+Wallets:
+/addwallet 0xPRIVATE_KEY
+/addwallet
+0xPRIVATE_KEY_1
+0xPRIVATE_KEY_2
+/wallets
+/wallet wallet1
+/balance wallet1
+/balance wallet1 mainnet
+/renamewallet wallet1 mintwallet
+/deletewallet wallet1
+
+NFTs:
+/nfts wallet1
+/osportfolio wallet1 5
+/postmint wallet1 collectionSlug contractAddress tokenId
+
+OpenSea:
+/osfloor collectionSlug
+/topoffer collectionSlug tokenId
+/bestlisting collectionSlug tokenId
+
+Testing:
+/minttest wallet1 1`;
+}
+
+function getWalletActionKeyboard(wallets: Array<{ label: string; status?: string }>) {
+  const rows = wallets.flatMap((wallet) => {
+    if (wallet.status === "archived") {
+      return [[Markup.button.callback(`View ${wallet.label}`, `wm:view:${wallet.label}`)]];
+    }
+
+    return [
+      [
+        Markup.button.callback(`View ${wallet.label}`, `wm:view:${wallet.label}`),
+        Markup.button.callback("Balance", `wm:balance:${wallet.label}`),
+        Markup.button.callback("NFTs", `wm:nfts:${wallet.label}`)
+      ]
+    ];
+  });
+
+  return Markup.inlineKeyboard(rows);
+}
+
+async function auditWalletManagementAction(details: {
+  ownerTelegramId: string | null;
+  action: string;
+  walletLabel?: string;
+  walletAddress?: string;
+  encryptionVersion?: string;
+  network?: string;
+  newWalletLabel?: string;
+  sessionId?: string;
+  status?: string;
+  reason?: string;
+}) {
+  await appendWalletAuditLog(details);
+}
+
+async function registerTelegramCommandMenu() {
+  try {
+    await bot.telegram.setMyCommands(BOT_COMMANDS);
+
+    try {
+      await auditWalletManagementAction({
+        ownerTelegramId: null,
+        action: "command_menu_registered"
+      });
+    } catch (auditError) {
+      logSafeError("Command menu audit failed", auditError);
+    }
+  } catch (error) {
+    logSafeError("Could not register Telegram command menu", error);
+  }
+}
+
+async function sendWalletsList(ctx: Context) {
+  const ownerTelegramId = getRequiredTelegramUserId(ctx);
+  const wallets = await listWalletsForOwner(ownerTelegramId);
+
+  if (wallets.length === 0) {
+    await ctx.reply(
+      "No wallets found. Add one with /addwallet in private chat, or:\n\nnpm run wallet:add"
+    );
+    return;
+  }
+
+  const message = wallets
+    .map((wallet) => {
+      const status = formatWalletStatus(wallet.status);
+
+      return [
+        `Wallet: ${wallet.label}`,
+        `Address: ${formatShortAddress(wallet.address)}`,
+        `Status: ${status}`
+      ].join("\n");
+    })
+    .join("\n\n");
+
+  await ctx.reply(
+    `Your wallets:\n\n${message}`,
+    getWalletActionKeyboard(wallets)
+  );
+}
+
+async function sendWalletDetails(ctx: Context, walletLabel: string) {
+  const ownerTelegramId = getRequiredTelegramUserId(ctx);
+  const wallet = await getWalletSummaryByLabelForOwner(
+    walletLabel,
+    ownerTelegramId,
+    { includeArchived: true }
+  );
+
+  await auditWalletManagementAction({
+    ownerTelegramId,
+    action: "wallet_viewed",
+    walletLabel: wallet.label,
+    walletAddress: wallet.address,
+    encryptionVersion: wallet.encryptionVersion,
+    status: wallet.status
+  });
+
+  const details = [
+    `Wallet: ${wallet.label}`,
+    `Address: ${formatShortAddress(wallet.address)}`,
+    `Status: ${formatWalletStatus(wallet.status)}`,
+    `Encryption: ${formatWalletEncryption(wallet.kmsProvider)}`,
+    `Created: ${wallet.createdAt}`
+  ];
+
+  if (wallet.archivedAt) {
+    details.push(`Archived: ${wallet.archivedAt}`);
+  }
+
+  if (wallet.status === "archived") {
+    await ctx.reply(
+      `${details.join("\n")}\n\nArchived wallets cannot be used for bot actions.`
+    );
+    return;
+  }
+
+  await ctx.reply(
+    `${details.join("\n")}\n\nActions:`,
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback("Balance", `wm:balance:${wallet.label}`),
+        Markup.button.callback("NFTs", `wm:nfts:${wallet.label}`),
+        Markup.button.callback("Portfolio", `wm:portfolio:${wallet.label}`)
+      ]
+    ])
+  );
+}
+
+function parseBalanceNetwork(rawNetwork?: string): SupportedBalanceNetwork {
+  const normalized = rawNetwork?.trim().toLowerCase();
+
+  if (!normalized || normalized === "sepolia") {
+    return "sepolia";
+  }
+
+  if (normalized === "mainnet") {
+    return "mainnet";
+  }
+
+  throw new Error("Network must be sepolia or mainnet.");
+}
+
+async function sendWalletBalance(
+  ctx: Context,
+  walletLabel: string,
+  network: SupportedBalanceNetwork
+) {
+  const ownerTelegramId = getRequiredTelegramUserId(ctx);
+  const wallet = await getWalletSummaryByLabelForOwner(
+    walletLabel,
+    ownerTelegramId
+  );
+  const balanceProvider = getBalanceProvider(network);
+  const balanceWei = await balanceProvider.getBalance(wallet.address);
+  const balanceEth = ethers.formatEther(balanceWei);
+
+  await auditWalletManagementAction({
+    ownerTelegramId,
+    action: "wallet_balance_checked",
+    walletLabel: wallet.label,
+    walletAddress: wallet.address,
+    encryptionVersion: wallet.encryptionVersion,
+    network
+  });
+
+  await ctx.reply(
+    `Balance for ${wallet.label} on ${BALANCE_NETWORK_LABELS[network]}:\n${balanceEth} ETH`
+  );
+}
+
+type WalletDeleteConfirmationStatus = "active" | "used" | "cancelled" | "expired";
+
+type WalletDeleteConfirmation = {
+  sessionId: string;
+  ownerTelegramId: string;
+  walletLabel: string;
+  walletAddress: string;
+  encryptionVersion: string;
+  createdAt: string;
+  expiresAt: string;
+  status: WalletDeleteConfirmationStatus;
+};
+
+const WALLET_DELETE_CONFIRMATION_TTL_MS = 10 * 60 * 1000;
+const walletDeleteConfirmations = new Map<string, WalletDeleteConfirmation>();
+
+function isWalletDeleteConfirmationExpired(session: WalletDeleteConfirmation) {
+  const expiresAtMs = Date.parse(session.expiresAt);
+  return !Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now();
+}
+
+function cleanupWalletDeleteConfirmations() {
+  for (const [sessionId, session] of walletDeleteConfirmations.entries()) {
+    if (session.status === "active" && isWalletDeleteConfirmationExpired(session)) {
+      session.status = "expired";
+    }
+
+    const expiresAtMs = Date.parse(session.expiresAt);
+    const cleanupAfterMs = Number.isFinite(expiresAtMs)
+      ? expiresAtMs + WALLET_DELETE_CONFIRMATION_TTL_MS
+      : Date.now();
+
+    if (cleanupAfterMs <= Date.now()) {
+      walletDeleteConfirmations.delete(sessionId);
+    }
+  }
+}
+
+function createWalletDeleteConfirmation(params: {
+  ownerTelegramId: string;
+  walletLabel: string;
+  walletAddress: string;
+  encryptionVersion: string;
+}) {
+  cleanupWalletDeleteConfirmations();
+
+  const createdAt = new Date();
+  const session: WalletDeleteConfirmation = {
+    sessionId: randomUUID(),
+    ownerTelegramId: params.ownerTelegramId,
+    walletLabel: params.walletLabel,
+    walletAddress: params.walletAddress,
+    encryptionVersion: params.encryptionVersion,
+    createdAt: createdAt.toISOString(),
+    expiresAt: new Date(
+      createdAt.getTime() + WALLET_DELETE_CONFIRMATION_TTL_MS
+    ).toISOString(),
+    status: "active"
+  };
+
+  walletDeleteConfirmations.set(session.sessionId, session);
+  return session;
+}
+
+async function auditWalletDeleteConfirmation(
+  session: WalletDeleteConfirmation,
+  action: string,
+  actorTelegramId: string | null,
+  reason?: string
+) {
+  await auditWalletManagementAction({
+    ownerTelegramId: session.ownerTelegramId,
+    action,
+    walletLabel: session.walletLabel,
+    walletAddress: session.walletAddress,
+    encryptionVersion: session.encryptionVersion,
+    sessionId: session.sessionId,
+    status: session.status,
+    ...(actorTelegramId && actorTelegramId !== session.ownerTelegramId
+      ? { reason: reason ? `${reason}; actor=${actorTelegramId}` : `actor=${actorTelegramId}` }
+      : reason
+        ? { reason }
+        : {})
+  });
+}
+
+async function validateWalletDeleteConfirmation(
+  ctx: Context,
+  sessionId: string
+) {
+  cleanupWalletDeleteConfirmations();
+
+  const actorTelegramId = getTelegramUserId(ctx);
+
+  if (!actorTelegramId) {
+    await ctx.reply("❌ Could not verify your Telegram account for this action.");
+    return null;
+  }
+
+  const session = walletDeleteConfirmations.get(sessionId);
+
+  if (!session) {
+    await ctx.reply("This wallet removal confirmation has expired. Run /deletewallet again.");
+    return null;
+  }
+
+  if (session.ownerTelegramId !== actorTelegramId) {
+    await auditWalletDeleteConfirmation(
+      session,
+      "wallet_delete_blocked_wrong_user",
+      actorTelegramId,
+      "wrong_user"
+    );
+    await ctx.reply("❌ This wallet removal confirmation is not available for your Telegram account.");
+    return null;
+  }
+
+  if (session.status === "expired" || isWalletDeleteConfirmationExpired(session)) {
+    session.status = "expired";
+    await auditWalletDeleteConfirmation(
+      session,
+      "wallet_delete_blocked_expired",
+      actorTelegramId,
+      "expired"
+    );
+    await ctx.reply("This wallet removal confirmation has expired. Run /deletewallet again.");
+    return null;
+  }
+
+  if (session.status === "used" || session.status === "cancelled") {
+    await auditWalletDeleteConfirmation(
+      session,
+      "wallet_delete_blocked_already_used",
+      actorTelegramId,
+      "already_used_or_cancelled"
+    );
+    await ctx.reply("This wallet removal confirmation has already been used or cancelled.");
+    return null;
+  }
+
+  return { session, actorTelegramId };
 }
 
 type TelegramWalletImportContext = Context & {
@@ -976,6 +1386,12 @@ bot.command("code", async (ctx) => {
   }
 });
 
+bot.command("help", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.reply(getHelpMessage());
+});
+
 for (const command of ["addwallet", "importwallet", "import_wallet"]) {
   bot.command(command, async (ctx) => {
     await handleTelegramWalletImport(ctx as TelegramWalletImportContext);
@@ -988,36 +1404,7 @@ bot.action("wallet_status", async (ctx) => {
   await ctx.answerCbQuery();
 
   try {
-    const ownerTelegramId = getRequiredTelegramUserId(ctx);
-    const wallets = await listWalletsForOwner(ownerTelegramId);
-
-    if (wallets.length === 0) {
-      await ctx.reply(
-        `❌ No wallets found.
-
-Add one first from Terminal:
-
-Use /addwallet in private chat, or:
-
-npm run wallet:add`
-      );
-      return;
-    }
-
-    let message = `⚙️ Wallet Status\n\nNetwork: Sepolia Testnet\n\n`;
-
-    for (const savedWallet of wallets) {
-      const balanceWei = await provider.getBalance(savedWallet.address);
-      const balanceEth = ethers.formatEther(balanceWei);
-
-      message += `👛 ${savedWallet.label}\n`;
-      message += `Address: ${savedWallet.address}\n`;
-      message += `Balance: ${balanceEth} ETH\n\n`;
-    }
-
-    message += `✅ Wallet vault loaded.`;
-
-    await ctx.reply(message);
+    await sendWalletsList(ctx);
   } catch (error) {
     logSafeError("Could not load wallet status", error);
     await ctx.reply("❌ Could not load wallet status. Check Terminal for the error.");
@@ -1028,25 +1415,340 @@ bot.command("wallets", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
   try {
-    const ownerTelegramId = getRequiredTelegramUserId(ctx);
-    const wallets = await listWalletsForOwner(ownerTelegramId);
-
-    if (wallets.length === 0) {
-      await ctx.reply(
-        "No wallets found. Add one with /addwallet in private chat, or:\n\nnpm run wallet:add"
-      );
-      return;
-    }
-
-    const message = wallets
-      .map((wallet) => `👛 ${wallet.label}\n${wallet.address}`)
-      .join("\n\n");
-
-    await ctx.reply(`Saved wallets:\n\n${message}`);
+    await sendWalletsList(ctx);
   } catch (error) {
     logSafeError("Could not list wallets", error);
     await ctx.reply("❌ Could not list wallets.");
   }
+});
+
+bot.command("wallet", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const walletLabel = parts[1]?.trim();
+
+  if (!walletLabel) {
+    await ctx.reply(
+      `Invalid format.
+
+Use:
+/wallet wallet1`
+    );
+    return;
+  }
+
+  try {
+    await sendWalletDetails(ctx, walletLabel);
+  } catch (error) {
+    logSafeError("Could not load wallet details", error);
+    await ctx.reply(`❌ Could not load wallet "${normalizeWalletLabel(walletLabel)}".`);
+  }
+});
+
+bot.action(/^wm:view:([A-Za-z0-9_-]{2,32})$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  try {
+    const walletLabel = ctx.match[1];
+
+    if (!walletLabel) {
+      await ctx.reply("❌ Could not read wallet label from this action.");
+      return;
+    }
+
+    await sendWalletDetails(ctx, walletLabel);
+  } catch (error) {
+    logSafeError("Could not load wallet details", error);
+    await ctx.reply("❌ Could not load wallet details.");
+  }
+});
+
+bot.command("balance", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const walletLabel = parts[1]?.trim();
+
+  if (!walletLabel) {
+    await ctx.reply(
+      `Invalid format.
+
+Use:
+/balance wallet1
+/balance wallet1 sepolia
+/balance wallet1 mainnet`
+    );
+    return;
+  }
+
+  let network: SupportedBalanceNetwork;
+
+  try {
+    network = parseBalanceNetwork(parts[2]);
+  } catch (error) {
+    await ctx.reply(`❌ ${getSafeErrorMessage(error)}`);
+    return;
+  }
+
+  try {
+    await sendWalletBalance(ctx, walletLabel, network);
+  } catch (error) {
+    logSafeError("Could not check wallet balance", error);
+    await ctx.reply(
+      `❌ Could not check balance.
+
+Reason:
+${getSafeErrorMessage(error)}`
+    );
+  }
+});
+
+bot.action(/^wm:balance:([A-Za-z0-9_-]{2,32})$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  try {
+    const walletLabel = ctx.match[1];
+
+    if (!walletLabel) {
+      await ctx.reply("❌ Could not read wallet label from this action.");
+      return;
+    }
+
+    await sendWalletBalance(ctx, walletLabel, "sepolia");
+  } catch (error) {
+    logSafeError("Could not check wallet balance", error);
+    await ctx.reply(`❌ Could not check balance.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^wm:nfts:([A-Za-z0-9_-]{2,32})$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+  const walletLabel = ctx.match[1];
+
+  if (!walletLabel) {
+    await ctx.reply("❌ Could not read wallet label from this action.");
+    return;
+  }
+
+  await ctx.reply(`Use:\n/nfts ${walletLabel}`);
+});
+
+bot.action(/^wm:portfolio:([A-Za-z0-9_-]{2,32})$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+  const walletLabel = ctx.match[1];
+
+  if (!walletLabel) {
+    await ctx.reply("❌ Could not read wallet label from this action.");
+    return;
+  }
+
+  await ctx.reply(`Use:\n/osportfolio ${walletLabel} 5`);
+});
+
+bot.command("renamewallet", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const oldLabel = parts[1]?.trim();
+  const newLabelRaw = parts[2]?.trim();
+
+  if (!oldLabel || !newLabelRaw) {
+    await ctx.reply(
+      `Invalid format.
+
+Use:
+/renamewallet wallet1 mintwallet`
+    );
+    return;
+  }
+
+  const newLabel = normalizeWalletLabel(newLabelRaw);
+
+  if (!isValidWalletLabel(newLabel)) {
+    await ctx.reply(
+      "❌ New wallet label must be 2-32 characters and use only letters, numbers, hyphen, or underscore."
+    );
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const oldWallet = await getWalletSummaryByLabelForOwner(
+      oldLabel,
+      ownerTelegramId,
+      { includeArchived: true }
+    );
+    const renamed = await renameWalletForOwner(oldLabel, newLabel, ownerTelegramId);
+
+    await auditWalletManagementAction({
+      ownerTelegramId,
+      action: "wallet_renamed",
+      walletLabel: normalizeWalletLabel(oldLabel),
+      newWalletLabel: renamed.label,
+      walletAddress: renamed.address,
+      encryptionVersion: renamed.encryptionVersion,
+      status: renamed.status
+    });
+
+    await ctx.reply(
+      `✅ Wallet renamed.
+
+Old label: ${oldWallet.label}
+New label: ${renamed.label}
+Address: ${formatShortAddress(renamed.address)}`
+    );
+  } catch (error) {
+    logSafeError("Could not rename wallet", error);
+    await ctx.reply(`❌ Could not rename wallet.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("deletewallet", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const walletLabel = parts[1]?.trim();
+
+  if (!walletLabel) {
+    await ctx.reply(
+      `Invalid format.
+
+Use:
+/deletewallet wallet1`
+    );
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const wallet = await getWalletSummaryByLabelForOwner(
+      walletLabel,
+      ownerTelegramId,
+      { includeArchived: true }
+    );
+
+    if (wallet.status === "archived") {
+      await ctx.reply(`Wallet "${wallet.label}" is already archived.`);
+      return;
+    }
+
+    const session = createWalletDeleteConfirmation({
+      ownerTelegramId,
+      walletLabel: wallet.label,
+      walletAddress: wallet.address,
+      encryptionVersion: wallet.encryptionVersion
+    });
+
+    await auditWalletDeleteConfirmation(
+      session,
+      "wallet_delete_requested",
+      ownerTelegramId
+    );
+
+    await ctx.reply(
+      `Are you sure you want to remove ${wallet.label}?
+This will disable it inside the bot. It will not affect the wallet on-chain.
+
+This confirmation expires in 10 minutes.`,
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            "Confirm Remove",
+            `wm:delete_confirm:${session.sessionId}`
+          )
+        ],
+        [Markup.button.callback("Cancel", `wm:delete_cancel:${session.sessionId}`)]
+      ])
+    );
+  } catch (error) {
+    logSafeError("Could not request wallet deletion", error);
+    await ctx.reply(`❌ Could not request wallet removal.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^wm:delete_confirm:([0-9a-f-]+)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const sessionId = ctx.match[1];
+
+  if (!sessionId) {
+    await ctx.reply("This wallet removal confirmation has expired. Run /deletewallet again.");
+    return;
+  }
+
+  const validated = await validateWalletDeleteConfirmation(ctx, sessionId);
+
+  if (!validated) {
+    return;
+  }
+
+  const { session, actorTelegramId } = validated;
+
+  try {
+    const archived = await archiveWalletForOwner(
+      session.walletLabel,
+      session.ownerTelegramId
+    );
+
+    session.status = "used";
+    await auditWalletDeleteConfirmation(
+      session,
+      "wallet_delete_confirmed",
+      actorTelegramId
+    );
+
+    await ctx.reply(
+      `✅ Wallet archived.
+
+Wallet: ${archived.label}
+Address: ${formatShortAddress(archived.address)}
+Status: ${formatWalletStatus(archived.status)}`
+    );
+  } catch (error) {
+    logSafeError("Could not archive wallet", error);
+    await ctx.reply(`❌ Could not archive wallet.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^wm:delete_cancel:([0-9a-f-]+)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const sessionId = ctx.match[1];
+
+  if (!sessionId) {
+    await ctx.reply("This wallet removal confirmation has expired. Run /deletewallet again.");
+    return;
+  }
+
+  const validated = await validateWalletDeleteConfirmation(ctx, sessionId);
+
+  if (!validated) {
+    return;
+  }
+
+  const { session, actorTelegramId } = validated;
+  session.status = "cancelled";
+
+  await auditWalletDeleteConfirmation(
+    session,
+    "wallet_delete_cancelled",
+    actorTelegramId
+  );
+
+  await ctx.reply(`Cancelled wallet removal for ${session.walletLabel}.`);
 });
 
 bot.action("test_mint", async (ctx) => {
@@ -1103,7 +1805,7 @@ Use:
     const wallet = await getWalletSignerByLabelForOwner(
       walletLabel,
       ownerTelegramId,
-      provider,
+      getProvider(),
       "minttest"
     );
 
@@ -1282,10 +1984,10 @@ Use:
     const walletAddressLower = walletAddress.toLowerCase();
     const mints = loadMints().filter(
       (mint) =>
-        mint.walletLabel.toLowerCase() === walletLabel &&
+        mint.walletAddress.toLowerCase() === walletAddressLower &&
         (mint.ownerTelegramId === ownerTelegramId ||
           (!mint.ownerTelegramId &&
-            mint.walletAddress.toLowerCase() === walletAddressLower))
+            mint.walletLabel.toLowerCase() === walletLabel))
     );
 
     if (mints.length === 0) {
@@ -1381,7 +2083,7 @@ Use:
     const contract = new ethers.Contract(
       testNft.contractAddress,
       testNft.abi,
-      provider
+      getProvider()
     ) as unknown as TestMintContract;
 
     const approved: boolean = await contract.isApprovedForAll(
@@ -1446,7 +2148,7 @@ Use:
     const wallet = await getWalletSignerByLabelForOwner(
       walletLabel,
       ownerTelegramId,
-      provider,
+      getProvider(),
       "approveall"
     );
 
@@ -1570,7 +2272,7 @@ Use:
     const wallet = await getWalletSignerByLabelForOwner(
       walletLabel,
       ownerTelegramId,
-      provider,
+      getProvider(),
       "revokeall"
     );
 
@@ -3494,11 +4196,18 @@ bot.action(/^pf:open:(.+)$/, async (ctx) => {
   await sendPostMintActionMenu(ctx, validated.action);
 });
 
+async function startBot() {
+  await registerTelegramCommandMenu();
+  await bot.launch();
 
-bot.launch();
+  console.log("Bot is running...");
+  console.log("Admin lock + NFT mint module loaded.");
+}
 
-console.log("Bot is running...");
-console.log("Admin lock + NFT mint module loaded.");
+startBot().catch((error) => {
+  logSafeError("Bot startup failed", error);
+  process.exit(1);
+});
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));

@@ -24,6 +24,8 @@ type EncryptionVersion =
   | typeof KMS_ENVELOPE_VERSION
   | typeof LEGACY_LOCAL_VERSION;
 
+type WalletStatus = "active" | "archived";
+
 type EncryptedPrivateKey = {
   iv: string;
   authTag: string;
@@ -41,6 +43,8 @@ type WalletRecord = {
   kmsKeyRef?: string;
   encryptionVersion?: EncryptionVersion;
   createdAt: string;
+  status?: WalletStatus;
+  archivedAt?: string;
 };
 
 type WalletSummary = {
@@ -51,6 +55,8 @@ type WalletSummary = {
   kmsKeyRef?: string;
   encryptionVersion: EncryptionVersion;
   createdAt: string;
+  status: WalletStatus;
+  archivedAt?: string;
 };
 
 const VAULT_PATH = path.join(process.cwd(), "data", "vault.json");
@@ -66,6 +72,10 @@ function normalizeOwnerTelegramId(ownerTelegramId?: string | null): string | und
 
 function getRecordEncryptionVersion(record: WalletRecord): EncryptionVersion {
   return record.encryptionVersion || LEGACY_LOCAL_VERSION;
+}
+
+function getWalletStatus(record: WalletRecord): WalletStatus {
+  return record.status === "archived" ? "archived" : "active";
 }
 
 function getLegacyVaultKey(): Buffer {
@@ -200,7 +210,8 @@ function recordMatchesOwner(record: WalletRecord, ownerTelegramId: string) {
 
 function findWalletRecordByLabel(
   label: string,
-  ownerTelegramId: string
+  ownerTelegramId: string,
+  options: { includeArchived?: boolean } = {}
 ): WalletRecord {
   const normalizedLabel = normalizeLabel(label);
 
@@ -220,6 +231,10 @@ function findWalletRecordByLabel(
     throw new Error(`Wallet "${normalizedLabel}" not found for this Telegram user.`);
   }
 
+  if (!options.includeArchived && getWalletStatus(record) === "archived") {
+    throw new Error(`Wallet "${normalizedLabel}" is archived and cannot be used.`);
+  }
+
   return record;
 }
 
@@ -231,7 +246,9 @@ function toWalletSummary(wallet: WalletRecord): WalletSummary {
     ...(wallet.kmsProvider ? { kmsProvider: wallet.kmsProvider } : {}),
     ...(wallet.kmsKeyRef ? { kmsKeyRef: wallet.kmsKeyRef } : {}),
     encryptionVersion: getRecordEncryptionVersion(wallet),
-    createdAt: wallet.createdAt
+    createdAt: wallet.createdAt,
+    status: getWalletStatus(wallet),
+    ...(wallet.archivedAt ? { archivedAt: wallet.archivedAt } : {})
   };
 }
 
@@ -288,7 +305,8 @@ export async function addWallet(
     kmsProvider: encrypted.kmsProvider,
     kmsKeyRef: encrypted.kmsKeyRef,
     encryptionVersion: KMS_ENVELOPE_VERSION,
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
+    status: "active"
   };
 
   wallets.push(record);
@@ -336,6 +354,101 @@ export async function getWalletAddressByLabelForOwner(
 
   const record = findWalletRecordByLabel(label, normalizedOwnerTelegramId);
   return record.address;
+}
+
+export async function getWalletSummaryByLabelForOwner(
+  label: string,
+  ownerTelegramId: string,
+  options: { includeArchived?: boolean } = {}
+) {
+  const normalizedOwnerTelegramId = normalizeOwnerTelegramId(ownerTelegramId);
+
+  if (!normalizedOwnerTelegramId) {
+    throw new Error("Owner Telegram ID is required.");
+  }
+
+  const record = findWalletRecordByLabel(
+    label,
+    normalizedOwnerTelegramId,
+    options
+  );
+
+  return toWalletSummary(record);
+}
+
+export async function renameWalletForOwner(
+  oldLabel: string,
+  newLabel: string,
+  ownerTelegramId: string
+) {
+  const normalizedOldLabel = normalizeLabel(oldLabel);
+  const normalizedNewLabel = normalizeLabel(newLabel);
+  const normalizedOwnerTelegramId = normalizeOwnerTelegramId(ownerTelegramId);
+
+  if (!normalizedOldLabel || !normalizedNewLabel) {
+    throw new Error("Wallet label is required.");
+  }
+
+  if (!normalizedOwnerTelegramId) {
+    throw new Error("Owner Telegram ID is required.");
+  }
+
+  const wallets = loadVault();
+  const record = wallets.find(
+    (wallet) =>
+      wallet.label === normalizedOldLabel &&
+      recordMatchesOwner(wallet, normalizedOwnerTelegramId)
+  );
+
+  if (!record) {
+    throw new Error(`Wallet "${normalizedOldLabel}" not found for this Telegram user.`);
+  }
+
+  const labelExists = wallets.some(
+    (wallet) =>
+      wallet.label === normalizedNewLabel &&
+      recordMatchesOwner(wallet, normalizedOwnerTelegramId)
+  );
+
+  if (labelExists) {
+    throw new Error(`A wallet with label "${normalizedNewLabel}" already exists.`);
+  }
+
+  record.label = normalizedNewLabel;
+  saveVault(wallets);
+
+  return toWalletSummary(record);
+}
+
+export async function archiveWalletForOwner(
+  label: string,
+  ownerTelegramId: string
+) {
+  const normalizedOwnerTelegramId = normalizeOwnerTelegramId(ownerTelegramId);
+
+  if (!normalizedOwnerTelegramId) {
+    throw new Error("Owner Telegram ID is required.");
+  }
+
+  const wallets = loadVault();
+  const normalizedLabel = normalizeLabel(label);
+  const record = wallets.find(
+    (wallet) =>
+      wallet.label === normalizedLabel &&
+      recordMatchesOwner(wallet, normalizedOwnerTelegramId)
+  );
+
+  if (!record) {
+    throw new Error(`Wallet "${normalizedLabel}" not found for this Telegram user.`);
+  }
+
+  if (getWalletStatus(record) !== "archived") {
+    record.status = "archived";
+    record.archivedAt = new Date().toISOString();
+    saveVault(wallets);
+  }
+
+  return toWalletSummary(record);
 }
 
 export async function getWalletSignerByLabelForOwner(

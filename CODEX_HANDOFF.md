@@ -29,7 +29,7 @@ Core stack:
 
 - Azure Key Vault Keys
 
-- Express wallet import server
+- Telegram wallet import flow
 
 - Provider-neutral envelope encryption with Azure Key Vault as the first KMS provider
 
@@ -48,6 +48,10 @@ Core stack:
 - `/whoami`
 
 - Inline button menus
+
+- Telegram slash command menu registration on startup with safe warning-only failure handling
+
+- `/help` command with command examples
 
 
 
@@ -126,6 +130,23 @@ Core stack:
 - Local owner claim command for old vault records:
 
   `npm run wallet:claim -- walletLabel ownerTelegramId`
+
+
+### Wallet management
+
+- `/wallets` lists only wallets owned by `ctx.from.id`, with label, short address, status, and inline View/Balance/NFT buttons.
+
+- `/wallet walletLabel` shows owner-scoped wallet details without decrypting or exposing vault internals.
+
+- `/balance walletLabel [network]` checks native ETH balance only. Default network is Sepolia; `mainnet` is allowed for read-only balance checks.
+
+- `/renamewallet oldLabel newLabel` renames an owner-scoped wallet without decrypting or re-encrypting private key material.
+
+- `/deletewallet walletLabel` creates a 10-minute owner-scoped confirmation session. Confirming archives the wallet locally; it does not affect the wallet on-chain.
+
+- Archived wallets keep encrypted data intact but are blocked from signing and normal wallet address lookup flows.
+
+- Wallet management audit events include `wallet_viewed`, `wallet_balance_checked`, `wallet_renamed`, `wallet_delete_requested`, `wallet_delete_confirmed`, `wallet_delete_cancelled`, and `command_menu_registered`.
 
 
 
@@ -427,6 +448,30 @@ Add wallet through terminal:
 Add wallet through Telegram private chat:
 
 `/addwallet wallet1 <private-key>`
+
+Show wallet commands:
+
+`/help`
+
+List wallets:
+
+`/wallets`
+
+View one wallet:
+
+`/wallet wallet1`
+
+Check balance:
+
+`/balance wallet1 sepolia`
+
+Rename wallet:
+
+`/renamewallet wallet1 mintwallet`
+
+Archive wallet inside bot:
+
+`/deletewallet mintwallet`
 
 Claim an old ownerless wallet record:
 
