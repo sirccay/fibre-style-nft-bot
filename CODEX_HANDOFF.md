@@ -169,6 +169,79 @@ Core stack:
 - `/nfts wallet1` shows minted test NFTs.
 
 
+### Real mint engine
+
+- Real mint previews and confirmation sessions are implemented for simple payable mint functions only:
+
+  - `mint(uint256)`
+
+  - `publicMint(uint256)`
+
+  - `mintPublic(uint256)`
+
+  - `mintTo(address,uint256)`
+
+  - `publicMint(address,uint256)`
+
+- Direct commands:
+
+  - `/mainmintpreview wallet1 0xCONTRACT mint(uint256) 1 0.03 mainnet`
+
+  - `/mainmint wallet1 0xCONTRACT mint(uint256) 1 0.03 mainnet`
+
+- Saved mint target commands:
+
+  - `/addminttarget whaleMint 0xCONTRACT mint(uint256) 1 0.03 mainnet`
+
+  - `/minttargets`
+
+  - `/minttarget targetId`
+
+  - `/updateminttarget targetId publicMint(uint256) 2 0.01 mainnet`
+
+  - `/deleteminttarget targetId`
+
+  - `/minttargetpreview targetId wallet1`
+
+  - `/minttargetnow targetId wallet1`
+
+- Mint history commands:
+
+  - `/minthistory`
+
+  - `/mintstatus runId`
+
+- Mint status command:
+
+  - `/mintingstatus`
+
+- Real mint helper files:
+
+  - `src/mintEngine.ts`
+
+  - `src/mintTargets.ts`
+
+  - `src/mintRuns.ts`
+
+- Mint targets are saved in `data/mintTargets.json` and are owner-scoped to `ctx.from.id`.
+
+- Mint runs are saved in `data/mintRuns.json` and are owner-scoped to `ctx.from.id`.
+
+- `/mainmint` and `/minttargetnow` create 10-minute owner-scoped confirmation sessions. Final confirm buttons are single-use, wrong-user clicks are blocked, and cancelled/expired sessions cannot send transactions.
+
+- Ethereum mainnet mint sends are locked separately by:
+
+  `ALLOW_MAINNET_MINTING=false`
+
+- Sepolia mints can be submitted without `ALLOW_MAINNET_MINTING=true`; mainnet mints cannot.
+
+- The mint engine uses `ETH_MAINNET_RPC_URL` for mainnet and `SEPOLIA_RPC_URL` or `ETH_SEPOLIA_RPC_URL` for Sepolia. It never uses `ethers.getDefaultProvider`.
+
+- Allowlist, Merkle proof, signature minting, and arbitrary ABI support are intentionally not implemented yet.
+
+- Mint audit events include `mint_previewed`, `mint_confirmation_created`, `mint_blocked`, `mint_submitted`, `mint_confirmed`, `mint_failed`, `mint_target_created`, `mint_target_updated`, `mint_target_archived`, and `mint_run_viewed`.
+
+
 
 ### OpenSea read modules
 
@@ -286,6 +359,8 @@ Expected env vars:
 - `ETH_MAINNET_RPC_URL`
 
 - `ALLOW_MAINNET_TRADING=false`
+
+- `ALLOW_MAINNET_MINTING=false`
 
 - `WALLET_IMPORT_PORT=3000`
 
