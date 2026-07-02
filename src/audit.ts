@@ -14,7 +14,31 @@ type WalletAuditLog = {
   events: WalletAuditEvent[];
 };
 
+type SessionAuditEvent = {
+  sessionId: string;
+  ownerTelegramId: string | null;
+  actorTelegramId: string | null;
+  walletLabel?: string;
+  walletAddress?: string;
+  collectionSlug?: string;
+  contractAddress?: string;
+  tokenId?: string;
+  action: string;
+  status?: string;
+  reason?: string;
+  timestamp: string;
+};
+
+type SessionAuditLog = {
+  events: SessionAuditEvent[];
+};
+
 const KMS_AUDIT_LOG_PATH = path.join(process.cwd(), "data", "kmsAuditLog.json");
+const SESSION_AUDIT_LOG_PATH = path.join(
+  process.cwd(),
+  "data",
+  "sessionAuditLog.json"
+);
 
 async function loadAuditLog(): Promise<WalletAuditLog> {
   try {
@@ -51,6 +75,46 @@ export async function appendWalletAuditLog(
   await fs.mkdir(path.dirname(KMS_AUDIT_LOG_PATH), { recursive: true });
   await fs.writeFile(
     KMS_AUDIT_LOG_PATH,
+    JSON.stringify(auditLog, null, 2),
+    "utf8"
+  );
+}
+
+async function loadSessionAuditLog(): Promise<SessionAuditLog> {
+  try {
+    const raw = await fs.readFile(SESSION_AUDIT_LOG_PATH, "utf8");
+
+    if (!raw.trim()) {
+      return { events: [] };
+    }
+
+    const parsed = JSON.parse(raw);
+
+    return {
+      events: Array.isArray(parsed.events) ? parsed.events : []
+    };
+  } catch (error: any) {
+    if (error?.code === "ENOENT") {
+      return { events: [] };
+    }
+
+    throw error;
+  }
+}
+
+export async function appendSessionAuditLog(
+  event: Omit<SessionAuditEvent, "timestamp">
+) {
+  const auditLog = await loadSessionAuditLog();
+
+  auditLog.events.push({
+    ...event,
+    timestamp: new Date().toISOString()
+  });
+
+  await fs.mkdir(path.dirname(SESSION_AUDIT_LOG_PATH), { recursive: true });
+  await fs.writeFile(
+    SESSION_AUDIT_LOG_PATH,
     JSON.stringify(auditLog, null, 2),
     "utf8"
   );
