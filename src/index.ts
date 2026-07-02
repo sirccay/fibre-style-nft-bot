@@ -43,6 +43,7 @@ const BOT_COMMANDS = [
   { command: "osfloor", description: "Check collection floor" },
   { command: "topoffer", description: "Check top offer" },
   { command: "bestlisting", description: "Check best listing" },
+  { command: "tradingstatus", description: "Show trading lock status" },
   { command: "help", description: "Show commands" }
 ];
 
@@ -53,6 +54,8 @@ const BALANCE_NETWORK_LABELS: Record<SupportedBalanceNetwork, string> = {
   mainnet: "Mainnet"
 };
 const COMMAND_MENU_REGISTRATION_TIMEOUT_MS = 10_000;
+const MAINNET_TRADING_DISABLED_MESSAGE =
+  "Mainnet trading is disabled. Set ALLOW_MAINNET_TRADING=true only when you are ready for live testing.";
 
 function getSepoliaRpcUrl(): string {
   const rpcUrl = process.env.SEPOLIA_RPC_URL || process.env.ETH_SEPOLIA_RPC_URL;
@@ -84,6 +87,20 @@ function getBalanceProvider(network: SupportedBalanceNetwork) {
   }
 
   return getProvider();
+}
+
+function isMainnetTradingEnabled(): boolean {
+  return process.env.ALLOW_MAINNET_TRADING === "true";
+}
+
+function getTradingLockStatusText(): string {
+  return isMainnetTradingEnabled()
+    ? "ENABLED - live mainnet listing/offer actions may execute."
+    : "DISABLED - previews only; live listing/offer actions are blocked.";
+}
+
+function getConfiguredStatus(value?: string): string {
+  return value && value.trim() ? "yes" : "no";
 }
 
 function parseCommandParts(text: string): string[] {
@@ -185,6 +202,14 @@ function formatShortAddress(address: string): string {
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
 
+function formatMaybeShortAddress(value: string | null | undefined): string {
+  if (!value) {
+    return "Not available";
+  }
+
+  return ethers.isAddress(value) ? formatShortAddress(value) : value;
+}
+
 function normalizeWalletLabel(label: string): string {
   return label.trim().toLowerCase();
 }
@@ -225,6 +250,7 @@ OpenSea:
 /osfloor collectionSlug
 /topoffer collectionSlug tokenId
 /bestlisting collectionSlug tokenId
+/tradingstatus
 
 Testing:
 /minttest wallet1 1`;
@@ -261,6 +287,200 @@ async function auditWalletManagementAction(details: {
   reason?: string;
 }) {
   await appendWalletAuditLog(details);
+}
+
+async function auditOpenSeaSessionAction(
+  action: PostMintActionSession,
+  auditAction: string,
+  actorTelegramId: string | null,
+  details: {
+    priceEth?: number;
+    txHash?: string;
+    reason?: string;
+  } = {}
+) {
+  await appendSessionAuditLog({
+    sessionId: action.sessionId,
+    ownerTelegramId: action.ownerTelegramId || null,
+    actorTelegramId,
+    walletLabel: action.walletLabel,
+    walletAddress: action.walletAddress,
+    collectionSlug: action.collectionSlug,
+    contractAddress: action.contractAddress,
+    tokenId: action.tokenId,
+    action: auditAction,
+    status: action.status,
+    ...details
+  });
+}
+
+async function auditOpenSeaWalletAction(details: {
+  ownerTelegramId: string | null;
+  action: string;
+  walletLabel?: string;
+  walletAddress?: string;
+  collectionSlug?: string;
+  contractAddress?: string;
+  tokenId?: string;
+  priceEth?: number;
+  txHash?: string;
+  reason?: string;
+}) {
+  await appendWalletAuditLog(details);
+}
+
+function getOpenSeaPublicResultValue(value: unknown): string | null {
+  if (typeof value === "string" && value.trim()) {
+    return value;
+  }
+
+  return null;
+}
+
+function getOpenSeaPublicField(source: any, fieldNames: string[]): string | null {
+  if (!source || typeof source !== "object") {
+    return null;
+  }
+
+  for (const fieldName of fieldNames) {
+    const rawValue = source[fieldName];
+    const value =
+      getOpenSeaPublicResultValue(rawValue) ||
+      getOpenSeaPublicResultValue(rawValue?.hash) ||
+      getOpenSeaPublicResultValue(rawValue?.transactionHash) ||
+      getOpenSeaPublicResultValue(rawValue?.txHash);
+
+    if (value) {
+      return value;
+    }
+  }
+
+  return null;
+}
+
+function getOpenSeaResultSummary(result: any): string {
+  const listing = result?.listing ?? result;
+  const txHash = getOpenSeaResultTxHash(result);
+  const orderHash =
+    getOpenSeaPublicField(result, ["orderHash", "order_hash"]) ||
+    getOpenSeaPublicField(listing, ["orderHash", "order_hash"]);
+  const protocolAddress =
+    getOpenSeaPublicField(result, ["protocolAddress", "protocol_address"]) ||
+    getOpenSeaPublicField(listing, ["protocolAddress", "protocol_address"]);
+
+  const lines = [];
+
+  if (txHash) {
+    lines.push(`Tx Hash: ${txHash}`);
+  }
+
+  if (orderHash) {
+    lines.push(`Order Hash: ${orderHash}`);
+  }
+
+  if (protocolAddress) {
+    lines.push(`Protocol: ${protocolAddress}`);
+  }
+
+  if (lines.length === 0) {
+    lines.push("OpenSea SDK returned a result but did not provide a public tx/order hash.");
+  }
+
+  return lines.join("\n");
+}
+
+function getOpenSeaResultTxHash(result: any): string | null {
+  const listing = result?.listing ?? result;
+
+  return (
+    getOpenSeaPublicField(result, ["txHash", "transactionHash", "hash"]) ||
+    getOpenSeaPublicField(listing, ["txHash", "transactionHash", "hash"])
+  );
+}
+
+async function checkPostMintSessionOwnership(action: PostMintActionSession) {
+  const savedWallet = await getWalletSummaryByLabelForOwner(
+    action.walletLabel,
+    action.ownerTelegramId
+  );
+
+  if (savedWallet.address.toLowerCase() !== action.walletAddress.toLowerCase()) {
+    throw new Error("Wallet session no longer matches the saved wallet.");
+  }
+
+  return checkErc721Ownership({
+    walletLabel: action.walletLabel,
+    ownerTelegramId: action.ownerTelegramId,
+    contractAddress: action.contractAddress,
+    tokenId: action.tokenId
+  });
+}
+
+async function blockOpenSeaActionIfNotOwner(params: {
+  ctx: Context;
+  action: PostMintActionSession;
+  actorTelegramId: string;
+  auditAction: string;
+  blockedVerb: string;
+}) {
+  const ownership = await checkPostMintSessionOwnership(params.action);
+
+  if (ownership.ownsToken) {
+    return ownership;
+  }
+
+  await auditOpenSeaSessionAction(
+    params.action,
+    params.auditAction,
+    params.actorTelegramId,
+    {
+      reason: `wallet_not_token_owner:${ownership.owner}`
+    }
+  );
+
+  await params.ctx.reply(
+    `❌ Cannot ${params.blockedVerb}.
+
+Wallet does not own this NFT.
+
+Wallet: ${formatShortAddress(ownership.walletAddress)}
+Owner Onchain: ${formatMaybeShortAddress(ownership.owner)}`
+  );
+
+  return null;
+}
+
+async function blockOpenSeaActionIfTradingDisabled(params: {
+  ctx: Context;
+  action: PostMintActionSession;
+  actorTelegramId: string;
+  auditAction: string;
+  priceEth?: number;
+}) {
+  if (isMainnetTradingEnabled()) {
+    return false;
+  }
+
+  await auditOpenSeaSessionAction(
+    params.action,
+    params.auditAction,
+    params.actorTelegramId,
+    {
+      ...(params.priceEth === undefined ? {} : { priceEth: params.priceEth }),
+      reason: "mainnet_trading_disabled"
+    }
+  );
+
+  await params.ctx.reply(MAINNET_TRADING_DISABLED_MESSAGE);
+  return true;
+}
+
+function getOfferExpirationText(offer: any): string {
+  return offer.expiration || "Not available";
+}
+
+function getOfferMakerText(offer: any): string {
+  return formatMaybeShortAddress(offer.maker);
 }
 
 async function registerTelegramCommandMenu() {
@@ -1013,6 +1233,7 @@ const ACTION_SESSION_EXPIRED_MESSAGE =
   "This action session has expired. Please open the NFT actions again.";
 const ACTION_ALREADY_USED_OR_CANCELLED_MESSAGE =
   "This action has already been used or cancelled.";
+const ACTION_WRONG_USER_MESSAGE = "You cannot use this action session.";
 
 function isPostMintActionStatus(value: unknown): value is PostMintActionStatus {
   return (
@@ -1243,7 +1464,7 @@ async function validatePostMintActionSession(
       actorTelegramId,
       actionName
     );
-    await ctx.reply("❌ This action is not available for your Telegram account.");
+    await ctx.reply(ACTION_WRONG_USER_MESSAGE);
     return null;
   }
 
@@ -1419,6 +1640,23 @@ bot.command("help", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
   await ctx.reply(getHelpMessage());
+});
+
+bot.command("tradingstatus", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.reply(
+    `Trading Status
+
+ALLOW_MAINNET_TRADING: ${isMainnetTradingEnabled() ? "true" : "false"}
+ETH_MAINNET_RPC_URL configured: ${getConfiguredStatus(process.env.ETH_MAINNET_RPC_URL)}
+OpenSea API key configured: ${getConfiguredStatus(process.env.OPENSEA_API_KEY)}
+
+Live listing and accept-offer actions require:
+ALLOW_MAINNET_TRADING=true
+
+${MAINNET_TRADING_DISABLED_MESSAGE}`
+  );
 });
 
 for (const command of ["addwallet", "importwallet", "import_wallet"]) {
@@ -2456,7 +2694,7 @@ Next later:
       `❌ Could not fetch OpenSea floor.
 
 Reason:
-${error?.message || "Unknown OpenSea error"}`
+${getSafeErrorMessage(error)}`
     );
   }
 });
@@ -2519,6 +2757,8 @@ ${bestOffer.reason}`
 Collection: ${bestOffer.slug}
 Token ID: ${bestOffer.tokenId}
 Offer: ${bestOffer.amount} ${bestOffer.symbol}
+Maker: ${getOfferMakerText(bestOffer)}
+Expiration: ${getOfferExpirationText(bestOffer)}
 
 Order Hash:
 ${bestOffer.orderHash}
@@ -2526,10 +2766,10 @@ ${bestOffer.orderHash}
 Protocol:
 ${bestOffer.protocolAddress}
 
-Next later:
-• Ask if you want to accept offer
-• Generate fulfillment data
-• Send accept-offer transaction`
+Trading Lock:
+${getTradingLockStatusText()}
+
+Use /postmint or /osportfolio to open owner-scoped NFT action sessions before accepting an offer.`
     );
   } catch (error: any) {
     logSafeError("Bot handler failed", error);
@@ -2538,7 +2778,7 @@ Next later:
       `❌ Could not fetch top offer.
 
 Reason:
-${error?.message || "Unknown OpenSea error"}`
+${getSafeErrorMessage(error)}`
     );
   }
 });
@@ -2620,7 +2860,7 @@ Next:
       `❌ Could not fetch best listing.
 
 Reason:
-${error?.message || "Unknown OpenSea error"}`
+${getSafeErrorMessage(error)}`
     );
   }
 });
@@ -2662,6 +2902,8 @@ Example:
   }
 
   try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+
     await ctx.reply(
       `🏷 Preparing OpenSea listing preview...
 
@@ -2675,30 +2917,61 @@ Checking ownership on Ethereum mainnet...`
 
     const ownership = await checkErc721Ownership({
       walletLabel,
-      ownerTelegramId: getRequiredTelegramUserId(ctx),
+      ownerTelegramId,
       contractAddress,
       tokenId
     });
+
+    if (!ownership.ownsToken) {
+      await auditOpenSeaWalletAction({
+        ownerTelegramId,
+        action: "opensea_listing_blocked",
+        walletLabel,
+        walletAddress: ownership.walletAddress,
+        contractAddress,
+        tokenId,
+        priceEth,
+        reason: `wallet_not_token_owner:${ownership.owner}`
+      });
+      await ctx.reply(
+        `❌ Listing preview blocked.
+
+Wallet does not own this NFT.
+
+Wallet: ${formatShortAddress(ownership.walletAddress)}
+Owner Onchain: ${formatMaybeShortAddress(ownership.owner)}`
+      );
+      return;
+    }
 
     await ctx.reply(
       `🏷 Listing Preview
 
 Network: Ethereum Mainnet
 Wallet: ${walletLabel}
-Wallet Address: ${ownership.walletAddress}
-Contract: ${contractAddress}
+Wallet Address: ${formatShortAddress(ownership.walletAddress)}
+Contract: ${formatShortAddress(contractAddress)}
 Token ID: ${tokenId}
-Owner Onchain: ${ownership.owner}
-Wallet Owns Token: ${ownership.ownsToken ? "YES ✅" : "NO ❌"}
+Owner Onchain: ${formatMaybeShortAddress(ownership.owner)}
+Wallet Owns Token: YES
 Listing Price: ${priceEth} ETH
 
-Live listing is currently locked by:
-
-ALLOW_MAINNET_TRADING=false
+Trading Lock:
+${getTradingLockStatusText()}
 
 When ready, use:
 /oslist ${walletLabel} ${contractAddress} ${tokenId} ${priceEth}`
     );
+
+    await auditOpenSeaWalletAction({
+      ownerTelegramId,
+      action: "opensea_listing_previewed",
+      walletLabel,
+      walletAddress: ownership.walletAddress,
+      contractAddress,
+      tokenId,
+      priceEth
+    });
   } catch (error: any) {
     logSafeError("Bot handler failed", error);
 
@@ -2706,7 +2979,7 @@ When ready, use:
       `❌ Listing preview failed.
 
 Reason:
-${error?.message || "Unknown error"}`
+${getSafeErrorMessage(error)}`
     );
   }
 });
@@ -2746,6 +3019,8 @@ Example:
   }
 
   try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+
     await ctx.reply(
       `⚠️ Live OpenSea Listing Request
 
@@ -2754,15 +3029,80 @@ Contract: ${contractAddress}
 Token ID: ${tokenId}
 Price: ${priceEth} ETH
 
-Submitting to OpenSea...`
+Checking ownership before any live action...`
+    );
+
+    const ownership = await checkErc721Ownership({
+      walletLabel,
+      ownerTelegramId,
+      contractAddress,
+      tokenId
+    });
+
+    if (!ownership.ownsToken) {
+      await auditOpenSeaWalletAction({
+        ownerTelegramId,
+        action: "opensea_listing_blocked",
+        walletLabel,
+        walletAddress: ownership.walletAddress,
+        contractAddress,
+        tokenId,
+        priceEth,
+        reason: `wallet_not_token_owner:${ownership.owner}`
+      });
+      await ctx.reply(
+        `❌ Listing cancelled.
+
+Wallet does not own this NFT.
+
+Wallet: ${formatShortAddress(ownership.walletAddress)}
+Owner Onchain: ${formatMaybeShortAddress(ownership.owner)}`
+      );
+      return;
+    }
+
+    if (!isMainnetTradingEnabled()) {
+      await auditOpenSeaWalletAction({
+        ownerTelegramId,
+        action: "opensea_listing_blocked",
+        walletLabel,
+        walletAddress: ownership.walletAddress,
+        contractAddress,
+        tokenId,
+        priceEth,
+        reason: "mainnet_trading_disabled"
+      });
+      await ctx.reply(MAINNET_TRADING_DISABLED_MESSAGE);
+      return;
+    }
+
+    await ctx.reply(
+      `🏷 Ownership confirmed. Submitting to OpenSea...
+
+If OpenSea requires approval, the SDK may request or submit an approval transaction before the listing order is created.`
     );
 
     const result = await createOpenSeaListing({
       walletLabel,
-      ownerTelegramId: getRequiredTelegramUserId(ctx),
+      ownerTelegramId,
       contractAddress,
       tokenId,
       priceEth
+    });
+
+    const resultSummary = getOpenSeaResultSummary(result);
+    const txHash = getOpenSeaResultTxHash(result) || undefined;
+
+    await auditOpenSeaWalletAction({
+      ownerTelegramId,
+      action: "opensea_listing_confirmed",
+      walletLabel,
+      walletAddress: result.wallet,
+      contractAddress,
+      tokenId,
+      priceEth,
+      ...(txHash ? { txHash } : {}),
+      reason: "submitted"
     });
 
     await ctx.reply(
@@ -2773,8 +3113,8 @@ Contract: ${result.contractAddress}
 Token ID: ${result.tokenId}
 Price: ${result.priceEth} ETH
 
-OpenSea SDK response:
-${JSON.stringify(result.listing, null, 2).slice(0, 2500)}`
+OpenSea result:
+${resultSummary}`
     );
   } catch (error: any) {
     logSafeError("Bot handler failed", error);
@@ -2783,7 +3123,7 @@ ${JSON.stringify(result.listing, null, 2).slice(0, 2500)}`
       `❌ OpenSea listing failed.
 
 Reason:
-${error?.message || "Unknown error"}
+${getSafeErrorMessage(error)}
 
 For safety, live trading stays disabled until:
 ALLOW_MAINNET_TRADING=true`
@@ -2876,7 +3216,7 @@ Useful next commands:
       `❌ NFT lookup failed.
 
 Reason:
-${error?.message || "Unknown OpenSea error"}`
+${getSafeErrorMessage(error)}`
     );
   }
 });
@@ -2912,6 +3252,7 @@ Example:
   }
 
   try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
     const slug = extractOpenSeaSlug(collectionInput);
 
     await ctx.reply(
@@ -2939,10 +3280,33 @@ Try:
 
     const ownership = await checkErc721Ownership({
       walletLabel,
-      ownerTelegramId: getRequiredTelegramUserId(ctx),
+      ownerTelegramId,
       contractAddress,
       tokenId
     });
+
+    if (!ownership.ownsToken) {
+      await auditOpenSeaWalletAction({
+        ownerTelegramId,
+        action: "opensea_listing_blocked",
+        walletLabel,
+        walletAddress: ownership.walletAddress,
+        collectionSlug: slug,
+        contractAddress,
+        tokenId,
+        priceEth: Number(stats.floorPrice),
+        reason: `wallet_not_token_owner:${ownership.owner}`
+      });
+      await ctx.reply(
+        `❌ Floor listing preview blocked.
+
+Wallet does not own this NFT.
+
+Wallet: ${formatShortAddress(ownership.walletAddress)}
+Owner Onchain: ${formatMaybeShortAddress(ownership.owner)}`
+      );
+      return;
+    }
 
     await ctx.reply(
       `🏷 Floor Listing Preview
@@ -2952,21 +3316,32 @@ Collection: ${slug}
 Floor Price: ${stats.floorPrice} ${stats.floorSymbol || "ETH"}
 
 Wallet: ${walletLabel}
-Wallet Address: ${ownership.walletAddress}
-Contract: ${contractAddress}
+Wallet Address: ${formatShortAddress(ownership.walletAddress)}
+Contract: ${formatShortAddress(contractAddress)}
 Token ID: ${tokenId}
-Owner Onchain: ${ownership.owner}
-Wallet Owns Token: ${ownership.ownsToken ? "YES ✅" : "NO ❌"}
+Owner Onchain: ${formatMaybeShortAddress(ownership.owner)}
+Wallet Owns Token: YES
 
 Suggested Listing Price:
 ${stats.floorPrice} ETH
 
-Live listing is still locked by:
-ALLOW_MAINNET_TRADING=false
+Trading Lock:
+${getTradingLockStatusText()}
 
 When ready, use:
 /listfloor ${walletLabel} ${slug} ${contractAddress} ${tokenId}`
     );
+
+    await auditOpenSeaWalletAction({
+      ownerTelegramId,
+      action: "opensea_listing_previewed",
+      walletLabel,
+      walletAddress: ownership.walletAddress,
+      collectionSlug: slug,
+      contractAddress,
+      tokenId,
+      priceEth: Number(stats.floorPrice)
+    });
   } catch (error: any) {
     logSafeError("Bot handler failed", error);
 
@@ -2974,7 +3349,7 @@ When ready, use:
       `❌ Floor listing preview failed.
 
 Reason:
-${error?.message || "Unknown error"}`
+${getSafeErrorMessage(error)}`
     );
   }
 });
@@ -3008,6 +3383,7 @@ Example:
   }
 
   try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
     const slug = extractOpenSeaSlug(collectionInput);
 
     await ctx.reply(
@@ -3038,20 +3414,49 @@ Checking ownership before listing...`
 
     const ownership = await checkErc721Ownership({
       walletLabel,
-      ownerTelegramId: getRequiredTelegramUserId(ctx),
+      ownerTelegramId,
       contractAddress,
       tokenId
     });
 
     if (!ownership.ownsToken) {
+      await auditOpenSeaWalletAction({
+        ownerTelegramId,
+        action: "opensea_listing_blocked",
+        walletLabel,
+        walletAddress: ownership.walletAddress,
+        collectionSlug: slug,
+        contractAddress,
+        tokenId,
+        priceEth: Number(stats.floorPrice),
+        reason: `wallet_not_token_owner:${ownership.owner}`
+      });
       await ctx.reply(
         `❌ Listing cancelled.
 
 Wallet does not own this NFT.
 
-Wallet: ${ownership.walletAddress}
-Owner Onchain: ${ownership.owner}`
+Wallet: ${formatShortAddress(ownership.walletAddress)}
+Owner Onchain: ${formatMaybeShortAddress(ownership.owner)}`
       );
+      return;
+    }
+
+    const priceEth = Number(stats.floorPrice);
+
+    if (!isMainnetTradingEnabled()) {
+      await auditOpenSeaWalletAction({
+        ownerTelegramId,
+        action: "opensea_listing_blocked",
+        walletLabel,
+        walletAddress: ownership.walletAddress,
+        collectionSlug: slug,
+        contractAddress,
+        tokenId,
+        priceEth,
+        reason: "mainnet_trading_disabled"
+      });
+      await ctx.reply(MAINNET_TRADING_DISABLED_MESSAGE);
       return;
     }
 
@@ -3059,15 +3464,33 @@ Owner Onchain: ${ownership.owner}`
       `✅ Ownership confirmed.
 
 Submitting OpenSea listing at floor price:
-${stats.floorPrice} ETH`
+${priceEth} ETH
+
+If OpenSea requires approval, the SDK may request or submit an approval transaction before the listing order is created.`
     );
 
     const result = await createOpenSeaListing({
       walletLabel,
-      ownerTelegramId: getRequiredTelegramUserId(ctx),
+      ownerTelegramId,
       contractAddress,
       tokenId,
-      priceEth: Number(stats.floorPrice)
+      priceEth
+    });
+
+    const resultSummary = getOpenSeaResultSummary(result);
+    const txHash = getOpenSeaResultTxHash(result) || undefined;
+
+    await auditOpenSeaWalletAction({
+      ownerTelegramId,
+      action: "opensea_listing_confirmed",
+      walletLabel,
+      walletAddress: result.wallet,
+      collectionSlug: slug,
+      contractAddress,
+      tokenId,
+      priceEth,
+      ...(txHash ? { txHash } : {}),
+      reason: "submitted"
     });
 
     await ctx.reply(
@@ -3078,8 +3501,8 @@ Contract: ${result.contractAddress}
 Token ID: ${result.tokenId}
 Price: ${result.priceEth} ETH
 
-OpenSea SDK response:
-${JSON.stringify(result.listing, null, 2).slice(0, 2500)}`
+OpenSea result:
+${resultSummary}`
     );
   } catch (error: any) {
     logSafeError("Bot handler failed", error);
@@ -3088,10 +3511,10 @@ ${JSON.stringify(result.listing, null, 2).slice(0, 2500)}`
       `❌ Floor listing failed.
 
 Reason:
-${error?.message || "Unknown error"}
+${getSafeErrorMessage(error)}
 
-Live trading is locked unless:
-ALLOW_MAINNET_TRADING=true`
+Safety lock status:
+${getTradingLockStatusText()}`
     );
   }
 });
@@ -3133,6 +3556,34 @@ Example:
       walletLabel,
       ownerTelegramId
     );
+    const ownership = await checkErc721Ownership({
+      walletLabel,
+      ownerTelegramId,
+      contractAddress,
+      tokenId
+    });
+
+    if (!ownership.ownsToken) {
+      await auditOpenSeaWalletAction({
+        ownerTelegramId,
+        action: "opensea_listing_blocked",
+        walletLabel,
+        walletAddress,
+        collectionSlug,
+        contractAddress,
+        tokenId,
+        reason: `wallet_not_token_owner:${ownership.owner}`
+      });
+      await ctx.reply(
+        `❌ Could not open NFT actions.
+
+Wallet does not own this NFT.
+
+Wallet: ${formatShortAddress(walletAddress)}
+Owner Onchain: ${formatMaybeShortAddress(ownership.owner)}`
+      );
+      return;
+    }
 
     const action = await createPostMintActionSession({
       ownerTelegramId,
@@ -3152,7 +3603,7 @@ Example:
       `❌ Could not create post-mint menu.
 
 Reason:
-${error?.message || "Unknown error"}`
+${getSafeErrorMessage(error)}`
     );
   }
 });
@@ -3169,7 +3620,7 @@ bot.action(/^pm:view:(.+)$/, async (ctx) => {
     return;
   }
 
-  const { action } = validated;
+  const { action, actorTelegramId } = validated;
 
   try {
     if (action.network !== "ethereum") {
@@ -3200,7 +3651,7 @@ OpenSea URL: ${nft.openseaUrl || "Not available"}`
       `❌ Could not view NFT.
 
 Reason:
-${error?.message || "Unknown error"}`
+${getSafeErrorMessage(error)}`
     );
   }
 });
@@ -3217,7 +3668,7 @@ bot.action(/^pm:floor:(.+)$/, async (ctx) => {
     return;
   }
 
-  const { action } = validated;
+  const { action, actorTelegramId } = validated;
 
   try {
     await ctx.reply(
@@ -3265,7 +3716,7 @@ Useful:
       `❌ Could not fetch market snapshot.
 
 Reason:
-${error?.message || "Unknown error"}`
+${getSafeErrorMessage(error)}`
     );
   }
 });
@@ -3282,7 +3733,7 @@ bot.action(/^pm:offer:(.+)$/, async (ctx) => {
     return;
   }
 
-  const { action } = validated;
+  const { action, actorTelegramId } = validated;
 
   try {
     await ctx.reply(
@@ -3292,12 +3743,30 @@ Collection: ${action.collectionSlug}
 Token ID: ${action.tokenId}`
     );
 
+    const ownership = await blockOpenSeaActionIfNotOwner({
+      ctx,
+      action,
+      actorTelegramId,
+      auditAction: "opensea_top_offer_checked",
+      blockedVerb: "check offers for this NFT"
+    });
+
+    if (!ownership) {
+      return;
+    }
+
     const bestOffer = await getOpenSeaBestOffer(
       action.collectionSlug,
       action.tokenId
     );
 
     if (!bestOffer.hasOffer) {
+      await auditOpenSeaSessionAction(
+        action,
+        "opensea_top_offer_checked",
+        actorTelegramId,
+        { reason: "no_top_offer" }
+      );
       await ctx.reply(
         `❌ No top offer found.
 
@@ -3312,13 +3781,27 @@ Token ID: ${action.tokenId}`
 
 Collection: ${action.collectionSlug}
 Token ID: ${action.tokenId}
+Wallet: ${action.walletLabel}
+Wallet Address: ${formatShortAddress(ownership.walletAddress)}
+Wallet Owns Token: YES
 Offer: ${bestOffer.amount} ${bestOffer.symbol}
+Maker: ${getOfferMakerText(bestOffer)}
+Expiration: ${getOfferExpirationText(bestOffer)}
 
 Order Hash:
 ${bestOffer.orderHash}
 
-Next module:
-[Accept Top Offer] with confirmation before sending the transaction.`
+Trading Lock:
+${getTradingLockStatusText()}
+
+Use "Accept Top Offer" from the NFT action menu to preview the sale before any live action.`
+    );
+
+    await auditOpenSeaSessionAction(
+      action,
+      "opensea_top_offer_checked",
+      actorTelegramId,
+      { reason: "offer_found" }
     );
   } catch (error: any) {
     logSafeError("Bot handler failed", error);
@@ -3327,7 +3810,7 @@ Next module:
       `❌ Could not fetch top offer.
 
 Reason:
-${error?.message || "Unknown error"}`
+${getSafeErrorMessage(error)}`
     );
   }
 });
@@ -3348,7 +3831,7 @@ bot.action(/^pm:listfloor:(.+)$/, async (ctx) => {
     return;
   }
 
-  const { action } = validated;
+  const { action, actorTelegramId } = validated;
 
   try {
     await ctx.reply(
@@ -3362,35 +3845,57 @@ Token ID: ${action.tokenId}`
     const stats = await getOpenSeaCollectionStats(action.collectionSlug);
 
     if (stats.floorPrice === null) {
+      await auditOpenSeaSessionAction(
+        action,
+        "opensea_listing_blocked",
+        actorTelegramId,
+        { reason: "floor_price_unavailable" }
+      );
       await ctx.reply("❌ Could not detect collection floor price.");
       return;
     }
 
-    const ownership = await checkErc721Ownership({
-      walletLabel: action.walletLabel,
-      ownerTelegramId: action.ownerTelegramId,
-      contractAddress: action.contractAddress,
-      tokenId: action.tokenId
+    const ownership = await blockOpenSeaActionIfNotOwner({
+      ctx,
+      action,
+      actorTelegramId,
+      auditAction: "opensea_listing_blocked",
+      blockedVerb: "preview a listing for this NFT"
     });
+
+    if (!ownership) {
+      return;
+    }
 
     await ctx.reply(
       `🏷 List at Floor Preview
 
 Collection: ${action.collectionSlug}
 Floor Price: ${stats.floorPrice} ${stats.floorSymbol || "ETH"}
+Estimated/List Price: ${stats.floorPrice} ETH
 
 Wallet: ${action.walletLabel}
-Wallet Address: ${ownership.walletAddress}
-Contract: ${action.contractAddress}
+Wallet Address: ${formatShortAddress(ownership.walletAddress)}
+Contract: ${formatShortAddress(action.contractAddress)}
 Token ID: ${action.tokenId}
-Owner Onchain: ${ownership.owner}
-Wallet Owns Token: ${ownership.ownsToken ? "YES ✅" : "NO ❌"}
+Owner Onchain: ${formatMaybeShortAddress(ownership.owner)}
+Wallet Owns Token: YES
 
-Suggested command:
-/listfloor ${action.walletLabel} ${action.collectionSlug} ${action.contractAddress} ${action.tokenId}
+Trading Lock:
+${getTradingLockStatusText()}
 
-Live listing lock:
-ALLOW_MAINNET_TRADING=${process.env.ALLOW_MAINNET_TRADING || "false"}`
+No signing has happened yet.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Confirm List at Floor", `pm:floorconfirmpreview:${action.sessionId}`)],
+        [Markup.button.callback("Cancel", `pm:cancel:${action.sessionId}`)]
+      ])
+    );
+
+    await auditOpenSeaSessionAction(
+      action,
+      "opensea_listing_previewed",
+      actorTelegramId,
+      { priceEth: Number(stats.floorPrice) }
     );
   } catch (error: any) {
     logSafeError("Bot handler failed", error);
@@ -3399,7 +3904,7 @@ ALLOW_MAINNET_TRADING=${process.env.ALLOW_MAINNET_TRADING || "false"}`
       `❌ List-at-floor preview failed.
 
 Reason:
-${error?.message || "Unknown error"}`
+${getSafeErrorMessage(error)}`
     );
   }
 });
@@ -3487,7 +3992,7 @@ bot.action(/^pm:floorconfirmpreview:(.+)$/, async (ctx) => {
     return;
   }
 
-  const { action } = validated;
+  const { action, actorTelegramId } = validated;
 
   try {
     await ctx.reply(
@@ -3504,26 +4009,25 @@ Checking floor price and ownership again...`
     const stats = await getOpenSeaCollectionStats(action.collectionSlug);
 
     if (stats.floorPrice === null) {
+      await auditOpenSeaSessionAction(
+        action,
+        "opensea_listing_blocked",
+        actorTelegramId,
+        { reason: "floor_price_unavailable" }
+      );
       await ctx.reply("❌ Could not detect floor price. Listing cancelled.");
       return;
     }
 
-    const ownership = await checkErc721Ownership({
-      walletLabel: action.walletLabel,
-      ownerTelegramId: action.ownerTelegramId,
-      contractAddress: action.contractAddress,
-      tokenId: action.tokenId
+    const ownership = await blockOpenSeaActionIfNotOwner({
+      ctx,
+      action,
+      actorTelegramId,
+      auditAction: "opensea_listing_blocked",
+      blockedVerb: "list this NFT"
     });
 
-    if (!ownership.ownsToken) {
-      await ctx.reply(
-        `❌ Cannot list this NFT.
-
-Wallet does not own token.
-
-Wallet: ${ownership.walletAddress}
-Owner Onchain: ${ownership.owner}`
-      );
+    if (!ownership) {
       return;
     }
 
@@ -3533,17 +4037,17 @@ Owner Onchain: ${ownership.owner}`
 Network: Ethereum Mainnet
 Collection: ${action.collectionSlug}
 Wallet: ${action.walletLabel}
-Wallet Address: ${ownership.walletAddress}
-Contract: ${action.contractAddress}
+Wallet Address: ${formatShortAddress(ownership.walletAddress)}
+Contract: ${formatShortAddress(action.contractAddress)}
 Token ID: ${action.tokenId}
 
 Current Floor Price:
 ${stats.floorPrice} ${stats.floorSymbol || "ETH"}
 
-Live trading lock:
-ALLOW_MAINNET_TRADING=${process.env.ALLOW_MAINNET_TRADING || "false"}
+Trading Lock:
+${getTradingLockStatusText()}
 
-If live trading is false, the next button will NOT create a listing.`,
+If live trading is disabled, the next button will NOT create a listing.`,
       Markup.inlineKeyboard([
         [Markup.button.callback("🚨 Confirm Live List at Floor", `pm:floorlistfinal:${action.sessionId}`)],
         [Markup.button.callback("❌ Cancel", `pm:cancel:${action.sessionId}`)]
@@ -3556,7 +4060,7 @@ If live trading is false, the next button will NOT create a listing.`,
       `❌ Final listing confirmation failed.
 
 Reason:
-${error?.message || "Unknown error"}`
+${getSafeErrorMessage(error)}`
     );
   }
 });
@@ -3578,13 +4082,7 @@ bot.action(/^pm:floorlistfinal:(.+)$/, async (ctx) => {
     return;
   }
 
-  const action = await markPostMintActionStatus(
-    validated.action,
-    validated.actorTelegramId,
-    "used",
-    "final_action.confirmed",
-    "floor-list-final"
-  );
+  let action = validated.action;
 
   try {
     await ctx.reply(
@@ -3596,28 +4094,56 @@ Re-checking current floor price and wallet ownership before listing...`
     const stats = await getOpenSeaCollectionStats(action.collectionSlug);
 
     if (stats.floorPrice === null) {
+      await auditOpenSeaSessionAction(
+        action,
+        "opensea_listing_blocked",
+        validated.actorTelegramId,
+        { reason: "floor_price_unavailable" }
+      );
       await ctx.reply("❌ Could not detect floor price. Listing cancelled.");
       return;
     }
 
-    const ownership = await checkErc721Ownership({
-      walletLabel: action.walletLabel,
-      ownerTelegramId: action.ownerTelegramId,
-      contractAddress: action.contractAddress,
-      tokenId: action.tokenId
+    const ownership = await blockOpenSeaActionIfNotOwner({
+      ctx,
+      action,
+      actorTelegramId: validated.actorTelegramId,
+      auditAction: "opensea_listing_blocked",
+      blockedVerb: "list this NFT"
     });
 
-    if (!ownership.ownsToken) {
-      await ctx.reply(
-        `❌ Listing cancelled.
-
-Wallet does not own this NFT.
-
-Wallet: ${ownership.walletAddress}
-Owner Onchain: ${ownership.owner}`
-      );
+    if (!ownership) {
       return;
     }
+
+    const priceEth = Number(stats.floorPrice);
+
+    if (
+      await blockOpenSeaActionIfTradingDisabled({
+        ctx,
+        action,
+        actorTelegramId: validated.actorTelegramId,
+        auditAction: "opensea_listing_blocked",
+        priceEth
+      })
+    ) {
+      return;
+    }
+
+    action = await markPostMintActionStatus(
+      action,
+      validated.actorTelegramId,
+      "used",
+      "final_action.confirmed",
+      "floor-list-final"
+    );
+
+    await auditOpenSeaSessionAction(
+      action,
+      "opensea_listing_confirmed",
+      validated.actorTelegramId,
+      { priceEth }
+    );
 
     await ctx.reply(
       `🏷 Submitting OpenSea listing...
@@ -3625,7 +4151,9 @@ Owner Onchain: ${ownership.owner}`
 Wallet: ${action.walletLabel}
 Contract: ${action.contractAddress}
 Token ID: ${action.tokenId}
-Price: ${stats.floorPrice} ETH`
+Price: ${priceEth} ETH
+
+If OpenSea requires approval, the SDK may request or submit an approval transaction before the listing order is created.`
     );
 
     const result = await createOpenSeaListing({
@@ -3633,8 +4161,22 @@ Price: ${stats.floorPrice} ETH`
       ownerTelegramId: action.ownerTelegramId,
       contractAddress: action.contractAddress,
       tokenId: action.tokenId,
-      priceEth: Number(stats.floorPrice)
+      priceEth
     });
+
+    const resultSummary = getOpenSeaResultSummary(result);
+    const txHash = getOpenSeaResultTxHash(result) || undefined;
+
+    await auditOpenSeaSessionAction(
+      action,
+      "opensea_listing_confirmed",
+      validated.actorTelegramId,
+      {
+        priceEth,
+        ...(txHash ? { txHash } : {}),
+        reason: "submitted"
+      }
+    );
 
     await ctx.reply(
       `✅ OpenSea listing created!
@@ -3644,20 +4186,26 @@ Contract: ${result.contractAddress}
 Token ID: ${result.tokenId}
 Price: ${result.priceEth} ETH
 
-OpenSea SDK response:
-${JSON.stringify(result.listing, null, 2).slice(0, 2500)}`
+OpenSea result:
+${resultSummary}`
     );
   } catch (error: any) {
     logSafeError("Bot handler failed", error);
+    await auditOpenSeaSessionAction(
+      action,
+      "opensea_action_failed",
+      validated.actorTelegramId,
+      { reason: getSafeErrorMessage(error) }
+    );
 
     await ctx.reply(
       `❌ Live floor listing failed.
 
 Reason:
-${error?.message || "Unknown error"}
+${getSafeErrorMessage(error)}
 
 Safety lock status:
-ALLOW_MAINNET_TRADING=${process.env.ALLOW_MAINNET_TRADING || "false"}`
+${getTradingLockStatusText()}`
     );
   }
 });
@@ -3754,22 +4302,15 @@ Custom Price: ${priceEth} ETH
 Checking ownership...`
     );
 
-    const ownership = await checkErc721Ownership({
-      walletLabel: action.walletLabel,
-      ownerTelegramId: action.ownerTelegramId,
-      contractAddress: action.contractAddress,
-      tokenId: action.tokenId
+    const ownership = await blockOpenSeaActionIfNotOwner({
+      ctx,
+      action,
+      actorTelegramId: validated.actorTelegramId,
+      auditAction: "opensea_listing_blocked",
+      blockedVerb: "preview a custom listing for this NFT"
     });
 
-    if (!ownership.ownsToken) {
-      await ctx.reply(
-        `❌ Cannot list this NFT.
-
-Wallet does not own token.
-
-Wallet: ${ownership.walletAddress}
-Owner Onchain: ${ownership.owner}`
-      );
+    if (!ownership) {
       return;
     }
 
@@ -3779,21 +4320,28 @@ Owner Onchain: ${ownership.owner}`
 Network: Ethereum Mainnet
 Collection: ${action.collectionSlug}
 Wallet: ${action.walletLabel}
-Wallet Address: ${ownership.walletAddress}
-Contract: ${action.contractAddress}
+Wallet Address: ${formatShortAddress(ownership.walletAddress)}
+Contract: ${formatShortAddress(action.contractAddress)}
 Token ID: ${action.tokenId}
 
 Listing Price:
 ${priceEth} ETH
 
-Live trading lock:
-ALLOW_MAINNET_TRADING=${process.env.ALLOW_MAINNET_TRADING || "false"}
+Trading Lock:
+${getTradingLockStatusText()}
 
-If live trading is false, the confirm button will NOT create a listing.`,
+No signing has happened yet. If live trading is disabled, the confirm button will NOT create a listing.`,
       Markup.inlineKeyboard([
         [Markup.button.callback("🚨 Confirm Custom Listing", `pm:customlistfinal:${sessionId}`)],
         [Markup.button.callback("❌ Cancel", `pm:cancel:${sessionId}`)]
       ])
+    );
+
+    await auditOpenSeaSessionAction(
+      action,
+      "opensea_custom_listing_previewed",
+      validated.actorTelegramId,
+      { priceEth }
     );
   } catch (error: any) {
     logSafeError("Bot handler failed", error);
@@ -3802,7 +4350,7 @@ If live trading is false, the confirm button will NOT create a listing.`,
       `❌ Custom listing confirmation failed.
 
 Reason:
-${error?.message || "Unknown error"}`
+${getSafeErrorMessage(error)}`
     );
   }
 });
@@ -3827,17 +4375,17 @@ bot.action(/^pm:customlistfinal:(.+)$/, async (ctx) => {
   const priceEth = validated.action.customPriceEth;
 
   if (!Number.isFinite(priceEth) || !priceEth || priceEth <= 0) {
+    await auditOpenSeaSessionAction(
+      validated.action,
+      "opensea_listing_blocked",
+      validated.actorTelegramId,
+      { reason: "invalid_custom_price" }
+    );
     await ctx.reply("❌ Invalid custom listing price. Please open the custom listing preview again.");
     return;
   }
 
-  const action = await markPostMintActionStatus(
-    validated.action,
-    validated.actorTelegramId,
-    "used",
-    "final_action.confirmed",
-    "custom-list-final"
-  );
+  let action = validated.action;
 
   try {
     await ctx.reply(
@@ -3846,24 +4394,44 @@ bot.action(/^pm:customlistfinal:(.+)$/, async (ctx) => {
 Re-checking ownership before submitting...`
     );
 
-    const ownership = await checkErc721Ownership({
-      walletLabel: action.walletLabel,
-      ownerTelegramId: action.ownerTelegramId,
-      contractAddress: action.contractAddress,
-      tokenId: action.tokenId
+    const ownership = await blockOpenSeaActionIfNotOwner({
+      ctx,
+      action,
+      actorTelegramId: validated.actorTelegramId,
+      auditAction: "opensea_listing_blocked",
+      blockedVerb: "list this NFT"
     });
 
-    if (!ownership.ownsToken) {
-      await ctx.reply(
-        `❌ Listing cancelled.
-
-Wallet does not own this NFT.
-
-Wallet: ${ownership.walletAddress}
-Owner Onchain: ${ownership.owner}`
-      );
+    if (!ownership) {
       return;
     }
+
+    if (
+      await blockOpenSeaActionIfTradingDisabled({
+        ctx,
+        action,
+        actorTelegramId: validated.actorTelegramId,
+        auditAction: "opensea_listing_blocked",
+        priceEth
+      })
+    ) {
+      return;
+    }
+
+    action = await markPostMintActionStatus(
+      action,
+      validated.actorTelegramId,
+      "used",
+      "final_action.confirmed",
+      "custom-list-final"
+    );
+
+    await auditOpenSeaSessionAction(
+      action,
+      "opensea_listing_confirmed",
+      validated.actorTelegramId,
+      { priceEth }
+    );
 
     await ctx.reply(
       `🏷 Submitting custom OpenSea listing...
@@ -3871,7 +4439,9 @@ Owner Onchain: ${ownership.owner}`
 Wallet: ${action.walletLabel}
 Contract: ${action.contractAddress}
 Token ID: ${action.tokenId}
-Price: ${priceEth} ETH`
+Price: ${priceEth} ETH
+
+If OpenSea requires approval, the SDK may request or submit an approval transaction before the listing order is created.`
     );
 
     const result = await createOpenSeaListing({
@@ -3882,6 +4452,20 @@ Price: ${priceEth} ETH`
       priceEth
     });
 
+    const resultSummary = getOpenSeaResultSummary(result);
+    const txHash = getOpenSeaResultTxHash(result) || undefined;
+
+    await auditOpenSeaSessionAction(
+      action,
+      "opensea_listing_confirmed",
+      validated.actorTelegramId,
+      {
+        priceEth,
+        ...(txHash ? { txHash } : {}),
+        reason: "submitted"
+      }
+    );
+
     await ctx.reply(
       `✅ Custom OpenSea listing created!
 
@@ -3890,20 +4474,26 @@ Contract: ${result.contractAddress}
 Token ID: ${result.tokenId}
 Price: ${result.priceEth} ETH
 
-OpenSea SDK response:
-${JSON.stringify(result.listing, null, 2).slice(0, 2500)}`
+OpenSea result:
+${resultSummary}`
     );
   } catch (error: any) {
     logSafeError("Bot handler failed", error);
+    await auditOpenSeaSessionAction(
+      action,
+      "opensea_action_failed",
+      validated.actorTelegramId,
+      { reason: getSafeErrorMessage(error) }
+    );
 
     await ctx.reply(
       `❌ Custom listing failed.
 
 Reason:
-${error?.message || "Unknown error"}
+${getSafeErrorMessage(error)}
 
 Safety lock status:
-ALLOW_MAINNET_TRADING=${process.env.ALLOW_MAINNET_TRADING || "false"}`
+${getTradingLockStatusText()}`
     );
   }
 });
@@ -3926,7 +4516,7 @@ bot.action(/^pm:acceptofferpreview:(.+)$/, async (ctx) => {
     return;
   }
 
-  const { action } = validated;
+  const { action, actorTelegramId } = validated;
 
   try {
     await ctx.reply(
@@ -3946,6 +4536,12 @@ Checking top offer and ownership...`
     );
 
     if (!bestOffer.hasOffer) {
+      await auditOpenSeaSessionAction(
+        action,
+        "opensea_accept_offer_blocked",
+        actorTelegramId,
+        { reason: "no_top_offer" }
+      );
       await ctx.reply(
         `❌ No top offer found.
 
@@ -3955,22 +4551,15 @@ Token ID: ${action.tokenId}`
       return;
     }
 
-    const ownership = await checkErc721Ownership({
-      walletLabel: action.walletLabel,
-      ownerTelegramId: action.ownerTelegramId,
-      contractAddress: action.contractAddress,
-      tokenId: action.tokenId
+    const ownership = await blockOpenSeaActionIfNotOwner({
+      ctx,
+      action,
+      actorTelegramId,
+      auditAction: "opensea_accept_offer_blocked",
+      blockedVerb: "accept an offer for this NFT"
     });
 
-    if (!ownership.ownsToken) {
-      await ctx.reply(
-        `❌ Cannot accept offer.
-
-Wallet does not own this NFT.
-
-Wallet: ${ownership.walletAddress}
-Owner Onchain: ${ownership.owner}`
-      );
+    if (!ownership) {
       return;
     }
 
@@ -3980,24 +4569,34 @@ Owner Onchain: ${ownership.owner}`
 Network: Ethereum Mainnet
 Collection: ${action.collectionSlug}
 Wallet: ${action.walletLabel}
-Wallet Address: ${ownership.walletAddress}
-Contract: ${action.contractAddress}
+Wallet Address: ${formatShortAddress(ownership.walletAddress)}
+Contract: ${formatShortAddress(action.contractAddress)}
 Token ID: ${action.tokenId}
+Wallet Owns Token: YES
 
 Top Offer:
 ${bestOffer.amount} ${bestOffer.symbol}
+Maker: ${getOfferMakerText(bestOffer)}
+Expiration: ${getOfferExpirationText(bestOffer)}
 
 Order Hash:
 ${bestOffer.orderHash}
 
-Live trading lock:
-ALLOW_MAINNET_TRADING=${process.env.ALLOW_MAINNET_TRADING || "false"}
+Trading Lock:
+${getTradingLockStatusText()}
 
-If you confirm, this will sell the NFT for the top offer when live trading is enabled.`,
+No signing has happened yet. If you confirm, this will sell the NFT for the top offer only when live trading is enabled.`,
       Markup.inlineKeyboard([
         [Markup.button.callback("🚨 Confirm Accept Top Offer", `pm:acceptofferfinal:${action.sessionId}`)],
         [Markup.button.callback("❌ Cancel", `pm:cancel:${action.sessionId}`)]
       ])
+    );
+
+    await auditOpenSeaSessionAction(
+      action,
+      "opensea_accept_offer_previewed",
+      actorTelegramId,
+      { reason: "offer_found" }
     );
   } catch (error: any) {
     logSafeError("Bot handler failed", error);
@@ -4006,7 +4605,7 @@ If you confirm, this will sell the NFT for the top offer when live trading is en
       `❌ Accept-offer preview failed.
 
 Reason:
-${error?.message || "Unknown error"}`
+${getSafeErrorMessage(error)}`
     );
   }
 });
@@ -4028,19 +4627,50 @@ bot.action(/^pm:acceptofferfinal:(.+)$/, async (ctx) => {
     return;
   }
 
-  const action = await markPostMintActionStatus(
-    validated.action,
-    validated.actorTelegramId,
-    "used",
-    "final_action.confirmed",
-    "accept-offer-final"
-  );
+  let action = validated.action;
 
   try {
     await ctx.reply(
       `🚨 Final accept-offer command received.
 
 Re-checking ownership and latest top offer before submitting...`
+    );
+
+    const ownership = await blockOpenSeaActionIfNotOwner({
+      ctx,
+      action,
+      actorTelegramId: validated.actorTelegramId,
+      auditAction: "opensea_accept_offer_blocked",
+      blockedVerb: "accept an offer for this NFT"
+    });
+
+    if (!ownership) {
+      return;
+    }
+
+    if (
+      await blockOpenSeaActionIfTradingDisabled({
+        ctx,
+        action,
+        actorTelegramId: validated.actorTelegramId,
+        auditAction: "opensea_accept_offer_blocked"
+      })
+    ) {
+      return;
+    }
+
+    action = await markPostMintActionStatus(
+      action,
+      validated.actorTelegramId,
+      "used",
+      "final_action.confirmed",
+      "accept-offer-final"
+    );
+
+    await auditOpenSeaSessionAction(
+      action,
+      "opensea_accept_offer_confirmed",
+      validated.actorTelegramId
     );
 
     const result = await acceptOpenSeaBestOffer({
@@ -4050,6 +4680,19 @@ Re-checking ownership and latest top offer before submitting...`
       contractAddress: action.contractAddress,
       tokenId: action.tokenId
     });
+
+    const resultSummary = getOpenSeaResultSummary(result);
+    const txHash = getOpenSeaResultTxHash(result) || undefined;
+
+    await auditOpenSeaSessionAction(
+      action,
+      "opensea_accept_offer_confirmed",
+      validated.actorTelegramId,
+      {
+        ...(txHash ? { txHash } : {}),
+        reason: "submitted"
+      }
+    );
 
     await ctx.reply(
       `✅ Top offer accepted!
@@ -4063,20 +4706,26 @@ Offer: ${result.offerAmount} ${result.offerSymbol}
 Order Hash:
 ${result.orderHash}
 
-Tx:
-${result.txHash}`
+OpenSea result:
+${resultSummary}`
     );
   } catch (error: any) {
     logSafeError("Bot handler failed", error);
+    await auditOpenSeaSessionAction(
+      action,
+      "opensea_action_failed",
+      validated.actorTelegramId,
+      { reason: getSafeErrorMessage(error) }
+    );
 
     await ctx.reply(
       `❌ Accept top offer failed.
 
 Reason:
-${error?.message || "Unknown error"}
+${getSafeErrorMessage(error)}
 
 Safety lock status:
-ALLOW_MAINNET_TRADING=${process.env.ALLOW_MAINNET_TRADING || "false"}`
+${getTradingLockStatusText()}`
     );
   }
 });
@@ -4201,7 +4850,7 @@ ${walletAddress}`
       `❌ Portfolio scan failed.
 
 Reason:
-${error?.message || "Unknown error"}`
+${getSafeErrorMessage(error)}`
     );
   }
 });

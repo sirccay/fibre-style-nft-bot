@@ -125,6 +125,45 @@ function formatOpenSeaPrice(order: any) {
   }
 }
 
+function getOpenSeaOrderMaker(order: any): string | null {
+  const maker =
+    order?.maker?.address ??
+    order?.maker ??
+    order?.protocol_data?.parameters?.offerer ??
+    order?.protocolData?.parameters?.offerer ??
+    null;
+
+  return typeof maker === "string" && maker.trim() ? maker : null;
+}
+
+function getOpenSeaOrderExpiration(order: any): string | null {
+  const expiration =
+    order?.expiration_time ??
+    order?.expirationTime ??
+    order?.closing_date ??
+    order?.closingDate ??
+    order?.protocol_data?.parameters?.endTime ??
+    order?.protocolData?.parameters?.endTime ??
+    null;
+
+  if (expiration === null || expiration === undefined || expiration === "") {
+    return null;
+  }
+
+  const numericExpiration = Number(expiration);
+
+  if (Number.isFinite(numericExpiration) && numericExpiration > 0) {
+    const timestampMs =
+      numericExpiration > 10_000_000_000
+        ? numericExpiration
+        : numericExpiration * 1000;
+
+    return new Date(timestampMs).toISOString();
+  }
+
+  return String(expiration);
+}
+
 export async function getOpenSeaBestOffer(slug: string, tokenId: string) {
   const apiKey = getOpenSeaApiKey();
 
@@ -166,6 +205,8 @@ export async function getOpenSeaBestOffer(slug: string, tokenId: string) {
     amount: price.amount,
     symbol: price.symbol,
     rawValue: price.rawValue,
+    maker: getOpenSeaOrderMaker(offer),
+    expiration: getOpenSeaOrderExpiration(offer),
     raw: data
   };
 }
