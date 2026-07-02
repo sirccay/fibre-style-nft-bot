@@ -18,6 +18,11 @@ type WalletAuditEvent = {
   contractAddress?: string;
   tokenId?: string;
   priceEth?: number;
+  targetId?: string;
+  runId?: string;
+  chain?: string;
+  functionSignature?: string;
+  quantity?: number;
   txHash?: string;
   reason?: string;
 };
@@ -36,6 +41,11 @@ type SessionAuditEvent = {
   contractAddress?: string;
   tokenId?: string;
   priceEth?: number;
+  targetId?: string;
+  runId?: string;
+  chain?: string;
+  functionSignature?: string;
+  quantity?: number;
   txHash?: string;
   action: string;
   status?: string;

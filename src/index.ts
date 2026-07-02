@@ -18,6 +18,38 @@ import { getTelegramUserId, requireAdmin } from "./auth.js";
 import { extractOpenSeaSlug, getOpenSeaCollectionStats, getOpenSeaBestOffer, getOpenSeaBestListing, getOpenSeaNft, getOpenSeaNftsByAccount } from "./opensea.js";
 import { checkErc721Ownership, createOpenSeaListing, getMainnetProvider, acceptOpenSeaBestOffer } from "./openseaTrading.js";
 import { appendSessionAuditLog, appendWalletAuditLog } from "./audit.js";
+import {
+  MAINNET_MINTING_DISABLED_MESSAGE,
+  getMintRpcStatus,
+  isMainnetMintingEnabled,
+  normalizeMintChain,
+  normalizeMintFunctionSignature,
+  previewMint,
+  submitMintTransaction,
+  validateMintPriceEth,
+  validateMintQuantity,
+  waitForMintConfirmation
+} from "./mintEngine.js";
+import type {
+  MintChain,
+  MintPreviewResult,
+  SupportedMintFunctionSignature
+} from "./mintEngine.js";
+import {
+  archiveMintTargetForOwner,
+  createMintTarget,
+  getMintTargetForOwner,
+  listMintTargetsForOwner,
+  updateMintTargetForOwner
+} from "./mintTargets.js";
+import type { MintTarget } from "./mintTargets.js";
+import {
+  createMintRun,
+  getMintRunForOwner,
+  listMintRunsForOwner,
+  updateMintRunForOwner
+} from "./mintRuns.js";
+import type { MintRun, MintRunStatus } from "./mintRuns.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -44,6 +76,18 @@ const BOT_COMMANDS = [
   { command: "topoffer", description: "Check top offer" },
   { command: "bestlisting", description: "Check best listing" },
   { command: "tradingstatus", description: "Show trading lock status" },
+  { command: "mainmintpreview", description: "Preview real mint" },
+  { command: "mainmint", description: "Create real mint confirmation" },
+  { command: "addminttarget", description: "Save mint target" },
+  { command: "minttargets", description: "Show mint targets" },
+  { command: "minttarget", description: "View mint target" },
+  { command: "updateminttarget", description: "Update mint target" },
+  { command: "deleteminttarget", description: "Archive mint target" },
+  { command: "minttargetpreview", description: "Preview saved mint target" },
+  { command: "minttargetnow", description: "Mint saved target" },
+  { command: "minthistory", description: "Show mint history" },
+  { command: "mintstatus", description: "Show mint run status" },
+  { command: "mintingstatus", description: "Show minting lock status" },
   { command: "help", description: "Show commands" }
 ];
 
@@ -251,6 +295,20 @@ OpenSea:
 /topoffer collectionSlug tokenId
 /bestlisting collectionSlug tokenId
 /tradingstatus
+
+Minting:
+/mainmintpreview wallet1 0xCONTRACT mint(uint256) 1 0.03 mainnet
+/mainmint wallet1 0xCONTRACT mint(uint256) 1 0.03 mainnet
+/addminttarget whaleMint 0xCONTRACT mint(uint256) 1 0.03 mainnet
+/minttargets
+/minttarget targetId
+/updateminttarget targetId publicMint(uint256) 2 0.01 mainnet
+/deleteminttarget targetId
+/minttargetpreview targetId wallet1
+/minttargetnow targetId wallet1
+/minthistory
+/mintstatus runId
+/mintingstatus
 
 Testing:
 /minttest wallet1 1`;
@@ -473,6 +531,543 @@ async function blockOpenSeaActionIfTradingDisabled(params: {
 
   await params.ctx.reply(MAINNET_TRADING_DISABLED_MESSAGE);
   return true;
+}
+
+type MintCommandParams = {
+  walletLabel: string;
+  contractAddress: string;
+  functionSignature: SupportedMintFunctionSignature;
+  quantity: number;
+  priceEth: string;
+  chain: MintChain;
+};
+
+type MintConfirmationStatus = "active" | "used" | "cancelled" | "expired";
+
+type MintConfirmationSession = {
+  sessionId: string;
+  ownerTelegramId: string;
+  walletLabel: string;
+  walletAddress: string;
+  chain: MintChain;
+  contractAddress: string;
+  functionSignature: SupportedMintFunctionSignature;
+  quantity: number;
+  priceEth: string;
+  runId: string;
+  targetId?: string;
+  createdAt: string;
+  expiresAt: string;
+  status: MintConfirmationStatus;
+};
+
+type ValidatedMintConfirmationSession = {
+  session: MintConfirmationSession;
+  actorTelegramId: string;
+};
+
+type MintTargetDeleteStatus = "active" | "used" | "cancelled" | "expired";
+
+type MintTargetDeleteConfirmation = {
+  sessionId: string;
+  ownerTelegramId: string;
+  targetId: string;
+  targetName: string;
+  createdAt: string;
+  expiresAt: string;
+  status: MintTargetDeleteStatus;
+};
+
+const MINT_CONFIRMATION_TTL_MS = 10 * 60 * 1000;
+const MINT_TARGET_DELETE_TTL_MS = 10 * 60 * 1000;
+const MINT_TARGET_NAME_PATTERN = /^[A-Za-z0-9_-]{2,40}$/;
+const MINT_CONFIRMATION_EXPIRED_MESSAGE =
+  "This mint confirmation has expired. Please create it again.";
+const MINT_CONFIRMATION_ALREADY_USED_MESSAGE =
+  "This mint confirmation has already been used or cancelled.";
+const MINT_CONFIRMATION_WRONG_USER_MESSAGE =
+  "You cannot use this mint confirmation.";
+const mintConfirmations = new Map<string, MintConfirmationSession>();
+const mintTargetDeleteConfirmations =
+  new Map<string, MintTargetDeleteConfirmation>();
+
+function getMintLockStatusText(chain: MintChain): string {
+  if (chain === "sepolia") {
+    return "Sepolia test minting is allowed without ALLOW_MAINNET_MINTING.";
+  }
+
+  return isMainnetMintingEnabled()
+    ? "ALLOW_MAINNET_MINTING=true - live mainnet mint sends are enabled."
+    : "ALLOW_MAINNET_MINTING=false - live mainnet mint sends are blocked.";
+}
+
+function sanitizeMintTargetName(name: string): string {
+  const normalized = name.trim();
+
+  if (!MINT_TARGET_NAME_PATTERN.test(normalized)) {
+    throw new Error(
+      "Mint target name must be 2-40 characters and use only letters, numbers, hyphen, or underscore."
+    );
+  }
+
+  return normalized;
+}
+
+function parseMintCommandParams(parts: string[]): MintCommandParams {
+  if (parts.length < 6) {
+    throw new Error(
+      "Invalid format. Use: /mainmintpreview wallet1 0xCONTRACT mint(uint256) 1 0.03 mainnet"
+    );
+  }
+
+  const walletLabel = getCommandPart(parts, 1);
+  const contractRaw = getCommandPart(parts, 2);
+  const functionSignature = normalizeMintFunctionSignature(getCommandPart(parts, 3));
+  const quantity = validateMintQuantity(getCommandPart(parts, 4));
+  const priceEth = validateMintPriceEth(getCommandPart(parts, 5));
+  const chain = normalizeMintChain(parts[6]);
+
+  if (!ethers.isAddress(contractRaw)) {
+    throw new Error("Invalid contract address.");
+  }
+
+  return {
+    walletLabel,
+    contractAddress: ethers.getAddress(contractRaw),
+    functionSignature,
+    quantity,
+    priceEth,
+    chain
+  };
+}
+
+function parseMintTargetParams(parts: string[]) {
+  if (parts.length < 6) {
+    throw new Error(
+      "Invalid format. Use: /addminttarget whaleMint 0xCONTRACT mint(uint256) 1 0.03 mainnet"
+    );
+  }
+
+  const name = sanitizeMintTargetName(getCommandPart(parts, 1));
+  const contractRaw = getCommandPart(parts, 2);
+  const functionSignature = normalizeMintFunctionSignature(getCommandPart(parts, 3));
+  const quantity = validateMintQuantity(getCommandPart(parts, 4));
+  const priceEth = validateMintPriceEth(getCommandPart(parts, 5));
+  const chain = normalizeMintChain(parts[6]);
+
+  if (!ethers.isAddress(contractRaw)) {
+    throw new Error("Invalid contract address.");
+  }
+
+  return {
+    name,
+    contractAddress: ethers.getAddress(contractRaw),
+    functionSignature,
+    quantity,
+    priceEth,
+    chain
+  };
+}
+
+function parseMintTargetUpdateParams(parts: string[]) {
+  if (parts.length < 5) {
+    throw new Error(
+      "Invalid format. Use: /updateminttarget targetId mint(uint256) 1 0.03 mainnet"
+    );
+  }
+
+  return {
+    targetId: getCommandPart(parts, 1),
+    functionSignature: normalizeMintFunctionSignature(getCommandPart(parts, 2)),
+    quantity: validateMintQuantity(getCommandPart(parts, 3)),
+    priceEth: validateMintPriceEth(getCommandPart(parts, 4)),
+    chain: normalizeMintChain(parts[5])
+  };
+}
+
+function formatMintPriceForAudit(priceEth: string) {
+  return Number(priceEth);
+}
+
+async function auditMintAction(details: {
+  ownerTelegramId: string | null;
+  action: string;
+  walletLabel?: string | undefined;
+  walletAddress?: string | undefined;
+  targetId?: string | undefined;
+  runId?: string | undefined;
+  chain?: string | undefined;
+  contractAddress?: string | undefined;
+  functionSignature?: string | undefined;
+  quantity?: number | undefined;
+  priceEth?: string | undefined;
+  txHash?: string | undefined;
+  status?: string | undefined;
+  reason?: string | undefined;
+}) {
+  const event: Record<string, string | number | null> = {
+    ownerTelegramId: details.ownerTelegramId,
+    action: details.action
+  };
+
+  for (const [key, value] of Object.entries(details)) {
+    if (key === "ownerTelegramId" || key === "action" || value === undefined) {
+      continue;
+    }
+
+    event[key] =
+      key === "priceEth" && typeof value === "string"
+        ? formatMintPriceForAudit(value)
+        : value;
+  }
+
+  await appendWalletAuditLog(event as any);
+}
+
+function formatMintPreviewMessage(
+  preview: MintPreviewResult,
+  options: { title?: string; runId?: string; targetId?: string } = {}
+) {
+  const lines = [
+    options.title || "Mint Preview",
+    "",
+    `Wallet: ${preview.walletLabel}`,
+    `Address: ${formatShortAddress(preview.walletAddress)}`,
+    `Chain: ${preview.chain}`,
+    `Contract: ${formatShortAddress(preview.contractAddress)}`,
+    `Function: ${preview.functionSignature}`,
+    `Quantity: ${preview.quantity}`,
+    `Price Each: ${preview.priceEth} ETH`,
+    `Total Mint Cost: ${preview.totalCostEth} ETH`,
+    `Estimated Gas: ${preview.gasEstimate || "Not available"}`,
+    `Minting Lock: ${getMintLockStatusText(preview.chain)}`
+  ];
+
+  if (options.targetId) {
+    lines.splice(2, 0, `Target ID: ${options.targetId}`);
+  }
+
+  if (options.runId) {
+    lines.push(`Run ID: ${options.runId}`);
+  }
+
+  if (preview.gasEstimateFailed) {
+    lines.push(
+      "",
+      "Gas estimation failed. The mint may not be live, wallet may not be eligible, function may be wrong, or contract may reject the call."
+    );
+  }
+
+  return lines.join("\n");
+}
+
+function createRunFromPreview(
+  ownerTelegramId: string,
+  preview: MintPreviewResult,
+  status: MintRunStatus,
+  targetId?: string
+) {
+  return createMintRun({
+    ownerTelegramId,
+    ...(targetId ? { targetId } : {}),
+    walletLabel: preview.walletLabel,
+    walletAddress: preview.walletAddress,
+    chain: preview.chain,
+    contractAddress: preview.contractAddress,
+    functionSignature: preview.functionSignature,
+    quantity: preview.quantity,
+    priceEth: preview.priceEth,
+    status
+  });
+}
+
+function isMintConfirmationExpired(session: MintConfirmationSession) {
+  const expiresAtMs = Date.parse(session.expiresAt);
+  return !Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now();
+}
+
+function cleanupMintConfirmations() {
+  for (const [sessionId, session] of mintConfirmations.entries()) {
+    if (session.status === "active" && isMintConfirmationExpired(session)) {
+      session.status = "expired";
+    }
+
+    const expiresAtMs = Date.parse(session.expiresAt);
+    const cleanupAfterMs = Number.isFinite(expiresAtMs)
+      ? expiresAtMs + MINT_CONFIRMATION_TTL_MS
+      : Date.now();
+
+    if (cleanupAfterMs <= Date.now()) {
+      mintConfirmations.delete(sessionId);
+    }
+  }
+}
+
+function createMintConfirmationSession(params: {
+  ownerTelegramId: string;
+  walletLabel: string;
+  walletAddress: string;
+  chain: MintChain;
+  contractAddress: string;
+  functionSignature: SupportedMintFunctionSignature;
+  quantity: number;
+  priceEth: string;
+  runId: string;
+  targetId?: string;
+}) {
+  cleanupMintConfirmations();
+
+  const createdAt = new Date();
+  const session: MintConfirmationSession = {
+    sessionId: randomUUID(),
+    ownerTelegramId: params.ownerTelegramId,
+    walletLabel: params.walletLabel,
+    walletAddress: params.walletAddress,
+    chain: params.chain,
+    contractAddress: params.contractAddress,
+    functionSignature: params.functionSignature,
+    quantity: params.quantity,
+    priceEth: params.priceEth,
+    runId: params.runId,
+    ...(params.targetId ? { targetId: params.targetId } : {}),
+    createdAt: createdAt.toISOString(),
+    expiresAt: new Date(
+      createdAt.getTime() + MINT_CONFIRMATION_TTL_MS
+    ).toISOString(),
+    status: "active"
+  };
+
+  mintConfirmations.set(session.sessionId, session);
+  return session;
+}
+
+async function validateMintConfirmationSession(
+  ctx: Context,
+  sessionId: string
+): Promise<ValidatedMintConfirmationSession | null> {
+  cleanupMintConfirmations();
+
+  const actorTelegramId = getTelegramUserId(ctx);
+
+  if (!actorTelegramId) {
+    await ctx.reply("❌ Could not verify your Telegram account for this action.");
+    return null;
+  }
+
+  const session = mintConfirmations.get(sessionId);
+
+  if (!session) {
+    await ctx.reply(MINT_CONFIRMATION_EXPIRED_MESSAGE);
+    return null;
+  }
+
+  if (session.ownerTelegramId !== actorTelegramId) {
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "mint_blocked",
+      walletLabel: session.walletLabel,
+      walletAddress: session.walletAddress,
+      targetId: session.targetId,
+      runId: session.runId,
+      chain: session.chain,
+      contractAddress: session.contractAddress,
+      functionSignature: session.functionSignature,
+      quantity: session.quantity,
+      priceEth: session.priceEth,
+      status: session.status,
+      reason: `wrong_user:actor=${actorTelegramId}`
+    });
+    await ctx.reply(MINT_CONFIRMATION_WRONG_USER_MESSAGE);
+    return null;
+  }
+
+  if (session.status === "expired" || isMintConfirmationExpired(session)) {
+    session.status = "expired";
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "mint_blocked",
+      walletLabel: session.walletLabel,
+      walletAddress: session.walletAddress,
+      targetId: session.targetId,
+      runId: session.runId,
+      chain: session.chain,
+      contractAddress: session.contractAddress,
+      functionSignature: session.functionSignature,
+      quantity: session.quantity,
+      priceEth: session.priceEth,
+      status: session.status,
+      reason: "expired"
+    });
+    updateMintRunForOwner(session.runId, session.ownerTelegramId, {
+      status: "blocked",
+      errorReason: "confirmation_expired"
+    });
+    await ctx.reply(MINT_CONFIRMATION_EXPIRED_MESSAGE);
+    return null;
+  }
+
+  if (session.status === "used" || session.status === "cancelled") {
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "mint_blocked",
+      walletLabel: session.walletLabel,
+      walletAddress: session.walletAddress,
+      targetId: session.targetId,
+      runId: session.runId,
+      chain: session.chain,
+      contractAddress: session.contractAddress,
+      functionSignature: session.functionSignature,
+      quantity: session.quantity,
+      priceEth: session.priceEth,
+      status: session.status,
+      reason: "already_used_or_cancelled"
+    });
+    await ctx.reply(MINT_CONFIRMATION_ALREADY_USED_MESSAGE);
+    return null;
+  }
+
+  return { session, actorTelegramId };
+}
+
+function formatMintTarget(target: MintTarget) {
+  return [
+    `Name: ${target.name}`,
+    `Target ID: ${target.targetId}`,
+    `Status: ${target.status}`,
+    `Chain: ${target.chain}`,
+    `Contract: ${formatShortAddress(target.contractAddress)}`,
+    `Function: ${target.functionSignature}`,
+    `Qty: ${target.quantity}`,
+    `Price: ${target.priceEth} ETH`,
+    `Created: ${target.createdAt}`,
+    `Updated: ${target.updatedAt}`
+  ].join("\n");
+}
+
+function formatMintRun(run: MintRun) {
+  return [
+    `Run ID: ${run.runId}`,
+    ...(run.targetId ? [`Target ID: ${run.targetId}`] : []),
+    `Status: ${run.status}`,
+    `Wallet: ${run.walletLabel}`,
+    `Address: ${formatShortAddress(run.walletAddress)}`,
+    `Chain: ${run.chain}`,
+    `Contract: ${formatShortAddress(run.contractAddress)}`,
+    `Function: ${run.functionSignature}`,
+    `Qty: ${run.quantity}`,
+    `Price Each: ${run.priceEth} ETH`,
+    ...(run.txHash ? [`Tx: ${run.txHash}`] : []),
+    ...(run.errorReason ? [`Reason: ${run.errorReason}`] : []),
+    `Created: ${run.createdAt}`,
+    `Updated: ${run.updatedAt}`,
+    ...(run.confirmedAt ? [`Confirmed: ${run.confirmedAt}`] : [])
+  ].join("\n");
+}
+
+function isMintTargetDeleteExpired(session: MintTargetDeleteConfirmation) {
+  const expiresAtMs = Date.parse(session.expiresAt);
+  return !Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now();
+}
+
+function cleanupMintTargetDeleteConfirmations() {
+  for (const [sessionId, session] of mintTargetDeleteConfirmations.entries()) {
+    if (session.status === "active" && isMintTargetDeleteExpired(session)) {
+      session.status = "expired";
+    }
+
+    const expiresAtMs = Date.parse(session.expiresAt);
+    const cleanupAfterMs = Number.isFinite(expiresAtMs)
+      ? expiresAtMs + MINT_TARGET_DELETE_TTL_MS
+      : Date.now();
+
+    if (cleanupAfterMs <= Date.now()) {
+      mintTargetDeleteConfirmations.delete(sessionId);
+    }
+  }
+}
+
+function createMintTargetDeleteConfirmation(params: {
+  ownerTelegramId: string;
+  targetId: string;
+  targetName: string;
+}) {
+  cleanupMintTargetDeleteConfirmations();
+
+  const createdAt = new Date();
+  const session: MintTargetDeleteConfirmation = {
+    sessionId: randomUUID(),
+    ownerTelegramId: params.ownerTelegramId,
+    targetId: params.targetId,
+    targetName: params.targetName,
+    createdAt: createdAt.toISOString(),
+    expiresAt: new Date(
+      createdAt.getTime() + MINT_TARGET_DELETE_TTL_MS
+    ).toISOString(),
+    status: "active"
+  };
+
+  mintTargetDeleteConfirmations.set(session.sessionId, session);
+  return session;
+}
+
+async function validateMintTargetDeleteConfirmation(
+  ctx: Context,
+  sessionId: string
+) {
+  cleanupMintTargetDeleteConfirmations();
+
+  const actorTelegramId = getTelegramUserId(ctx);
+
+  if (!actorTelegramId) {
+    await ctx.reply("❌ Could not verify your Telegram account for this action.");
+    return null;
+  }
+
+  const session = mintTargetDeleteConfirmations.get(sessionId);
+
+  if (!session) {
+    await ctx.reply("This mint target removal confirmation has expired. Run /deleteminttarget again.");
+    return null;
+  }
+
+  if (session.ownerTelegramId !== actorTelegramId) {
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "mint_target_archive_blocked",
+      targetId: session.targetId,
+      status: session.status,
+      reason: `wrong_user:actor=${actorTelegramId}`
+    });
+    await ctx.reply("You cannot use this mint target confirmation.");
+    return null;
+  }
+
+  if (session.status === "expired" || isMintTargetDeleteExpired(session)) {
+    session.status = "expired";
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "mint_target_archive_blocked",
+      targetId: session.targetId,
+      status: session.status,
+      reason: "expired"
+    });
+    await ctx.reply("This mint target removal confirmation has expired. Run /deleteminttarget again.");
+    return null;
+  }
+
+  if (session.status === "used" || session.status === "cancelled") {
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "mint_target_archive_blocked",
+      targetId: session.targetId,
+      status: session.status,
+      reason: "already_used_or_cancelled"
+    });
+    await ctx.reply("This mint target confirmation has already been used or cancelled.");
+    return null;
+  }
+
+  return { session, actorTelegramId };
 }
 
 function getOfferExpirationText(offer: any): string {
@@ -1657,6 +2252,856 @@ ALLOW_MAINNET_TRADING=true
 
 ${MAINNET_TRADING_DISABLED_MESSAGE}`
   );
+});
+
+bot.command("mintingstatus", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const rpcStatus = getMintRpcStatus();
+
+  await ctx.reply(
+    `Minting Status
+
+ALLOW_MAINNET_MINTING: ${isMainnetMintingEnabled() ? "true" : "false"}
+ETH_MAINNET_RPC_URL configured: ${rpcStatus.mainnetRpcConfigured ? "yes" : "no"}
+SEPOLIA_RPC_URL or ETH_SEPOLIA_RPC_URL configured: ${rpcStatus.sepoliaRpcConfigured ? "yes" : "no"}
+OpenSea API key configured: ${getConfiguredStatus(process.env.OPENSEA_API_KEY)}
+
+Live Ethereum mainnet minting requires:
+ALLOW_MAINNET_MINTING=true
+
+Mainnet minting uses real ETH. Keep this disabled until you are ready for live minting.`
+  );
+});
+
+bot.command("mainmintpreview", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const params = parseMintCommandParams(parseCommandParts(ctx.message.text));
+    const preview = await previewMint({
+      ownerTelegramId,
+      ...params
+    });
+    const run = createRunFromPreview(ownerTelegramId, preview, "previewed");
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_previewed",
+      walletLabel: preview.walletLabel,
+      walletAddress: preview.walletAddress,
+      runId: run.runId,
+      chain: preview.chain,
+      contractAddress: preview.contractAddress,
+      functionSignature: preview.functionSignature,
+      quantity: preview.quantity,
+      priceEth: preview.priceEth,
+      status: run.status,
+      ...(preview.gasEstimateFailed ? { reason: "gas_estimation_failed" } : {})
+    });
+
+    await ctx.reply(formatMintPreviewMessage(preview, { runId: run.runId }));
+  } catch (error) {
+    logSafeError("Mint preview failed", error);
+    await ctx.reply(`❌ Mint preview failed.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("mainmint", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const params = parseMintCommandParams(parseCommandParts(ctx.message.text));
+    const preview = await previewMint({
+      ownerTelegramId,
+      ...params
+    });
+    const run = createRunFromPreview(ownerTelegramId, preview, "pending");
+    const session = createMintConfirmationSession({
+      ownerTelegramId,
+      walletLabel: preview.walletLabel,
+      walletAddress: preview.walletAddress,
+      chain: preview.chain,
+      contractAddress: preview.contractAddress,
+      functionSignature: preview.functionSignature,
+      quantity: preview.quantity,
+      priceEth: preview.priceEth,
+      runId: run.runId
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_confirmation_created",
+      walletLabel: preview.walletLabel,
+      walletAddress: preview.walletAddress,
+      runId: run.runId,
+      chain: preview.chain,
+      contractAddress: preview.contractAddress,
+      functionSignature: preview.functionSignature,
+      quantity: preview.quantity,
+      priceEth: preview.priceEth,
+      status: session.status
+    });
+
+    await ctx.reply(
+      `${formatMintPreviewMessage(preview, {
+        title: "Final Mint Confirmation",
+        runId: run.runId
+      })}
+
+This confirmation expires in 10 minutes.
+
+No transaction will be sent until you press Confirm Mint.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Confirm Mint", `mint:confirm:${session.sessionId}`)],
+        [Markup.button.callback("Cancel", `mint:cancel:${session.sessionId}`)]
+      ])
+    );
+  } catch (error) {
+    logSafeError("Could not create mint confirmation", error);
+    await ctx.reply(`❌ Could not create mint confirmation.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^mint:confirm:([0-9a-f-]+)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const sessionId = ctx.match[1];
+
+  if (!sessionId) {
+    await ctx.reply(MINT_CONFIRMATION_EXPIRED_MESSAGE);
+    return;
+  }
+
+  const validated = await validateMintConfirmationSession(ctx, sessionId);
+
+  if (!validated) {
+    return;
+  }
+
+  const { session, actorTelegramId } = validated;
+
+  try {
+    const preview = await previewMint({
+      ownerTelegramId: session.ownerTelegramId,
+      walletLabel: session.walletLabel,
+      contractAddress: session.contractAddress,
+      functionSignature: session.functionSignature,
+      quantity: session.quantity,
+      priceEth: session.priceEth,
+      chain: session.chain
+    });
+
+    if (preview.walletAddress.toLowerCase() !== session.walletAddress.toLowerCase()) {
+      throw new Error("Wallet session no longer matches the saved wallet.");
+    }
+
+    if (session.chain === "mainnet" && !isMainnetMintingEnabled()) {
+      session.status = "used";
+      updateMintRunForOwner(session.runId, session.ownerTelegramId, {
+        status: "blocked",
+        errorReason: "mainnet_minting_disabled"
+      });
+      await auditMintAction({
+        ownerTelegramId: session.ownerTelegramId,
+        action: "mint_blocked",
+        walletLabel: session.walletLabel,
+        walletAddress: session.walletAddress,
+        targetId: session.targetId,
+        runId: session.runId,
+        chain: session.chain,
+        contractAddress: session.contractAddress,
+        functionSignature: session.functionSignature,
+        quantity: session.quantity,
+        priceEth: session.priceEth,
+        status: "blocked",
+        reason: "mainnet_minting_disabled"
+      });
+      await ctx.reply(MAINNET_MINTING_DISABLED_MESSAGE);
+      return;
+    }
+
+    if (preview.gasEstimateFailed) {
+      session.status = "used";
+      updateMintRunForOwner(session.runId, session.ownerTelegramId, {
+        status: "blocked",
+        errorReason: "gas_estimation_failed"
+      });
+      await auditMintAction({
+        ownerTelegramId: session.ownerTelegramId,
+        action: "mint_blocked",
+        walletLabel: session.walletLabel,
+        walletAddress: session.walletAddress,
+        targetId: session.targetId,
+        runId: session.runId,
+        chain: session.chain,
+        contractAddress: session.contractAddress,
+        functionSignature: session.functionSignature,
+        quantity: session.quantity,
+        priceEth: session.priceEth,
+        status: "blocked",
+        reason: "gas_estimation_failed"
+      });
+      await ctx.reply(
+        "Gas estimation failed. The mint may not be live, wallet may not be eligible, function may be wrong, or contract may reject the call."
+      );
+      return;
+    }
+
+    session.status = "used";
+    const submitted = await submitMintTransaction({
+      ownerTelegramId: session.ownerTelegramId,
+      walletLabel: session.walletLabel,
+      contractAddress: session.contractAddress,
+      functionSignature: session.functionSignature,
+      quantity: session.quantity,
+      priceEth: session.priceEth,
+      chain: session.chain
+    });
+
+    updateMintRunForOwner(session.runId, session.ownerTelegramId, {
+      status: "submitted",
+      txHash: submitted.txHash
+    });
+
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "mint_submitted",
+      walletLabel: session.walletLabel,
+      walletAddress: submitted.walletAddress,
+      targetId: session.targetId,
+      runId: session.runId,
+      chain: session.chain,
+      contractAddress: session.contractAddress,
+      functionSignature: session.functionSignature,
+      quantity: session.quantity,
+      priceEth: session.priceEth,
+      txHash: submitted.txHash,
+      status: "submitted"
+    });
+
+    await ctx.reply(
+      `✅ Mint transaction sent.
+
+Run ID: ${session.runId}
+Tx:
+${submitted.txHash}`
+    );
+
+    try {
+      const confirmation = await waitForMintConfirmation(
+        session.chain,
+        submitted.txHash
+      );
+
+      if (confirmation.status === "confirmed") {
+        updateMintRunForOwner(session.runId, session.ownerTelegramId, {
+          status: "confirmed",
+          confirmedAt: new Date().toISOString()
+        });
+        await auditMintAction({
+          ownerTelegramId: session.ownerTelegramId,
+          action: "mint_confirmed",
+          walletLabel: session.walletLabel,
+          walletAddress: submitted.walletAddress,
+          targetId: session.targetId,
+          runId: session.runId,
+          chain: session.chain,
+          contractAddress: session.contractAddress,
+          functionSignature: session.functionSignature,
+          quantity: session.quantity,
+          priceEth: session.priceEth,
+          txHash: submitted.txHash,
+          status: "confirmed"
+        });
+        await ctx.reply(
+          `✅ Mint confirmed.
+
+Run ID: ${session.runId}
+Tx:
+${submitted.txHash}`
+        );
+        return;
+      }
+
+      if (confirmation.status === "timeout") {
+        updateMintRunForOwner(session.runId, session.ownerTelegramId, {
+          status: "submitted",
+          errorReason: "confirmation_timeout"
+        });
+        await ctx.reply(
+          `⚠️ Mint transaction was sent, but confirmation timed out.
+
+Run ID: ${session.runId}
+Tx:
+${submitted.txHash}`
+        );
+        return;
+      }
+
+      updateMintRunForOwner(session.runId, session.ownerTelegramId, {
+        status: "failed",
+        errorReason: "transaction_failed",
+        confirmedAt: new Date().toISOString()
+      });
+      await auditMintAction({
+        ownerTelegramId: session.ownerTelegramId,
+        action: "mint_failed",
+        walletLabel: session.walletLabel,
+        walletAddress: submitted.walletAddress,
+        targetId: session.targetId,
+        runId: session.runId,
+        chain: session.chain,
+        contractAddress: session.contractAddress,
+        functionSignature: session.functionSignature,
+        quantity: session.quantity,
+        priceEth: session.priceEth,
+        txHash: submitted.txHash,
+        status: "failed",
+        reason: "transaction_failed"
+      });
+      await ctx.reply(
+        `❌ Mint transaction failed.
+
+Run ID: ${session.runId}
+Tx:
+${submitted.txHash}`
+      );
+    } catch (confirmationError) {
+      logSafeError("Mint confirmation wait failed", confirmationError);
+      updateMintRunForOwner(session.runId, session.ownerTelegramId, {
+        status: "submitted",
+        errorReason: getSafeErrorMessage(confirmationError)
+      });
+      await ctx.reply(
+        `⚠️ Mint transaction was sent, but confirmation could not be verified yet.
+
+Run ID: ${session.runId}
+Tx:
+${submitted.txHash}
+
+Reason:
+${getSafeErrorMessage(confirmationError)}`
+      );
+    }
+  } catch (error) {
+    logSafeError("Mint confirmation failed", error);
+    session.status = "used";
+    updateMintRunForOwner(session.runId, session.ownerTelegramId, {
+      status: "failed",
+      errorReason: getSafeErrorMessage(error)
+    });
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "mint_failed",
+      walletLabel: session.walletLabel,
+      walletAddress: session.walletAddress,
+      targetId: session.targetId,
+      runId: session.runId,
+      chain: session.chain,
+      contractAddress: session.contractAddress,
+      functionSignature: session.functionSignature,
+      quantity: session.quantity,
+      priceEth: session.priceEth,
+      status: "failed",
+      reason: getSafeErrorMessage(error)
+    });
+    await ctx.reply(`❌ Mint failed.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^mint:cancel:([0-9a-f-]+)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const sessionId = ctx.match[1];
+
+  if (!sessionId) {
+    await ctx.reply(MINT_CONFIRMATION_EXPIRED_MESSAGE);
+    return;
+  }
+
+  const validated = await validateMintConfirmationSession(ctx, sessionId);
+
+  if (!validated) {
+    return;
+  }
+
+  const { session, actorTelegramId } = validated;
+  session.status = "cancelled";
+  updateMintRunForOwner(session.runId, session.ownerTelegramId, {
+    status: "cancelled",
+    errorReason: "cancelled_by_user"
+  });
+  await auditMintAction({
+    ownerTelegramId: session.ownerTelegramId,
+    action: "mint_blocked",
+    walletLabel: session.walletLabel,
+    walletAddress: session.walletAddress,
+    targetId: session.targetId,
+    runId: session.runId,
+    chain: session.chain,
+    contractAddress: session.contractAddress,
+    functionSignature: session.functionSignature,
+    quantity: session.quantity,
+    priceEth: session.priceEth,
+    status: "cancelled",
+    reason: `cancelled_by=${actorTelegramId}`
+  });
+
+  await ctx.reply(`Cancelled mint confirmation for run ${session.runId}.`);
+});
+
+bot.command("addminttarget", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const params = parseMintTargetParams(parseCommandParts(ctx.message.text));
+    const target = createMintTarget({
+      ownerTelegramId,
+      ...params
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_target_created",
+      targetId: target.targetId,
+      chain: target.chain,
+      contractAddress: target.contractAddress,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      status: target.status
+    });
+
+    await ctx.reply(`✅ Mint target saved.\n\n${formatMintTarget(target)}`);
+  } catch (error) {
+    logSafeError("Could not add mint target", error);
+    await ctx.reply(`❌ Could not add mint target.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("minttargets", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const targets = listMintTargetsForOwner(ownerTelegramId);
+
+    if (targets.length === 0) {
+      await ctx.reply("No active mint targets found. Add one with /addminttarget.");
+      return;
+    }
+
+    const message = targets
+      .map((target, index) =>
+        [
+          `${index + 1}. ${target.name}`,
+          `Target ID: ${target.targetId}`,
+          `Chain: ${target.chain}`,
+          `Contract: ${formatShortAddress(target.contractAddress)}`,
+          `Function: ${target.functionSignature}`,
+          `Qty: ${target.quantity}`,
+          `Price: ${target.priceEth} ETH`
+        ].join("\n")
+      )
+      .join("\n\n");
+
+    await ctx.reply(`Your mint targets:\n\n${message}`);
+  } catch (error) {
+    logSafeError("Could not list mint targets", error);
+    await ctx.reply(`❌ Could not list mint targets.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("minttarget", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const targetId = parseCommandParts(ctx.message.text)[1]?.trim();
+
+    if (!targetId) {
+      await ctx.reply("Use:\n/minttarget targetId");
+      return;
+    }
+
+    const target = getMintTargetForOwner(targetId, ownerTelegramId, {
+      includeArchived: true
+    });
+
+    await ctx.reply(formatMintTarget(target));
+  } catch (error) {
+    logSafeError("Could not load mint target", error);
+    await ctx.reply(`❌ Could not load mint target.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("updateminttarget", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const parsed = parseMintTargetUpdateParams(parseCommandParts(ctx.message.text));
+    const target = updateMintTargetForOwner(parsed.targetId, ownerTelegramId, {
+      chain: parsed.chain,
+      functionSignature: parsed.functionSignature,
+      quantity: parsed.quantity,
+      priceEth: parsed.priceEth
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_target_updated",
+      targetId: target.targetId,
+      chain: target.chain,
+      contractAddress: target.contractAddress,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      status: target.status
+    });
+
+    await ctx.reply(`✅ Mint target updated.\n\n${formatMintTarget(target)}`);
+  } catch (error) {
+    logSafeError("Could not update mint target", error);
+    await ctx.reply(`❌ Could not update mint target.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("deleteminttarget", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const targetId = parseCommandParts(ctx.message.text)[1]?.trim();
+
+    if (!targetId) {
+      await ctx.reply("Use:\n/deleteminttarget targetId");
+      return;
+    }
+
+    const target = getMintTargetForOwner(targetId, ownerTelegramId, {
+      includeArchived: true
+    });
+
+    if (target.status === "archived") {
+      await ctx.reply(`Mint target "${target.name}" is already archived.`);
+      return;
+    }
+
+    const session = createMintTargetDeleteConfirmation({
+      ownerTelegramId,
+      targetId: target.targetId,
+      targetName: target.name
+    });
+
+    await ctx.reply(
+      `Are you sure you want to remove mint target "${target.name}"?
+
+This archives the target locally. It does not interact with the contract.
+
+This confirmation expires in 10 minutes.`,
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            "Confirm Remove",
+            `mt:delete_confirm:${session.sessionId}`
+          )
+        ],
+        [Markup.button.callback("Cancel", `mt:delete_cancel:${session.sessionId}`)]
+      ])
+    );
+  } catch (error) {
+    logSafeError("Could not request mint target deletion", error);
+    await ctx.reply(`❌ Could not request mint target removal.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^mt:delete_confirm:([0-9a-f-]+)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const sessionId = ctx.match[1];
+
+  if (!sessionId) {
+    await ctx.reply("This mint target removal confirmation has expired. Run /deleteminttarget again.");
+    return;
+  }
+
+  const validated = await validateMintTargetDeleteConfirmation(ctx, sessionId);
+
+  if (!validated) {
+    return;
+  }
+
+  const { session } = validated;
+
+  try {
+    const target = archiveMintTargetForOwner(
+      session.targetId,
+      session.ownerTelegramId
+    );
+    session.status = "used";
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "mint_target_archived",
+      targetId: target.targetId,
+      chain: target.chain,
+      contractAddress: target.contractAddress,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      status: target.status
+    });
+    await ctx.reply(`✅ Mint target archived.\n\n${formatMintTarget(target)}`);
+  } catch (error) {
+    logSafeError("Could not archive mint target", error);
+    await ctx.reply(`❌ Could not archive mint target.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^mt:delete_cancel:([0-9a-f-]+)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const sessionId = ctx.match[1];
+
+  if (!sessionId) {
+    await ctx.reply("This mint target removal confirmation has expired. Run /deleteminttarget again.");
+    return;
+  }
+
+  const validated = await validateMintTargetDeleteConfirmation(ctx, sessionId);
+
+  if (!validated) {
+    return;
+  }
+
+  validated.session.status = "cancelled";
+  await ctx.reply(`Cancelled removal for mint target "${validated.session.targetName}".`);
+});
+
+bot.command("minttargetpreview", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const parts = parseCommandParts(ctx.message.text);
+    const targetId = parts[1]?.trim();
+    const walletLabel = parts[2]?.trim();
+
+    if (!targetId || !walletLabel) {
+      await ctx.reply("Use:\n/minttargetpreview targetId wallet1");
+      return;
+    }
+
+    const target = getMintTargetForOwner(targetId, ownerTelegramId);
+    const preview = await previewMint({
+      ownerTelegramId,
+      walletLabel,
+      contractAddress: target.contractAddress,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      chain: target.chain
+    });
+    const run = createRunFromPreview(
+      ownerTelegramId,
+      preview,
+      "previewed",
+      target.targetId
+    );
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_previewed",
+      walletLabel: preview.walletLabel,
+      walletAddress: preview.walletAddress,
+      targetId: target.targetId,
+      runId: run.runId,
+      chain: preview.chain,
+      contractAddress: preview.contractAddress,
+      functionSignature: preview.functionSignature,
+      quantity: preview.quantity,
+      priceEth: preview.priceEth,
+      status: run.status,
+      ...(preview.gasEstimateFailed ? { reason: "gas_estimation_failed" } : {})
+    });
+
+    await ctx.reply(
+      formatMintPreviewMessage(preview, {
+        title: `Mint Target Preview: ${target.name}`,
+        targetId: target.targetId,
+        runId: run.runId
+      })
+    );
+  } catch (error) {
+    logSafeError("Mint target preview failed", error);
+    await ctx.reply(`❌ Mint target preview failed.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("minttargetnow", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const parts = parseCommandParts(ctx.message.text);
+    const targetId = parts[1]?.trim();
+    const walletLabel = parts[2]?.trim();
+
+    if (!targetId || !walletLabel) {
+      await ctx.reply("Use:\n/minttargetnow targetId wallet1");
+      return;
+    }
+
+    const target = getMintTargetForOwner(targetId, ownerTelegramId);
+    const preview = await previewMint({
+      ownerTelegramId,
+      walletLabel,
+      contractAddress: target.contractAddress,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      chain: target.chain
+    });
+    const run = createRunFromPreview(
+      ownerTelegramId,
+      preview,
+      "pending",
+      target.targetId
+    );
+    const session = createMintConfirmationSession({
+      ownerTelegramId,
+      walletLabel: preview.walletLabel,
+      walletAddress: preview.walletAddress,
+      chain: preview.chain,
+      contractAddress: preview.contractAddress,
+      functionSignature: preview.functionSignature,
+      quantity: preview.quantity,
+      priceEth: preview.priceEth,
+      runId: run.runId,
+      targetId: target.targetId
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_confirmation_created",
+      walletLabel: preview.walletLabel,
+      walletAddress: preview.walletAddress,
+      targetId: target.targetId,
+      runId: run.runId,
+      chain: preview.chain,
+      contractAddress: preview.contractAddress,
+      functionSignature: preview.functionSignature,
+      quantity: preview.quantity,
+      priceEth: preview.priceEth,
+      status: session.status
+    });
+
+    await ctx.reply(
+      `${formatMintPreviewMessage(preview, {
+        title: `Final Mint Target Confirmation: ${target.name}`,
+        targetId: target.targetId,
+        runId: run.runId
+      })}
+
+This confirmation expires in 10 minutes.
+
+No transaction will be sent until you press Confirm Mint.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Confirm Mint", `mint:confirm:${session.sessionId}`)],
+        [Markup.button.callback("Cancel", `mint:cancel:${session.sessionId}`)]
+      ])
+    );
+  } catch (error) {
+    logSafeError("Could not create mint target confirmation", error);
+    await ctx.reply(`❌ Could not create mint target confirmation.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("minthistory", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const limitRaw = parseCommandParts(ctx.message.text)[1]?.trim();
+    const limit = limitRaw ? Number(limitRaw) : 10;
+    const runs = listMintRunsForOwner(
+      ownerTelegramId,
+      Number.isFinite(limit) ? limit : 10
+    );
+
+    if (runs.length === 0) {
+      await ctx.reply("No mint history found yet.");
+      return;
+    }
+
+    await ctx.reply(
+      `Recent mint runs:\n\n${runs
+        .map((run) =>
+          [
+            `Run ID: ${run.runId}`,
+            `Status: ${run.status}`,
+            `Wallet: ${run.walletLabel}`,
+            `Chain: ${run.chain}`,
+            `Contract: ${formatShortAddress(run.contractAddress)}`,
+            `Function: ${run.functionSignature}`,
+            ...(run.txHash ? [`Tx: ${run.txHash}`] : [])
+          ].join("\n")
+        )
+        .join("\n\n")}`
+    );
+  } catch (error) {
+    logSafeError("Could not load mint history", error);
+    await ctx.reply(`❌ Could not load mint history.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("mintstatus", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const runId = parseCommandParts(ctx.message.text)[1]?.trim();
+
+    if (!runId) {
+      await ctx.reply("Use:\n/mintstatus runId");
+      return;
+    }
+
+    const run = getMintRunForOwner(runId, ownerTelegramId);
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_run_viewed",
+      walletLabel: run.walletLabel,
+      walletAddress: run.walletAddress,
+      targetId: run.targetId,
+      runId: run.runId,
+      chain: run.chain,
+      contractAddress: run.contractAddress,
+      functionSignature: run.functionSignature,
+      quantity: run.quantity,
+      priceEth: run.priceEth,
+      txHash: run.txHash,
+      status: run.status
+    });
+
+    await ctx.reply(formatMintRun(run));
+  } catch (error) {
+    logSafeError("Could not load mint run", error);
+    await ctx.reply(`❌ Could not load mint run.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
 });
 
 for (const command of ["addwallet", "importwallet", "import_wallet"]) {
