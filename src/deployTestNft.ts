@@ -126,13 +126,20 @@ function compileContract() {
   };
 }
 
+function getSepoliaRpcUrl(): string {
+  const rpcUrl = process.env.SEPOLIA_RPC_URL || process.env.ETH_SEPOLIA_RPC_URL;
+
+  if (!rpcUrl) {
+    throw new Error("Missing SEPOLIA_RPC_URL or ETH_SEPOLIA_RPC_URL");
+  }
+
+  return rpcUrl;
+}
+
 async function main() {
   const walletLabel = process.argv[2] || "wallet1";
 
-  const rpcUrl = process.env.RPC_URL_SEPOLIA;
-  const provider = rpcUrl
-    ? new ethers.JsonRpcProvider(rpcUrl)
-    : ethers.getDefaultProvider("sepolia");
+  const provider = new ethers.JsonRpcProvider(getSepoliaRpcUrl());
 
   const wallet = await getWalletSignerByLabel(
     walletLabel,
