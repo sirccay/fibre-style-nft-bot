@@ -59,6 +59,13 @@ type MintActionParams = {
   chain: MintChain;
 };
 
+type BuiltMintTransaction = {
+  to: string;
+  data: string;
+  value: bigint;
+  totalCostEth: string;
+};
+
 const SUPPORTED_SIGNATURES: SupportedMintFunctionSignature[] = [
   "mint(uint256)",
   "publicMint(uint256)",
@@ -157,7 +164,59 @@ export function getMintProvider(chain: MintChain) {
   return new ethers.JsonRpcProvider(rpcUrl);
 }
 
-export function buildMintTransaction(params: BuildMintTransactionParams) {
+function redactMintErrorText(text: string): string {
+  const sensitiveEnvNames = [
+    "AZURE_CLIENT_SECRET",
+    "TELEGRAM_BOT_TOKEN",
+    "SEPOLIA_RPC_URL",
+    "ETH_SEPOLIA_RPC_URL",
+    "ETH_MAINNET_RPC_URL",
+    "OPENSEA_API_KEY",
+    "VAULT_SECRET"
+  ];
+
+  let redacted = text;
+
+  for (const name of sensitiveEnvNames) {
+    const value = process.env[name];
+
+    if (value && value.length >= 8) {
+      redacted = redacted.split(value).join("[REDACTED]");
+    }
+  }
+
+  return redacted
+    .replace(/0x[a-fA-F0-9]{64}/g, "[REDACTED_HEX_SECRET]")
+    .replace(
+      /([?&](?:api[_-]?key|key|token|secret)=)[^&\s]+/gi,
+      "$1[REDACTED]"
+    )
+    .slice(0, 300);
+}
+
+export function getMintSafeErrorReason(error: unknown): string {
+  const anyError = error as any;
+  const candidates = [
+    anyError?.shortMessage,
+    anyError?.reason,
+    anyError?.revert?.args?.[0],
+    anyError?.info?.error?.message,
+    anyError?.error?.message,
+    anyError?.message
+  ];
+
+  const reason = candidates.find(
+    (candidate) => typeof candidate === "string" && candidate.trim()
+  );
+
+  return redactMintErrorText(
+    (reason || "Unknown mint error").split("\n")[0] || "Unknown mint error"
+  );
+}
+
+export function buildMintTransaction(
+  params: BuildMintTransactionParams
+): BuiltMintTransaction {
   if (!ethers.isAddress(params.contractAddress)) {
     throw new Error("Invalid contract address.");
   }
@@ -180,12 +239,34 @@ export function buildMintTransaction(params: BuildMintTransactionParams) {
   };
 }
 
+export async function estimateMintGas(
+  signer: ethers.Signer,
+  tx: BuiltMintTransaction
+) {
+  return signer.estimateGas({
+    to: tx.to,
+    data: tx.data,
+    value: tx.value
+  });
+}
+
 export async function previewMint(params: MintActionParams): Promise<MintPreviewResult> {
-  const wallet = await getWalletSummaryByLabelForOwner(
+  const provider = getMintProvider(params.chain);
+  const walletSummary = await getWalletSummaryByLabelForOwner(
     params.walletLabel,
     params.ownerTelegramId
   );
-  const provider = getMintProvider(params.chain);
+  const wallet = await getWalletSignerByLabelForOwner(
+    params.walletLabel,
+    params.ownerTelegramId,
+    provider,
+    "mainmintpreview"
+  );
+
+  if (wallet.address.toLowerCase() !== walletSummary.address.toLowerCase()) {
+    throw new Error("Wallet signer no longer matches the saved wallet.");
+  }
+
   const tx = buildMintTransaction({
     contractAddress: params.contractAddress,
     functionSignature: params.functionSignature,
@@ -198,19 +279,14 @@ export async function previewMint(params: MintActionParams): Promise<MintPreview
   let gasEstimateError: string | undefined;
 
   try {
-    const estimated = await provider.estimateGas({
-      from: wallet.address,
-      to: tx.to,
-      data: tx.data,
-      value: tx.value
-    });
+    const estimated = await estimateMintGas(wallet, tx);
     gasEstimate = estimated.toString();
   } catch (error) {
-    gasEstimateError = error instanceof Error ? error.message : "Unknown gas estimation error";
+    gasEstimateError = getMintSafeErrorReason(error);
   }
 
   return {
-    walletLabel: wallet.label,
+    walletLabel: walletSummary.label,
     walletAddress: wallet.address,
     chain: params.chain,
     contractAddress: tx.to,
@@ -247,12 +323,7 @@ export async function submitMintTransaction(
     walletAddress: wallet.address
   });
 
-  const gasEstimate = await provider.estimateGas({
-    from: wallet.address,
-    to: tx.to,
-    data: tx.data,
-    value: tx.value
-  });
+  const gasEstimate = await estimateMintGas(wallet, tx);
 
   const response = await wallet.sendTransaction({
     to: tx.to,

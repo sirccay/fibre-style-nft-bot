@@ -237,6 +237,12 @@ Core stack:
 
 - The mint engine uses `ETH_MAINNET_RPC_URL` for mainnet and `SEPOLIA_RPC_URL` or `ETH_SEPOLIA_RPC_URL` for Sepolia. It never uses `ethers.getDefaultProvider`.
 
+- Regression check for generic mint gas estimation:
+
+  `/mainmintpreview wallet1 0x73Ca24ad5D2Db0f1C5d0457895B06F429468cA92 mint(uint256) 1 0.01 sepolia`
+
+  Expected: estimated gas should appear if the wallet is eligible and the contract accepts the selected mint function. If the selected function is wrong for that contract, the preview should show a redacted failure reason instead of a raw transaction object.
+
 - Allowlist, Merkle proof, signature minting, and arbitrary ABI support are intentionally not implemented yet.
 
 - Mint audit events include `mint_previewed`, `mint_confirmation_created`, `mint_blocked`, `mint_submitted`, `mint_confirmed`, `mint_failed`, `mint_target_created`, `mint_target_updated`, `mint_target_archived`, and `mint_run_viewed`.
