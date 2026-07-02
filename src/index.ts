@@ -52,6 +52,7 @@ const BALANCE_NETWORK_LABELS: Record<SupportedBalanceNetwork, string> = {
   sepolia: "Sepolia",
   mainnet: "Mainnet"
 };
+const COMMAND_MENU_REGISTRATION_TIMEOUT_MS = 10_000;
 
 function getSepoliaRpcUrl(): string {
   const rpcUrl = process.env.SEPOLIA_RPC_URL || process.env.ETH_SEPOLIA_RPC_URL;
@@ -152,6 +153,26 @@ function logSafeError(context: string, error: unknown) {
   console.error(`${context}: ${getSafeErrorMessage(error)}`);
 }
 
+function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string
+): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(timeoutMessage));
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  });
+}
+
 function formatShortAddress(address: string): string {
   if (address.length <= 12) {
     return address;
@@ -240,7 +261,11 @@ async function auditWalletManagementAction(details: {
 
 async function registerTelegramCommandMenu() {
   try {
-    await bot.telegram.setMyCommands(BOT_COMMANDS);
+    await withTimeout(
+      bot.telegram.setMyCommands(BOT_COMMANDS),
+      COMMAND_MENU_REGISTRATION_TIMEOUT_MS,
+      "Telegram command menu registration timed out after 10 seconds."
+    );
 
     try {
       await auditWalletManagementAction({
@@ -251,7 +276,7 @@ async function registerTelegramCommandMenu() {
       logSafeError("Command menu audit failed", auditError);
     }
   } catch (error) {
-    logSafeError("Could not register Telegram command menu", error);
+    logSafeError("Could not register Telegram command menu; continuing startup", error);
   }
 }
 
