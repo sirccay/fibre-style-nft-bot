@@ -74,6 +74,7 @@ type CreateMintTargetParams = {
 };
 
 type UpdateMintTargetParams = {
+  contractAddress?: string;
   chain: MintChain;
   functionSignature: SupportedMintFunctionSignature;
   quantity: number;
@@ -492,6 +493,10 @@ export function updateMintTargetForOwner(
 
   if (target.status === "archived") {
     throw new Error("Mint target is archived and cannot be updated.");
+  }
+
+  if (updates.contractAddress !== undefined) {
+    target.contractAddress = updates.contractAddress;
   }
 
   target.chain = updates.chain;

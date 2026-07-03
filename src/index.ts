@@ -57,6 +57,7 @@ import type { MintRun, MintRunStatus } from "./mintRuns.js";
 import {
   detectMint,
   detectMintFunctions,
+  resolveOpenSeaContracts,
   toSupportedMintChain
 } from "./mintDetector.js";
 import { getConfiguredDetectorRpcStatus } from "./mintDetectorV2.js";
@@ -64,6 +65,7 @@ import type {
   DetectedChainName,
   MintDetectionResult,
   MintFunctionCandidate,
+  OpenSeaContractResolutionResult,
   OpenSeaMintMetadata
 } from "./mintDetector.js";
 import { detectMintPhase } from "./mintPhaseDetector.js";
@@ -108,6 +110,7 @@ const BOT_COMMANDS = [
   { command: "mintingstatus", description: "Show minting lock status" },
   { command: "parsemintlink", description: "Parse mint link" },
   { command: "addmintfromlink", description: "Create mint target from link" },
+  { command: "resolvecontract", description: "Resolve OpenSea contract" },
   { command: "detectmintfunction", description: "Detect mint functions" },
   { command: "detecttargetfunction", description: "Detect target functions" },
   { command: "checkmintphase", description: "Check mint phase" },
@@ -346,6 +349,7 @@ Minting:
 /mintingstatus
 /parsemintlink https://opensea.io/collection/collectionSlug
 /addmintfromlink https://opensea.io/collection/collectionSlug mintName
+/resolvecontract collectionSlug
 /detectmintfunction 0xCONTRACT mainnet
 /detecttargetfunction targetId
 /checkmintphase targetId
@@ -353,6 +357,8 @@ Minting:
 /checkmintreadiness targetId wallet1
 /refreshtarget targetId
 /parserstatus
+
+You can also paste an OpenSea/Zora/explorer mint link directly in private chat.
 
 Testing:
 /minttest wallet1 1`;
@@ -716,16 +722,32 @@ function parseMintTargetParams(parts: string[]) {
 function parseMintTargetUpdateParams(parts: string[]) {
   if (parts.length < 5) {
     throw new Error(
-      "Invalid format. Use: /updateminttarget targetId mint(uint256) 1 0.03 mainnet"
+      "Invalid format. Use: /updateminttarget targetId mint(uint256) 1 0.03 mainnet or /updateminttarget targetId 0xCONTRACT mint(uint256) 1 0.03 mainnet"
+    );
+  }
+
+  let cursor = 2;
+  let contractAddress: string | undefined;
+  const possibleContract = parts[cursor]?.trim();
+
+  if (possibleContract && ethers.isAddress(possibleContract)) {
+    contractAddress = ethers.getAddress(possibleContract);
+    cursor += 1;
+  }
+
+  if (parts.length < cursor + 3) {
+    throw new Error(
+      "Invalid format. Use: /updateminttarget targetId mint(uint256) 1 0.03 mainnet or /updateminttarget targetId 0xCONTRACT mint(uint256) 1 0.03 mainnet"
     );
   }
 
   return {
     targetId: getCommandPart(parts, 1),
-    functionSignature: normalizeMintFunctionSignature(getCommandPart(parts, 2)),
-    quantity: validateMintQuantity(getCommandPart(parts, 3)),
-    priceEth: validateMintPriceEth(getCommandPart(parts, 4)),
-    chain: normalizeMintChain(parts[5])
+    ...(contractAddress ? { contractAddress } : {}),
+    functionSignature: normalizeMintFunctionSignature(getCommandPart(parts, cursor)),
+    quantity: validateMintQuantity(getCommandPart(parts, cursor + 1)),
+    priceEth: validateMintPriceEth(getCommandPart(parts, cursor + 2)),
+    chain: normalizeMintChain(parts[cursor + 3])
   };
 }
 
@@ -993,7 +1015,7 @@ function formatMintTarget(target: MintTarget) {
       ? [`Missing: ${missing.join(", ") || "Unknown"}`]
       : []),
     `Chain: ${target.chain}`,
-    `Contract: ${formatShortAddress(target.contractAddress)}`,
+    `Contract: ${target.contractAddress ? formatShortAddress(target.contractAddress) : "Unknown"}`,
     `Function: ${target.functionSignature || "Unknown"}`,
     `Qty: ${target.quantity}`,
     `Price: ${target.priceEth === undefined ? "Unknown" : `${target.priceEth} ETH`}`,
@@ -1391,6 +1413,146 @@ function formatMintDetectionResult(detection: MintDetectionResult) {
     "Next:",
     "Use /addmintfromlink URL to save this as a draft target."
   ].join("\n");
+}
+
+function formatOpenSeaContractResolution(result: OpenSeaContractResolutionResult) {
+  const reliable = result.candidates.filter(
+    (candidate) => candidate.confidence === "high" || candidate.confidence === "medium"
+  );
+
+  return [
+    "OpenSea Contract Resolver",
+    "",
+    ...(result.collectionName ? [`Collection: ${result.collectionName}`] : []),
+    ...(result.slug ? [`Slug: ${result.slug}`] : []),
+    "",
+    result.candidates.length === 0
+      ? "Contract could not be safely detected."
+      : reliable.length === 1 && result.candidates.length === 1
+        ? `Resolved Contract:\n${result.candidates[0]!.address}`
+        : "Contract Candidates:",
+    ...(result.candidates.length > 0
+      ? result.candidates.map((candidate) =>
+          [
+            `- ${candidate.address}`,
+            `  Confidence: ${candidate.confidence}`,
+            `  Source: ${candidate.source}`,
+            ...(candidate.chainName ? [`  Chain: ${candidate.chainName}`] : []),
+            ...(candidate.tokenStandard ? [`  Token Standard: ${candidate.tokenStandard}`] : []),
+            ...(candidate.evidence ? [`  Evidence: ${candidate.evidence}`] : [])
+          ].join("\n")
+        )
+      : []),
+    ...(result.warnings.length > 0
+      ? ["", "Warnings:", ...result.warnings.map((warning) => `- ${warning}`)]
+      : [])
+  ].join("\n");
+}
+
+function detectionHasMintMetadata(detection: MintDetectionResult) {
+  const openSeaMint = detection.mint.openSeaMint;
+
+  return Boolean(
+    openSeaMint?.mintStatusText ||
+      openSeaMint?.mintSchedule.length ||
+      openSeaMint?.mintedCount !== undefined ||
+      openSeaMint?.maxSupply !== undefined ||
+      openSeaMint?.currentStageName ||
+      openSeaMint?.currentStagePriceText ||
+      detection.mint.priceEth ||
+      detection.mint.phaseStatus !== "unknown"
+  );
+}
+
+async function replyWithMintDetection(
+  ctx: Context,
+  input: string,
+  reasonPrefix?: string
+) {
+  const detection = await detectMint(input);
+
+  await auditMintAction({
+    ownerTelegramId: getTelegramUserId(ctx),
+    action: "mint_link_parsed",
+    contractAddress: detection.contract.address,
+    chain: detection.chain.name,
+    collectionSlug: detection.contract.collectionSlug,
+    candidateFunctions: getFoundFunctionCandidates(detection.mint.candidateFunctions).map(
+      (candidate) => candidate.signature
+    ),
+    phaseStatus: detection.mint.phaseStatus,
+    phaseTypeEstimate: detection.mint.phaseTypeEstimate,
+    phaseTypeConfidence: detection.mint.phaseTypeConfidence,
+    reason: reasonPrefix || detection.warnings[0]
+  });
+
+  await ctx.reply(formatMintDetectionResult(detection));
+  return detection;
+}
+
+const PRIVATE_KEY_SHAPED_PATTERN = /0x[a-fA-F0-9]{64}/;
+const EXACT_EVM_ADDRESS_PATTERN = /^0x[a-fA-F0-9]{40}$/;
+const URL_PATTERN = /https?:\/\/[^\s<>()]+/gi;
+const EXPLORER_HOSTS = new Set([
+  "etherscan.io",
+  "www.etherscan.io",
+  "sepolia.etherscan.io",
+  "basescan.org",
+  "www.basescan.org",
+  "arbiscan.io",
+  "www.arbiscan.io",
+  "polygonscan.com",
+  "www.polygonscan.com"
+]);
+
+function getDirectMintLinkInput(text: string): string | null {
+  const trimmed = text.trim();
+
+  if (!trimmed || trimmed.startsWith("/") || PRIVATE_KEY_SHAPED_PATTERN.test(trimmed)) {
+    return null;
+  }
+
+  if (EXACT_EVM_ADDRESS_PATTERN.test(trimmed)) {
+    return ethers.getAddress(trimmed);
+  }
+
+  const matches = [...trimmed.matchAll(URL_PATTERN)];
+
+  for (const match of matches) {
+    const rawUrl = match[0]?.replace(/[.,;!?)\]]+$/g, "");
+
+    if (!rawUrl) {
+      continue;
+    }
+
+    try {
+      const url = new URL(rawUrl);
+      const host = url.hostname.toLowerCase();
+      const parts = url.pathname
+        .split("/")
+        .map((part) => part.trim())
+        .filter(Boolean);
+
+      if (
+        host.endsWith("opensea.io") &&
+        (parts.includes("collection") || parts.includes("assets"))
+      ) {
+        return url.toString();
+      }
+
+      if (host.endsWith("zora.co") && parts.includes("collect")) {
+        return url.toString();
+      }
+
+      if (EXPLORER_HOSTS.has(host) && parts[0] === "address" && parts[1]) {
+        return url.toString();
+      }
+    } catch {
+      // Ignore malformed URLs in regular chat text.
+    }
+  }
+
+  return null;
 }
 
 function formatPhaseDetectionResult(phase: MintPhaseDetectionResult) {
@@ -2783,6 +2945,7 @@ RESERVOIR_API_KEY configured: ${getConfiguredStatus(process.env.RESERVOIR_API_KE
 ETHERSCAN_API_KEY configured: ${getConfiguredStatus(process.env.ETHERSCAN_API_KEY)}
 ETH_MAINNET_RPC_URL configured: ${rpcStatus.mainnetRpcConfigured ? "yes" : "no"}
 SEPOLIA_RPC_URL or ETH_SEPOLIA_RPC_URL configured: ${rpcStatus.sepoliaRpcConfigured ? "yes" : "no"}
+Direct link auto-parser: enabled
 OpenSea page metadata fallback: enabled
 Reservoir mint-stage lookup: ${getConfiguredStatus(process.env.RESERVOIR_API_KEY) === "yes" ? "enabled" : "disabled"}
 Etherscan V2 ABI fallback: ${getConfiguredStatus(process.env.ETHERSCAN_API_KEY) === "yes" ? "enabled" : "disabled"}
@@ -2826,27 +2989,29 @@ bot.command("parsemintlink", async (ctx) => {
   }
 
   try {
-    const detection = await detectMint(input);
-
-    await auditMintAction({
-      ownerTelegramId: getTelegramUserId(ctx),
-      action: "mint_link_parsed",
-      contractAddress: detection.contract.address,
-      chain: detection.chain.name,
-      collectionSlug: detection.contract.collectionSlug,
-      candidateFunctions: getFoundFunctionCandidates(detection.mint.candidateFunctions).map(
-        (candidate) => candidate.signature
-      ),
-      phaseStatus: detection.mint.phaseStatus,
-      phaseTypeEstimate: detection.mint.phaseTypeEstimate,
-      phaseTypeConfidence: detection.mint.phaseTypeConfidence,
-      reason: detection.warnings[0]
-    });
-
-    await ctx.reply(formatMintDetectionResult(detection));
+    await replyWithMintDetection(ctx, input);
   } catch (error) {
     logSafeError("Could not parse mint link", error);
     await ctx.reply(`❌ Could not parse mint link.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("resolvecontract", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const input = getCommandRemainder(ctx.message.text);
+
+  if (!input) {
+    await ctx.reply("Use:\n/resolvecontract collectionSlug_or_OpenSea_URL");
+    return;
+  }
+
+  try {
+    const result = await resolveOpenSeaContracts(input);
+    await ctx.reply(formatOpenSeaContractResolution(result));
+  } catch (error) {
+    logSafeError("Could not resolve OpenSea contract", error);
+    await ctx.reply(`❌ Could not resolve contract.\n\nReason:\n${getSafeErrorMessage(error)}`);
   }
 });
 
@@ -2865,8 +3030,9 @@ bot.command("addmintfromlink", async (ctx) => {
   try {
     const ownerTelegramId = getRequiredTelegramUserId(ctx);
     const detection = await detectMint(input);
+    const hasMintMetadata = detectionHasMintMetadata(detection);
 
-    if (!detection.contract.address) {
+    if (!detection.contract.address && !hasMintMetadata) {
       await auditMintAction({
         ownerTelegramId,
         action: "mint_target_created_from_link",
@@ -2882,12 +3048,14 @@ bot.command("addmintfromlink", async (ctx) => {
     }
 
     const detectedChain = getDetectedChainForTarget(detection.chain.name);
-    const foundCandidates = getFoundFunctionCandidates(detection.mint.candidateFunctions);
+    const foundCandidates = detection.contract.address
+      ? getFoundFunctionCandidates(detection.mint.candidateFunctions)
+      : [];
     const target = createMintTarget({
       ownerTelegramId,
       name: generateMintTargetName(ownerTelegramId, detection, providedName),
       chain: detectedChain.chain,
-      contractAddress: detection.contract.address,
+      contractAddress: detection.contract.address || "",
       ...(foundCandidates.length === 1
         ? { functionSignature: foundCandidates[0]!.signature }
         : {}),
@@ -2904,7 +3072,7 @@ bot.command("addmintfromlink", async (ctx) => {
       ownerTelegramId,
       action: "mint_target_created_from_link",
       targetId: target.targetId,
-      contractAddress: target.contractAddress,
+      ...(target.contractAddress ? { contractAddress: target.contractAddress } : {}),
       chain: target.chain,
       collectionSlug: target.collectionSlug,
       candidateFunctions: foundCandidates.map((candidate) => candidate.signature),
@@ -2912,8 +3080,14 @@ bot.command("addmintfromlink", async (ctx) => {
       phaseTypeEstimate: detection.mint.phaseTypeEstimate,
       phaseTypeConfidence: detection.mint.phaseTypeConfidence,
       status: target.targetCompleteness,
-      reason: detectedChain.warning
+      reason: detection.contract.address
+        ? detectedChain.warning
+        : "contract_not_detected_saved_incomplete"
     });
+
+    const contractMissingMessage = !detection.contract.address
+      ? "\n\nI saved this as an incomplete target. Add contract/function later with /updateminttarget or create manually with /addminttarget."
+      : "";
 
     await ctx.reply(
       `✅ Mint target draft saved.
@@ -2922,7 +3096,9 @@ ${formatMintTarget(target)}
 
 ${detectedChain.warning ? `Warning: ${detectedChain.warning}\n\n` : ""}${
         target.targetCompleteness === "incomplete"
-          ? `Complete it with:\n/updateminttarget ${target.targetId} publicMint(uint256) 1 0.03 ${target.chain}`
+          ? detection.contract.address
+            ? `Complete it with:\n/updateminttarget ${target.targetId} publicMint(uint256) 1 0.03 ${target.chain}`
+            : `Complete it with:\n/updateminttarget ${target.targetId} 0xCONTRACT publicMint(uint256) 1 0.03 ${target.chain}${contractMissingMessage}`
           : "Target appears complete, but preview before minting."
       }`
     );
@@ -3002,6 +3178,14 @@ bot.command("detecttargetfunction", async (ctx) => {
   try {
     const ownerTelegramId = getRequiredTelegramUserId(ctx);
     const target = getMintTargetForOwner(targetId, ownerTelegramId);
+
+    if (!target.contractAddress || !ethers.isAddress(target.contractAddress)) {
+      await ctx.reply(
+        "This mint target is missing contractAddress. Add it with:\n/updateminttarget targetId 0xCONTRACT publicMint(uint256) 1 PRICE_ETH mainnet"
+      );
+      return;
+    }
+
     const result = await detectMintFunctions({
       contractAddress: target.contractAddress,
       chain: target.chain
@@ -3024,7 +3208,7 @@ bot.command("detecttargetfunction", async (ctx) => {
 Target: ${target.name}
 Target ID: ${target.targetId}
 Chain: ${target.chain}
-Contract: ${formatShortAddress(target.contractAddress)}
+Contract: ${target.contractAddress ? formatShortAddress(target.contractAddress) : "Unknown"}
 
 Candidate functions:
 ${formatFunctionCandidates(result.candidateFunctions)}
@@ -3054,6 +3238,48 @@ bot.command("checkmintphase", async (ctx) => {
   try {
     const ownerTelegramId = getRequiredTelegramUserId(ctx);
     const target = getMintTargetForOwner(targetId, ownerTelegramId);
+
+    if (!target.contractAddress || !ethers.isAddress(target.contractAddress)) {
+      const openSeaMint = target.detectedMetadata?.openSeaMint;
+      const openSeaCurrentStage = getOpenSeaMintCurrentStage(openSeaMint);
+
+      await auditMintAction({
+        ownerTelegramId,
+        action: "mint_phase_checked",
+        targetId: target.targetId,
+        chain: target.chain,
+        collectionSlug: target.collectionSlug,
+        phaseStatus: openSeaCurrentStage?.status || target.detectedMetadata?.phaseStatus || "unknown",
+        phaseTypeEstimate:
+          openSeaCurrentStage?.phaseTypeEstimate ||
+          target.detectedMetadata?.phaseTypeEstimate ||
+          "unknown",
+        phaseTypeConfidence:
+          openSeaCurrentStage?.phaseTypeConfidence ||
+          target.detectedMetadata?.phaseTypeConfidence ||
+          "unknown",
+        reason: "contractAddress_missing"
+      });
+
+      await ctx.reply(
+        [
+          "Mint Phase Check",
+          "",
+          ...(openSeaMint
+            ? [
+                "Stored OpenSea Mint Schedule",
+                "",
+                ...formatOpenSeaMintMetadata(openSeaMint),
+                ""
+              ]
+            : []),
+          "On-chain phase probe skipped because contractAddress is missing.",
+          "Add the contract with /updateminttarget or create manually with /addminttarget."
+        ].join("\n")
+      );
+      return;
+    }
+
     const phase = await detectMintPhase({
       contractAddress: target.contractAddress,
       chain: target.chain,
@@ -3180,6 +3406,9 @@ bot.command("checkmintreadiness", async (ctx) => {
     const ownerTelegramId = getRequiredTelegramUserId(ctx);
     const target = getMintTargetForOwner(targetId, ownerTelegramId);
     const targetMissing = getMintTargetMissingFields(target);
+    const hasContractAddress = Boolean(
+      target.contractAddress && ethers.isAddress(target.contractAddress)
+    );
     const openSeaMint = target.detectedMetadata?.openSeaMint;
     const openSeaCurrentStage = getOpenSeaMintCurrentStage(openSeaMint);
     const openSeaPhaseStatus =
@@ -3201,18 +3430,22 @@ bot.command("checkmintreadiness", async (ctx) => {
       openSeaPhaseStatus === "ended" ||
       openSeaPhaseStatus === "paused";
     const wallet = await getWalletSummaryByLabelForOwner(walletLabel, ownerTelegramId);
-    const contractExists = await getContractExists(target.chain, target.contractAddress);
+    const contractExists = hasContractAddress
+      ? await getContractExists(target.chain, target.contractAddress)
+      : false;
     const functionSupported = Boolean(target.functionSignature);
-    const phase = await detectMintPhase({
-      contractAddress: target.contractAddress,
-      chain: target.chain,
-      evidenceTexts: [
-        target.name,
-        target.collectionSlug || "",
-        target.sourceUrl || "",
-        target.notes || ""
-      ]
-    });
+    const phase = hasContractAddress
+      ? await detectMintPhase({
+          contractAddress: target.contractAddress,
+          chain: target.chain,
+          evidenceTexts: [
+            target.name,
+            target.collectionSlug || "",
+            target.sourceUrl || "",
+            target.notes || ""
+          ]
+        })
+      : null;
     let balanceEnough: boolean | null = null;
     let gasEstimate: string | null = null;
     let gasError: string | undefined;
@@ -3240,18 +3473,29 @@ bot.command("checkmintreadiness", async (ctx) => {
 
     const mainnetLockAllows =
       target.chain !== "mainnet" || isMainnetMintingEnabled();
+    const phaseStatusForDisplay = phase?.phaseStatus || openSeaPhaseStatus;
+    const phaseTypeForDisplay =
+      phase?.phaseTypeEstimate ||
+      openSeaCurrentStage?.phaseTypeEstimate ||
+      target.detectedMetadata?.phaseTypeEstimate ||
+      "unknown";
+    const phaseTypeConfidenceForDisplay =
+      phase?.phaseTypeConfidence ||
+      openSeaCurrentStage?.phaseTypeConfidence ||
+      target.detectedMetadata?.phaseTypeConfidence ||
+      "unknown";
+    const notReadyReasons = [
+      ...(!hasContractAddress ? ["contractAddress missing"] : []),
+      ...(!functionSupported ? ["functionSignature missing"] : []),
+      ...(target.priceEth === undefined || target.priceEth === "" ? ["priceEth missing"] : []),
+      ...(!contractExists && hasContractAddress ? ["contract not found on selected chain"] : []),
+      ...(balanceEnough === false ? ["wallet balance below mint price"] : []),
+      ...(pagePriceIsNotEth ? ["OpenSea price is not an ETH value"] : []),
+      ...(openSeaPhaseBlocksReadiness ? [`OpenSea phase is ${openSeaPhaseStatus}`] : []),
+      ...(!mainnetLockAllows ? ["mainnet minting lock disabled"] : [])
+    ];
     const finalStatus =
-      targetMissing.length > 0 ||
-      !contractExists ||
-      !functionSupported ||
-      balanceEnough === false ||
-      pagePriceIsNotEth ||
-      openSeaPhaseBlocksReadiness ||
-      !mainnetLockAllows
-        ? "no"
-        : gasEstimate
-          ? "yes"
-          : "unknown";
+      notReadyReasons.length > 0 ? "no" : gasEstimate ? "yes" : "unknown";
 
     await auditMintAction({
       ownerTelegramId,
@@ -3259,29 +3503,31 @@ bot.command("checkmintreadiness", async (ctx) => {
       targetId: target.targetId,
       walletLabel: wallet.label,
       walletAddress: wallet.address,
-      contractAddress: target.contractAddress,
+      ...(hasContractAddress ? { contractAddress: target.contractAddress } : {}),
       chain: target.chain,
-      functionSignature: target.functionSignature,
+      ...(target.functionSignature ? { functionSignature: target.functionSignature } : {}),
       quantity: target.quantity,
       priceEth: target.priceEth,
-      phaseStatus: phase.phaseStatus,
-      phaseTypeEstimate: phase.phaseTypeEstimate,
-      phaseTypeConfidence: phase.phaseTypeConfidence,
+      phaseStatus: phaseStatusForDisplay,
+      phaseTypeEstimate: phaseTypeForDisplay,
+      phaseTypeConfidence: phaseTypeConfidenceForDisplay,
       status: finalStatus,
-      reason: gasError
+      reason: gasError || notReadyReasons[0]
     });
 
     await ctx.reply(
       `Ready Check
 
 Target complete: ${targetMissing.length === 0 ? "yes" : "no"}
-Contract exists: ${contractExists ? "yes" : "no"}
+Contract exists: ${
+        hasContractAddress ? (contractExists ? "yes" : "no") : "no - contractAddress missing"
+      }
 Supported function: ${functionSupported ? "yes" : "no"}
 Wallet active: yes
 Balance enough for mint price: ${balanceEnough === null ? "unknown" : balanceEnough ? "yes" : "no"}
 Gas estimate: ${gasEstimate ? gasEstimate : "no"}
-Phase status: ${phase.phaseStatus}
-Phase type estimate: ${phase.phaseTypeEstimate}
+Phase status: ${phaseStatusForDisplay}
+Phase type estimate: ${phaseTypeForDisplay}
 Detected OpenSea mint status: ${openSeaMint?.mintStatusText || "unknown"}
 Detected current stage: ${openSeaCurrentStage?.stageName || openSeaMint?.currentStageName || "unknown"}
 Detected page price: ${openSeaMint?.currentStagePriceText || "unknown"}
@@ -3290,6 +3536,10 @@ Mainnet minting lock: ${isMainnetMintingEnabled() ? "enabled" : "disabled"}
 Final:
 Ready for manual mint: ${finalStatus}
 ${targetMissing.length > 0 ? `\nMissing: ${targetMissing.join(", ")}` : ""}${
+        notReadyReasons.length > 0
+          ? `\nNot ready reason: ${notReadyReasons.join(", ")}`
+          : ""
+      }${
         pagePriceIsNotEth
           ? `\nDetected page price is not an ETH value. Set priceEth with /updateminttarget before minting.`
           : ""
@@ -3300,8 +3550,12 @@ ${targetMissing.length > 0 ? `\nMissing: ${targetMissing.join(", ")}` : ""}${
       }${
         gasError ? `\nGas reason: ${gasError}` : ""
       }${
-        phase.phaseTypeEstimate === "holder_phase"
+        phaseTypeForDisplay === "holder_phase"
           ? "\nHolder phase note: holder eligibility verification is limited unless the required collection contract is known."
+          : ""
+      }${
+        openSeaMint
+          ? `\n\nStored OpenSea Mint Schedule\n\n${formatOpenSeaMintMetadata(openSeaMint).join("\n")}`
           : ""
       }`
     );
@@ -3324,35 +3578,59 @@ bot.command("refreshtarget", async (ctx) => {
   try {
     const ownerTelegramId = getRequiredTelegramUserId(ctx);
     const target = getMintTargetForOwner(targetId, ownerTelegramId);
-    const detection = await detectMint(target.sourceUrl || target.contractAddress);
-    const functionResult = await detectMintFunctions({
-      contractAddress: target.contractAddress,
-      chain: target.chain
-    });
-    const foundCandidates = getFoundFunctionCandidates(functionResult.candidateFunctions);
-    const phase = await detectMintPhase({
-      contractAddress: target.contractAddress,
-      chain: target.chain,
-      evidenceTexts: [
-        target.name,
-        target.collectionSlug || "",
-        detection.contract.collectionSlug || "",
-        target.sourceUrl || "",
-        target.notes || ""
-      ]
-    });
+    const detection = await detectMint(target.sourceUrl || target.contractAddress || target.name);
+    const resolvedContractAddress = target.contractAddress || detection.contract.address || "";
+    const hasResolvedContract = Boolean(
+      resolvedContractAddress && ethers.isAddress(resolvedContractAddress)
+    );
+    let foundCandidates: MintFunctionCandidate[] = [];
+    let functionWarnings: string[] = [];
+    let phaseStatus = detection.mint.phaseStatus;
+    let phaseTypeEstimate = detection.mint.phaseTypeEstimate;
+    let phaseTypeConfidence = detection.mint.phaseTypeConfidence;
+    let phaseTypeEvidence = detection.mint.phaseTypeEvidence;
+    let phaseConfidence = detection.mint.confidence;
+    let phaseWarnings: string[] = [];
+
+    if (hasResolvedContract) {
+      const functionResult = await detectMintFunctions({
+        contractAddress: resolvedContractAddress,
+        chain: target.chain
+      });
+      const phase = await detectMintPhase({
+        contractAddress: resolvedContractAddress,
+        chain: target.chain,
+        evidenceTexts: [
+          target.name,
+          target.collectionSlug || "",
+          detection.contract.collectionSlug || "",
+          target.sourceUrl || "",
+          target.notes || ""
+        ]
+      });
+
+      foundCandidates = getFoundFunctionCandidates(functionResult.candidateFunctions);
+      functionWarnings = functionResult.warnings;
+      phaseStatus = phase.phaseStatus;
+      phaseTypeEstimate = phase.phaseTypeEstimate;
+      phaseTypeConfidence = phase.phaseTypeConfidence;
+      phaseTypeEvidence = phase.phaseTypeEvidence;
+      phaseConfidence = phase.confidence;
+      phaseWarnings = phase.warnings;
+    }
+
     const detectedMetadata = {
       ...getDetectionMetadata(detection),
       lastCheckedAt: new Date().toISOString(),
-      detectedContractAddress: target.contractAddress,
+      ...(resolvedContractAddress ? { detectedContractAddress: resolvedContractAddress } : {}),
       detectedChain: target.chain,
       candidateFunctions: foundCandidates.map((candidate) => candidate.signature),
-      phaseStatus: phase.phaseStatus,
-      phaseTypeEstimate: phase.phaseTypeEstimate,
-      phaseTypeConfidence: phase.phaseTypeConfidence,
-      phaseTypeEvidence: phase.phaseTypeEvidence,
-      phaseConfidence: phase.confidence,
-      warnings: [...detection.warnings, ...functionResult.warnings, ...phase.warnings].slice(0, 10)
+      phaseStatus,
+      phaseTypeEstimate,
+      phaseTypeConfidence,
+      phaseTypeEvidence,
+      phaseConfidence,
+      warnings: [...detection.warnings, ...functionWarnings, ...phaseWarnings].slice(0, 10)
     };
     const updated = updateMintTargetDetectedMetadataForOwner(
       target.targetId,
@@ -3364,6 +3642,9 @@ bot.command("refreshtarget", async (ctx) => {
         ...(detection.contract.collectionSlug
           ? { collectionSlug: detection.contract.collectionSlug }
           : {}),
+        ...(resolvedContractAddress && !target.contractAddress
+          ? { contractAddress: resolvedContractAddress }
+          : {}),
         detectedMetadata
       }
     );
@@ -3372,7 +3653,7 @@ bot.command("refreshtarget", async (ctx) => {
       ownerTelegramId,
       action: "mint_target_refreshed",
       targetId: updated.targetId,
-      contractAddress: updated.contractAddress,
+      ...(updated.contractAddress ? { contractAddress: updated.contractAddress } : {}),
       chain: updated.chain,
       collectionSlug: updated.collectionSlug,
       candidateFunctions: updated.detectedMetadata?.candidateFunctions,
@@ -3822,7 +4103,7 @@ bot.command("minttargets", async (ctx) => {
           `${index + 1}. ${target.name}`,
           `Target ID: ${target.targetId}`,
           `Chain: ${target.chain}`,
-          `Contract: ${formatShortAddress(target.contractAddress)}`,
+          `Contract: ${target.contractAddress ? formatShortAddress(target.contractAddress) : "Unknown"}`,
           `Completeness: ${target.targetCompleteness}`,
           `Function: ${target.functionSignature || "Unknown"}`,
           `Qty: ${target.quantity}`,
@@ -3868,6 +4149,7 @@ bot.command("updateminttarget", async (ctx) => {
     const ownerTelegramId = getRequiredTelegramUserId(ctx);
     const parsed = parseMintTargetUpdateParams(parseCommandParts(ctx.message.text));
     const target = updateMintTargetForOwner(parsed.targetId, ownerTelegramId, {
+      ...(parsed.contractAddress ? { contractAddress: parsed.contractAddress } : {}),
       chain: parsed.chain,
       functionSignature: parsed.functionSignature,
       quantity: parsed.quantity,
@@ -7439,6 +7721,27 @@ bot.action(/^pf:open:(.+)$/, async (ctx) => {
   }
 
   await sendPostMintActionMenu(ctx, validated.action);
+});
+
+bot.on("text", async (ctx) => {
+  if (ctx.chat?.type !== "private") {
+    return;
+  }
+
+  const input = getDirectMintLinkInput(ctx.message.text);
+
+  if (!input) {
+    return;
+  }
+
+  if (!(await requireAdmin(ctx))) return;
+
+  try {
+    await replyWithMintDetection(ctx, input, "direct_link_auto_parser");
+  } catch (error) {
+    logSafeError("Could not auto-parse mint link", error);
+    await ctx.reply(`❌ Could not parse mint link.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
 });
 
 async function startBot() {

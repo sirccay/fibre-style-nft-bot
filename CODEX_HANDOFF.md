@@ -258,6 +258,10 @@ Core stack:
 
   - `/addmintfromlink URL_OR_TEXT mintName`
 
+- OpenSea contract resolver:
+
+  - `/resolvecontract collectionSlug_or_OpenSea_URL`
+
 - Function detection commands:
 
   - `/detectmintfunction 0xCONTRACT mainnet`
@@ -279,6 +283,8 @@ Core stack:
 - Parser status:
 
   - `/parserstatus`
+
+- Direct private-chat link parsing is enabled. Pasting a supported OpenSea/Zora/explorer link in a private chat runs the same safe parser output as `/parsemintlink`. Commands still go to their command handlers, group chats are ignored, and private-key-shaped `0x` + 64 hex values are not parsed.
 
 - Supported parser inputs:
 
@@ -326,13 +332,15 @@ Core stack:
 
 - Parser-created targets save OpenSea mint schedule metadata under `target.detectedMetadata.openSeaMint`. If OpenSea only exposes a USD price, `priceEth` is not guessed or stored; complete the ETH price manually with `/updateminttarget`.
 
+- If OpenSea mint metadata is detected but the contract address is still unknown, `/addmintfromlink` saves an incomplete draft target with the source URL, slug, schedule, and price metadata. Complete it later with `/updateminttarget targetId 0xCONTRACT functionSignature quantity priceEth chain` or create a manual target with `/addminttarget`.
+
 - Regression check for OpenSea mint stage parsing:
 
   `/parsemintlink https://opensea.io/collection/fuzzlingss/overview`
 
-  Expected: when OpenSea public page metadata is available, the reply should include Fuzzlings mint status, minted supply progress, current Public stage price/limit, and Team/GTD/Public schedule rows. If OpenSea blocks or omits public metadata, the reply should stay safe and show unknown/warnings instead of failing.
+  Expected: when OpenSea public page metadata is available, the reply should include Fuzzlings mint status, minted supply progress, current Public stage price/limit, Team/GTD/Public schedule rows, and final Phase should summarize the current live Public stage as `public_phase` with high confidence. If OpenSea blocks or omits public metadata, the reply should stay safe and show unknown/warnings instead of failing.
 
-- Parser-created mint targets may be incomplete. Complete them with `/updateminttarget targetId functionSignature quantity priceEth chain` before `/minttargetpreview` or `/minttargetnow`.
+- Parser-created mint targets may be incomplete. Complete them with `/updateminttarget targetId functionSignature quantity priceEth chain` or `/updateminttarget targetId 0xCONTRACT functionSignature quantity priceEth chain` before `/minttargetpreview` or `/minttargetnow`.
 
 - Parser commands do not send transactions, do not schedule mints, and do not bypass project mint rules.
 
