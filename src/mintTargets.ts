@@ -9,6 +9,7 @@ import type {
   OpenSeaMintMetadata,
   OpenSeaMintStage
 } from "./mintDetector.js";
+import type { MintJobMintType } from "./mintJobs.js";
 
 export type MintTargetStatus = "active" | "archived";
 export type MintTargetCompleteness = "complete" | "incomplete";
@@ -51,6 +52,9 @@ export type MintTarget = {
   collectionSlug?: string;
   sourceUrl?: string;
   notes?: string;
+  mintType?: MintJobMintType;
+  maxRetries?: number;
+  retryDelayMs?: number;
   detectedMetadata?: MintTargetDetectedMetadata;
 };
 
@@ -89,6 +93,12 @@ type UpdateMintTargetMetadataParams = {
   detectedMetadata: MintTargetDetectedMetadata;
 };
 
+type UpdateMintTargetMintSettingsParams = {
+  mintType: MintJobMintType;
+  maxRetries: number;
+  retryDelayMs: number;
+};
+
 const MINT_TARGETS_PATH = path.join(process.cwd(), "data", "mintTargets.json");
 const SUPPORTED_STORED_MINT_SIGNATURES: SupportedMintFunctionSignature[] = [
   "mint(uint256)",
@@ -113,6 +123,17 @@ function isSupportedStoredMintFunctionSignature(
 ): value is SupportedMintFunctionSignature {
   return SUPPORTED_STORED_MINT_SIGNATURES.includes(
     value as SupportedMintFunctionSignature
+  );
+}
+
+function isMintJobMintType(value: unknown): value is MintJobMintType {
+  return (
+    value === "manual" ||
+    value === "team" ||
+    value === "holder" ||
+    value === "gtd" ||
+    value === "fcfs" ||
+    value === "public"
   );
 }
 
@@ -350,6 +371,8 @@ function normalizeStoredMintTarget(raw: any): MintTarget | null {
         quantity
       });
   const detectedMetadata = normalizeDetectedMetadata(raw.detectedMetadata);
+  const maxRetries = normalizeNumberField(raw.maxRetries);
+  const retryDelayMs = normalizeNumberField(raw.retryDelayMs);
 
   return {
     targetId: raw.targetId,
@@ -369,6 +392,9 @@ function normalizeStoredMintTarget(raw: any): MintTarget | null {
       : {}),
     ...(typeof raw.sourceUrl === "string" ? { sourceUrl: raw.sourceUrl } : {}),
     ...(typeof raw.notes === "string" ? { notes: raw.notes } : {}),
+    ...(isMintJobMintType(raw.mintType) ? { mintType: raw.mintType } : {}),
+    ...(maxRetries !== undefined ? { maxRetries } : {}),
+    ...(retryDelayMs !== undefined ? { retryDelayMs } : {}),
     ...(detectedMetadata ? { detectedMetadata } : {})
   };
 }
@@ -548,6 +574,35 @@ export function updateMintTargetDetectedMetadataForOwner(
 
   target.detectedMetadata = updates.detectedMetadata;
   target.targetCompleteness = calculateMintTargetCompleteness(target);
+  target.updatedAt = new Date().toISOString();
+
+  writeMintTargets(file.targets);
+  return target;
+}
+
+export function updateMintTargetMintSettingsForOwner(
+  targetId: string,
+  ownerTelegramId: string,
+  updates: UpdateMintTargetMintSettingsParams
+) {
+  const file = loadMintTargetsFile();
+  const target = file.targets.find(
+    (savedTarget) =>
+      savedTarget.targetId === targetId &&
+      savedTarget.ownerTelegramId === ownerTelegramId
+  );
+
+  if (!target) {
+    throw new Error("Mint target not found for this Telegram user.");
+  }
+
+  if (target.status === "archived") {
+    throw new Error("Mint target is archived and cannot be updated.");
+  }
+
+  target.mintType = updates.mintType;
+  target.maxRetries = updates.maxRetries;
+  target.retryDelayMs = updates.retryDelayMs;
   target.updatedAt = new Date().toISOString();
 
   writeMintTargets(file.targets);
