@@ -304,7 +304,25 @@ Core stack:
 
 - OpenSea mint page metadata fallback is enabled. For public OpenSea collection/mint pages, the parser now attempts safe public HTML/embedded JSON extraction with no cookies, no auth, no headless browser, and a short timeout. It can store/display mint status, minted supply progress, current stage, stage schedule, raw time text, price text, wallet limit text, and eligibility text when the public page exposes them.
 
-- If `RESERVOIR_API_KEY` is configured, the parser attempts a best-effort Reservoir mint-stage lookup before falling back to OpenSea page metadata. Reservoir is optional and failures/401/403/429 responses should not stop the bot.
+- The detector now has two real tiers:
+
+  - Tier 1: Reservoir collection lookup with `includeMintStages=true` when `RESERVOIR_API_KEY` is configured.
+
+  - Tier 2: on-chain fallback using RPC, Etherscan V2 ABI lookup when `ETHERSCAN_API_KEY` is configured, bytecode selector scan, 4byte lookup, common getter probes, and recent transaction price inference when possible.
+
+- Raw address input probes configured detector RPC chains and marks chain confidence lower if the same contract address has code on more than one configured chain.
+
+- Supported detector chain config is in `src/mintDetectorV2.ts`. Currently configured chains are Ethereum mainnet, Base, Arbitrum, Polygon, and Sepolia. RPC env vars include `ETH_MAINNET_RPC_URL`, `BASE_RPC_URL`/`ETH_BASE_RPC_URL`, `ARBITRUM_RPC_URL`/`ETH_ARBITRUM_RPC_URL`, `POLYGON_RPC_URL`/`ETH_POLYGON_RPC_URL`, and `SEPOLIA_RPC_URL`/`ETH_SEPOLIA_RPC_URL`.
+
+- Optional detector API env vars:
+
+  - `RESERVOIR_API_KEY`
+
+  - `OPENSEA_API_KEY`
+
+  - `ETHERSCAN_API_KEY`
+
+- If `RESERVOIR_API_KEY` is configured, the parser attempts Reservoir mint-stage lookup before falling back to on-chain/page metadata. Reservoir is optional and failures/401/403/429 responses should not stop the bot.
 
 - Parser-created targets save OpenSea mint schedule metadata under `target.detectedMetadata.openSeaMint`. If OpenSea only exposes a USD price, `priceEth` is not guessed or stored; complete the ETH price manually with `/updateminttarget`.
 

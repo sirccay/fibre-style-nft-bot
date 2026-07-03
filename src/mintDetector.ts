@@ -12,11 +12,18 @@ import {
   detectMintPhase,
   estimatePhaseTypeFromTexts
 } from "./mintPhaseDetector.js";
+import {
+  detectMintStructured
+} from "./mintDetectorV2.js";
 import type {
   Confidence,
   MintPhaseStatus,
   MintPhaseTypeEstimate
 } from "./mintPhaseDetector.js";
+import type {
+  DetectorStage,
+  StructuredMintDetectionResult
+} from "./mintDetectorV2.js";
 
 export type MintSourcePlatform =
   | "opensea"
@@ -81,6 +88,7 @@ export type OpenSeaMintMetadata = {
 
 export type MintDetectionResult = {
   input: string;
+  structured: StructuredMintDetectionResult;
   detectedAt: string;
   warnings: string[];
   source: {
@@ -514,6 +522,8 @@ function normalizeDisplayText(text: string) {
   return text
     .replace(/\\u003c/gi, "<")
     .replace(/\\u003e/gi, ">")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
     .replace(/&quot;/gi, "\"")
@@ -868,7 +878,7 @@ function extractJsonScriptText(html: string) {
       scriptText &&
       /\b(minting now|minting soon|public stage|team|gtd|allowlist|whitelist|limit per wallet|eligible|items minted)\b/i.test(scriptText)
     ) {
-      texts.push(scriptText.slice(0, 1_000_000));
+      texts.push(scriptText.slice(0, 5_000_000));
     }
   }
 
@@ -894,12 +904,333 @@ function extractOpenGraphText(html: string) {
   return texts;
 }
 
+function extractBalancedJsonObject(text: string, startIndex: number): string | null {
+  const firstBrace = text.indexOf("{", startIndex);
+
+  if (firstBrace === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaping = false;
+
+  for (let index = firstBrace; index < text.length; index++) {
+    const char = text[index];
+
+    if (escaping) {
+      escaping = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      escaping = true;
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+
+      if (depth === 0) {
+        return text.slice(firstBrace, index + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractOpenSeaUrqlPayloads(html: string) {
+  const payloads: any[] = [];
+  let searchIndex = 0;
+
+  while (searchIndex < html.length) {
+    const pushIndex = html.indexOf("urql_transport", searchIndex);
+
+    if (pushIndex === -1) break;
+
+    const pushCallIndex = html.indexOf(".push(", pushIndex);
+
+    if (pushCallIndex === -1) {
+      searchIndex = pushIndex + 1;
+      continue;
+    }
+
+    const jsonText = extractBalancedJsonObject(html, pushCallIndex);
+
+    if (jsonText) {
+      try {
+        payloads.push(JSON.parse(jsonText));
+      } catch {
+        // Ignore non-JSON hydration chunks; other parser paths still run.
+      }
+    }
+
+    searchIndex = pushCallIndex + 6;
+  }
+
+  return payloads;
+}
+
+function collectOpenSeaDropObjects(value: unknown, results: any[] = [], depth = 0): any[] {
+  if (!value || typeof value !== "object" || depth > 10) {
+    return results;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectOpenSeaDropObjects(item, results, depth + 1);
+    }
+
+    return results;
+  }
+
+  const record = value as Record<string, any>;
+
+  if (record.dropBySlug && typeof record.dropBySlug === "object") {
+    results.push(record.dropBySlug);
+  }
+
+  if (
+    Array.isArray(record.stages) &&
+    ((typeof record.__typename === "string" && record.__typename.includes("SeaDrop")) ||
+      record.maxSupply !== undefined ||
+      record.totalSupply !== undefined)
+  ) {
+    results.push(record);
+  }
+
+  if (record.drop && typeof record.drop === "object" && Array.isArray(record.drop.stages)) {
+    results.push(record.drop);
+  }
+
+  for (const child of Object.values(record)) {
+    collectOpenSeaDropObjects(child, results, depth + 1);
+  }
+
+  return results;
+}
+
+function scoreOpenSeaDrop(drop: any) {
+  const stages = Array.isArray(drop?.stages) ? drop.stages : [];
+
+  return (
+    (drop?.maxSupply !== undefined ? 20 : 0) +
+    (drop?.totalSupply !== undefined ? 20 : 0) +
+    (drop?.activeDropStage ? 15 : 0) +
+    stages.length * 3 +
+    stages.filter((stage: any) => typeof stage.endTime === "string").length * 8 +
+    stages.filter((stage: any) => typeof stage.maxTotalMintableByWallet === "number").length * 5
+  );
+}
+
+function getOpenSeaStageLabel(stage: any) {
+  if (typeof stage.label === "string" && stage.label.trim()) return stage.label.trim();
+  if (typeof stage.name === "string" && stage.name.trim()) return stage.name.trim();
+
+  if (stage.stageIndex === 1) return "Team";
+  if (stage.stageIndex === 2) return "GTD";
+  if (stage.stageIndex === 0) return "Public stage";
+
+  return "Unknown stage";
+}
+
+function getOpenSeaStagePrice(stage: any) {
+  const unit = Number(stage?.price?.token?.unit);
+  const usd = Number(stage?.price?.usd);
+  const symbol = typeof stage?.price?.token?.symbol === "string"
+    ? stage.price.token.symbol
+    : "ETH";
+  const priceEth =
+    Number.isFinite(unit) && unit >= 0 && symbol.toUpperCase() === "ETH"
+      ? String(unit)
+      : undefined;
+
+  if (Number.isFinite(usd) && usd > 0) {
+    return {
+      priceText: `$${usd.toFixed(2)}`,
+      priceEth
+    };
+  }
+
+  if (Number.isFinite(unit) && unit === 0) {
+    return {
+      priceText: "Free",
+      priceEth: "0"
+    };
+  }
+
+  if (priceEth) {
+    return {
+      priceText: `${priceEth} ETH`,
+      priceEth
+    };
+  }
+
+  return {};
+}
+
+function classifyOpenSeaHydrationStage(params: {
+  stage: any;
+  activeStageIndex?: number;
+  activeStageLabel?: string;
+}): MintPhaseStatus {
+  const label = getOpenSeaStageLabel(params.stage);
+
+  if (
+    params.activeStageIndex !== undefined &&
+    params.stage.stageIndex === params.activeStageIndex
+  ) {
+    return "live";
+  }
+
+  if (
+    params.activeStageLabel &&
+    label.toLowerCase() === params.activeStageLabel.toLowerCase()
+  ) {
+    return "live";
+  }
+
+  const nowMs = Date.now();
+  const startMs = typeof params.stage.startTime === "string"
+    ? Date.parse(params.stage.startTime)
+    : NaN;
+  const endMs = typeof params.stage.endTime === "string"
+    ? Date.parse(params.stage.endTime)
+    : NaN;
+
+  if (Number.isFinite(startMs) && startMs > nowMs) return "not_live_yet";
+  if (Number.isFinite(endMs) && endMs <= nowMs) return "ended";
+  if (Number.isFinite(startMs) && startMs <= nowMs && (!Number.isFinite(endMs) || endMs > nowMs)) {
+    return "live";
+  }
+
+  return "unknown";
+}
+
+function openSeaHydrationDropToMetadata(drop: any): OpenSeaMintMetadata | null {
+  const stages = Array.isArray(drop?.stages) ? drop.stages : [];
+
+  if (stages.length === 0) {
+    return null;
+  }
+
+  const activeStageIndex =
+    typeof drop?.activeDropStage?.stageIndex === "number"
+      ? drop.activeDropStage.stageIndex
+      : undefined;
+  const activeStageLabel =
+    typeof drop?.activeDropStage?.label === "string"
+      ? drop.activeDropStage.label
+      : undefined;
+  const mintSchedule: OpenSeaMintStage[] = stages.map((stage: any) => {
+    const label = getOpenSeaStageLabel(stage);
+    const phaseType = estimatePhaseTypeFromTexts([label], "high");
+    const price = getOpenSeaStagePrice(stage);
+    const limitPerWallet = parseIntegerText(
+      stage.maxTotalMintableByWallet === undefined
+        ? null
+        : String(stage.maxTotalMintableByWallet)
+    );
+
+    return {
+      stageName: label,
+      phaseTypeEstimate: phaseType.phaseTypeEstimate,
+      phaseTypeConfidence: phaseType.phaseTypeConfidence,
+      status: classifyOpenSeaHydrationStage({
+        stage,
+        activeStageIndex,
+        activeStageLabel
+      }),
+      ...(typeof stage.startTime === "string" ? { startTimeText: stage.startTime } : {}),
+      ...(typeof stage.endTime === "string" ? { endTimeText: stage.endTime } : {}),
+      ...(price.priceText ? { priceText: price.priceText } : {}),
+      ...(price.priceEth !== undefined ? { priceEth: price.priceEth } : {}),
+      ...(limitPerWallet !== undefined ? { limitPerWallet } : {}),
+      evidence: phaseType.phaseTypeEvidence
+    } satisfies OpenSeaMintStage;
+  });
+  const activeStage =
+    mintSchedule.find((stage) => stage.status === "live") ||
+    mintSchedule.find((stage) => stage.phaseTypeEstimate === "public_phase") ||
+    mintSchedule[0];
+  const mintedCount = parseIntegerText(
+    drop.totalSupply === undefined ? null : String(drop.totalSupply)
+  );
+  const maxSupply = parseIntegerText(
+    drop.maxSupply === undefined ? null : String(drop.maxSupply)
+  );
+  const mintStatusText =
+    activeStage?.status === "live"
+      ? "Minting Now"
+      : activeStage?.status === "not_live_yet"
+        ? "Minting Soon"
+        : activeStage?.status === "ended"
+          ? "Mint Ended"
+          : undefined;
+
+  return {
+    ...(mintStatusText ? { mintStatusText } : {}),
+    ...(mintedCount !== undefined ? { mintedCount } : {}),
+    ...(maxSupply !== undefined ? { maxSupply } : {}),
+    ...(activeStage?.stageName ? { currentStageName: activeStage.stageName } : {}),
+    ...(activeStage?.priceText ? { currentStagePriceText: activeStage.priceText } : {}),
+    ...(activeStage?.priceEth !== undefined ? { currentStagePriceEth: activeStage.priceEth } : {}),
+    ...(activeStage?.limitPerWallet !== undefined
+      ? { currentStageLimitPerWallet: activeStage.limitPerWallet }
+      : {}),
+    mintSchedule,
+    metadataSource: "opensea_page_embedded_json",
+    confidence: "high"
+  };
+}
+
+function extractOpenSeaHydrationMintMetadata(html: string): OpenSeaMintMetadata | null {
+  const payloads = extractOpenSeaUrqlPayloads(html);
+  const drops = payloads
+    .flatMap((payload) => collectOpenSeaDropObjects(payload))
+    .sort((a, b) => scoreOpenSeaDrop(b) - scoreOpenSeaDrop(a));
+
+  for (const drop of drops) {
+    const metadata = openSeaHydrationDropToMetadata(drop);
+
+    if (metadata) {
+      return metadata;
+    }
+  }
+
+  return null;
+}
+
 function extractOpenSeaCollectionNameFromHtml(html: string): string | undefined {
-  for (const text of extractOpenGraphText(html)) {
+  const titleTexts: string[] = [];
+
+  for (const match of html.matchAll(
+    /<meta[^>]+(?:property|name)=["'](?:og:title|twitter:title)["'][^>]+content=["']([^"']+)["'][^>]*>/gi
+  )) {
+    if (match[1]) {
+      titleTexts.push(match[1]);
+    }
+  }
+
+  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1];
+  if (title) {
+    titleTexts.push(title);
+  }
+
+  for (const text of titleTexts) {
     const normalized = normalizeDisplayText(text);
     const withoutOpenSea = normalized
       .replace(/\s*\|\s*OpenSea.*$/i, "")
       .replace(/\s*-\s*OpenSea.*$/i, "")
+      .replace(/\s*<.*$/i, "")
       .trim();
     const collectionMatch = withoutOpenSea.match(/^(.+?)\s*[-|]\s*(?:NFT\s+)?Collection\b/i);
     const candidate = collectionMatch?.[1]?.trim() || withoutOpenSea;
@@ -948,6 +1279,16 @@ async function fetchOpenSeaPageMintMetadata(
 
       const html = await response.text();
       const collectionName = extractOpenSeaCollectionNameFromHtml(html);
+      const hydrationMetadata = extractOpenSeaHydrationMintMetadata(html);
+
+      if (hydrationMetadata) {
+        return {
+          ...hydrationMetadata,
+          ...(collectionName ? { collectionName } : {}),
+          warnings: [...(hydrationMetadata.warnings || []), ...warnings]
+        };
+      }
+
       const embeddedText = extractJsonScriptText(html).join(" ");
       const embeddedMetadata = extractOpenSeaMintFromText(
         embeddedText,
@@ -1182,31 +1523,247 @@ function getFirstPhaseTime(
   return fields.find((field) => field.name.toLowerCase().includes(pattern))?.iso;
 }
 
+function mapStructuredChainName(chainName: string | null): DetectedChainName {
+  if (
+    chainName === "mainnet" ||
+    chainName === "sepolia" ||
+    chainName === "base" ||
+    chainName === "arbitrum" ||
+    chainName === "polygon"
+  ) {
+    return chainName;
+  }
+
+  return "unknown";
+}
+
+function mapStructuredPhaseStatus(
+  status: StructuredMintDetectionResult["mint"]["phase"]["status"]
+): MintPhaseStatus {
+  if (status === "public" || status === "allowlist") return "live";
+  if (status === "not-started") return "not_live_yet";
+  if (status === "paused" || status === "ended") return status;
+  return "unknown";
+}
+
+function getStagePhaseType(stage: DetectorStage) {
+  return estimatePhaseTypeFromTexts(
+    [stage.name || "", stage.kind || ""],
+    stage.confidence === "high" ? "high" : stage.confidence === "medium" ? "medium" : "low"
+  );
+}
+
+function stageToOpenSeaMintStage(stage: DetectorStage): OpenSeaMintStage {
+  const phaseType = getStagePhaseType(stage);
+
+  return {
+    ...(stage.name ? { stageName: stage.name } : {}),
+    phaseTypeEstimate: phaseType.phaseTypeEstimate,
+    phaseTypeConfidence: phaseType.phaseTypeConfidence,
+    status: mapStructuredPhaseStatus(stage.status),
+    ...(stage.startTime ? { startTimeText: stage.startTime } : {}),
+    ...(stage.endTime ? { endTimeText: stage.endTime } : {}),
+    ...(stage.priceText || stage.priceEth
+      ? { priceText: stage.priceText || `${stage.priceEth} ETH` }
+      : {}),
+    ...(stage.priceEth ? { priceEth: stage.priceEth } : {}),
+    ...(stage.maxPerWallet !== null ? { limitPerWallet: stage.maxPerWallet } : {}),
+    ...(stage.eligibilityText ? { eligibilityText: stage.eligibilityText } : {}),
+    evidence: phaseType.phaseTypeEvidence
+  };
+}
+
+function getStructuredCurrentStage(structured: StructuredMintDetectionResult) {
+  return (
+    structured.mint.stages.find((stage) => stage.status === "public") ||
+    structured.mint.stages.find((stage) => stage.status === "allowlist") ||
+    structured.mint.stages.find((stage) => stage.status === "not-started") ||
+    structured.mint.stages[0]
+  );
+}
+
+function structuredToOpenSeaMintMetadata(
+  structured: StructuredMintDetectionResult
+): OpenSeaMintMetadata | undefined {
+  if (structured.mint.stages.length === 0) {
+    return undefined;
+  }
+
+  const currentStage = getStructuredCurrentStage(structured);
+  const mintSchedule = structured.mint.stages.map(stageToOpenSeaMintStage);
+  const metadataSource = structured.mint.stages.some((stage) => stage.source === "reservoir")
+    ? "reservoir"
+    : "unknown";
+  const mintStatusText =
+    structured.mint.phase.status === "public"
+      ? "Minting Now"
+      : structured.mint.phase.status === "not-started"
+        ? "Minting Soon"
+        : structured.mint.phase.status === "ended"
+          ? "Mint Ended"
+          : undefined;
+
+  return {
+    ...(mintStatusText ? { mintStatusText } : {}),
+    ...(currentStage?.name ? { currentStageName: currentStage.name } : {}),
+    ...(currentStage?.priceText || currentStage?.priceEth
+      ? { currentStagePriceText: currentStage.priceText || `${currentStage.priceEth} ETH` }
+      : {}),
+    ...(currentStage?.priceEth ? { currentStagePriceEth: currentStage.priceEth } : {}),
+    ...(currentStage?.maxPerWallet !== null && currentStage?.maxPerWallet !== undefined
+      ? { currentStageLimitPerWallet: currentStage.maxPerWallet }
+      : {}),
+    mintSchedule,
+    metadataSource,
+    confidence: structured.mint.stages.some((stage) => stage.confidence === "high")
+      ? "high"
+      : "medium"
+  };
+}
+
+function structuredToSupportedCandidate(
+  structured: StructuredMintDetectionResult
+): MintFunctionCandidate | undefined {
+  const signature = structured.mint.function.signature;
+
+  if (!signature || !SUPPORTED_MINT_FUNCTION_SIGNATURES.includes(signature as SupportedMintFunctionSignature)) {
+    return undefined;
+  }
+
+  return {
+    signature: signature as SupportedMintFunctionSignature,
+    selector: structured.mint.function.selector || getFunctionSelector(signature as SupportedMintFunctionSignature),
+    foundInBytecode: structured.mint.function.source !== "unknown",
+    confidence: structured.mint.function.confidence
+  };
+}
+
+function mapMintPhaseStatusToStructured(
+  status: MintPhaseStatus,
+  stage: OpenSeaMintStage
+): DetectorStage["status"] {
+  if (status === "not_live_yet") return "not-started";
+  if (status === "ended" || status === "paused") return status;
+
+  if (status === "live") {
+    if (stage.phaseTypeEstimate === "gtd_phase" || stage.phaseTypeEstimate === "holder_phase") {
+      return "allowlist";
+    }
+
+    return "public";
+  }
+
+  return "unknown";
+}
+
+function applyOpenSeaMintToStructured(
+  structured: StructuredMintDetectionResult,
+  openSeaMint?: OpenSeaMintMetadata
+) {
+  if (!openSeaMint || openSeaMint.mintSchedule.length === 0) {
+    return;
+  }
+
+  const detectorStages: DetectorStage[] = openSeaMint.mintSchedule.map((stage) => ({
+    name: stage.stageName || null,
+    kind: stage.phaseTypeEstimate,
+    status: mapMintPhaseStatusToStructured(stage.status, stage),
+    startTime: stage.startTimeText || null,
+    endTime: stage.endTimeText || null,
+    priceWei: stage.priceEth ? ethers.parseEther(stage.priceEth).toString() : null,
+    priceEth: stage.priceEth || null,
+    priceText: stage.priceText || null,
+    currency: stage.priceEth ? "ETH" : "unknown",
+    currencyAddress: null,
+    maxPerWallet: stage.limitPerWallet ?? null,
+    eligibilityText: stage.eligibilityText || null,
+    source: openSeaMint.metadataSource === "reservoir" ? "reservoir" : "opensea",
+    confidence: openSeaMint.confidence
+  }));
+  const currentStage =
+    detectorStages.find((stage) => stage.status === "public") ||
+    detectorStages.find((stage) => stage.status === "allowlist") ||
+    detectorStages[0];
+
+  structured.mint.stages = detectorStages;
+
+  if (currentStage) {
+    structured.mint.phase = {
+      status: currentStage.status,
+      startTime: currentStage.startTime,
+      endTime: currentStage.endTime,
+      confidence: currentStage.confidence
+    };
+
+    if (currentStage.priceEth) {
+      structured.mint.price = {
+        wei: currentStage.priceWei,
+        eth: currentStage.priceEth,
+        currency: "ETH",
+        currencyAddress: null,
+        source: openSeaMint.metadataSource === "reservoir" ? "reservoir" : "opensea_page",
+        confidence: currentStage.confidence
+      };
+    }
+  }
+}
+
 export async function detectMint(
   input: string,
   walletAddress?: string
 ): Promise<MintDetectionResult> {
+  const structured = await detectMintStructured(input, walletAddress);
   const parsed = parseMintInput(input);
-  const warnings = [...parsed.warnings];
+  const warnings = [...new Set([...parsed.warnings, ...structured.warnings])];
   let collectionName = parsed.collectionName;
-  let collectionSlug = parsed.collectionSlug;
-  let contractAddress = parsed.contractAddress;
-  let contractConfidence = parsed.contractConfidence;
-  let tokenStandard: string | undefined;
-  let chainName = parsed.chainName;
-  let chainId = parsed.chainId;
-  let chainConfidence = parsed.chainConfidence;
-  let openSeaMint: OpenSeaMintMetadata | undefined;
+  let collectionSlug = parsed.collectionSlug || structured.contract.collectionSlug || undefined;
+  let contractAddress = parsed.contractAddress || structured.contract.address || undefined;
+  let contractConfidence: Confidence =
+    parsed.contractConfidence !== "unknown"
+      ? parsed.contractConfidence
+      : structured.contract.address
+        ? "medium"
+        : "unknown";
+  let tokenStandard: string | undefined =
+    structured.contract.tokenStandard !== "unknown"
+      ? structured.contract.tokenStandard
+      : undefined;
+  let chainName = mapStructuredChainName(structured.chain.name) !== "unknown"
+    ? mapStructuredChainName(structured.chain.name)
+    : parsed.chainName;
+  let chainId = structured.chain.chainId || parsed.chainId;
+  let chainConfidence =
+    structured.chain.confidence !== "unknown"
+      ? structured.chain.confidence
+      : parsed.chainConfidence;
+  let openSeaMint: OpenSeaMintMetadata | undefined = structuredToOpenSeaMintMetadata(structured);
   let candidateFunctions: MintFunctionCandidate[] = [];
-  let priceEth: string | undefined;
-  let phaseStatus: MintPhaseStatus = "unknown";
+  const structuredCandidate = structuredToSupportedCandidate(structured);
+  if (structuredCandidate) {
+    candidateFunctions = [structuredCandidate];
+  }
+  let priceEth: string | undefined = structured.mint.price.eth || undefined;
+  let phaseStatus: MintPhaseStatus = mapStructuredPhaseStatus(structured.mint.phase.status);
   let phaseTypeEstimate: MintPhaseTypeEstimate = "unknown";
   let phaseTypeConfidence: Confidence = "unknown";
   let phaseTypeEvidence =
     "GTD/FCFS/Public phase type could not be safely detected. The project may use custom phase naming or off-chain mint logic.";
-  let startTime: string | undefined;
-  let endTime: string | undefined;
-  let mintConfidence: Confidence = "unknown";
+  let startTime: string | undefined = structured.mint.phase.startTime || undefined;
+  let endTime: string | undefined = structured.mint.phase.endTime || undefined;
+  let mintConfidence: Confidence =
+    structured.mint.function.confidence !== "unknown" ||
+    structured.mint.price.confidence !== "unknown" ||
+    structured.mint.phase.confidence !== "unknown"
+      ? "medium"
+      : "unknown";
+
+  const structuredCurrentStage = getStructuredCurrentStage(structured);
+  if (structuredCurrentStage) {
+    const phaseType = getStagePhaseType(structuredCurrentStage);
+    phaseTypeEstimate = phaseType.phaseTypeEstimate;
+    phaseTypeConfidence = phaseType.phaseTypeConfidence;
+    phaseTypeEvidence = phaseType.phaseTypeEvidence;
+  }
 
   if (parsed.platform === "opensea" && collectionSlug && !contractAddress) {
     const details = await fetchOpenSeaCollectionDetails(collectionSlug);
@@ -1292,6 +1849,8 @@ export async function detectMint(
     }
   }
 
+  applyOpenSeaMintToStructured(structured, openSeaMint);
+
   const supportedChain = toSupportedMintChain(chainName);
   const evidenceTexts = [
     input,
@@ -1352,6 +1911,7 @@ export async function detectMint(
 
   return {
     input,
+    structured,
     detectedAt: new Date().toISOString(),
     warnings,
     source: {
