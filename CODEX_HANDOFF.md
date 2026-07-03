@@ -543,6 +543,14 @@ Expected env vars:
 
 - `AZURE_KEY_WRAP_ALGORITHM=RSA-OAEP-256`
 
+- `MAX_MULTI_MINT_WALLETS=10`
+
+- `MAX_MULTI_MINT_CONCURRENCY=2`
+
+- `MULTI_MINT_DELAY_MS=1000`
+
+- `ALLOW_SCHEDULED_MAINNET_MINTING=false`
+
 
 
 
@@ -636,21 +644,99 @@ Runtime testing still needed with real Azure credentials and a real Azure Key Va
 
 12. Add mint phase detection.
 
-13. Add FCFS speed layer:
+13. Continue FCFS speed layer:
 
     - private RPC
 
     - prebuilt tx
 
-    - gas strategy
-
     - retry strategy
-
-    - parallel wallet execution
 
 14. Add subscription/user access system.
 
 15. Deploy backend safely.
+
+
+
+## Task 10 multi-wallet minting and gas strategy
+
+Task 10 adds safe multi-wallet minting for user-owned wallets only.
+
+New files:
+
+- `src/gasStrategy.ts` — EIP-1559 gas strategy parsing, fee override resolution, gas preview formatting.
+
+- `src/multiMintJobs.ts` — local `data/multiMintJobs.json` storage for scheduled multi-wallet parent jobs and per-wallet child results.
+
+Gas strategy:
+
+- Supported modes: `auto`, `standard`, `fast`, `custom`.
+
+- Default: `auto`, gas limit multiplier `1.15`.
+
+- `fast` uses provider fee data with a conservative bump.
+
+- `custom` requires `maxFeeGwei` and `maxPriorityFeeGwei`.
+
+- Safety caps: max fee `<= 300 gwei`, max priority fee `<= 50 gwei`.
+
+- Gas strategy is saved on mint targets and used by saved-target preview/mint, gas preview, and multi-mint flows.
+
+Multi-wallet safety caps:
+
+- `MAX_MULTI_MINT_WALLETS` defaults to `10` and is hard-capped at `10`.
+
+- `MAX_MULTI_MINT_CONCURRENCY` defaults to `2` and is hard-capped at `3`.
+
+- `MULTI_MINT_DELAY_MS` defaults to `1000` and has minimum `500`.
+
+- No unlimited parallel transactions and no infinite retry loop.
+
+Mainnet locks:
+
+- Immediate `/mintmulti` requires manual confirmation; final mainnet sends still require `ALLOW_MAINNET_MINTING=true`.
+
+- Scheduled `/schedulemintmulti ... auto` on mainnet requires both `ALLOW_MAINNET_MINTING=true` and `ALLOW_SCHEDULED_MAINNET_MINTING=true`.
+
+- Watch mode never auto-sends transactions.
+
+Multi-mint commands:
+
+- `/setgas targetId auto`
+
+- `/setgas targetId fast`
+
+- `/setgas targetId custom 25 2`
+
+- `/gaspreview targetId wallet1`
+
+- `/multigaspreview targetId wallet1,wallet2`
+
+- `/mintmulti targetId wallet1,wallet2`
+
+- `/schedulemintmulti targetId wallet1,wallet2 2026-07-04T18:00:00Z watch`
+
+- `/schedulemintmulti targetId wallet1,wallet2 2026-07-04T18:00:00Z auto`
+
+- `/runmultimintjob jobId`
+
+- `/multimintjob jobId`
+
+- `/cancelmultimintjob jobId`
+
+- `/multimintstatus`
+
+Runtime notes:
+
+- Multi-mint confirmation sessions are owner-scoped, expire after 10 minutes, and are single-use.
+
+- Callback data contains only session IDs.
+
+- Each wallet attempt writes a separate mint run and can succeed/fail independently.
+
+- Per-wallet failures do not stop other wallets unless a global safety lock or target/config problem blocks the run.
+
+- Stored multi-mint jobs do not contain private keys, DEKs, wrapped DEKs, signed transactions, RPC keys, or secrets.
 
 
 
@@ -729,6 +815,30 @@ Archive wallet inside bot:
 Check live trading lock/config:
 
 `/tradingstatus`
+
+Check multi-mint caps/config:
+
+`/multimintstatus`
+
+Set target gas:
+
+`/setgas TARGET_ID fast`
+
+Preview target gas:
+
+`/gaspreview TARGET_ID wallet1`
+
+Preview multiple wallets:
+
+`/multigaspreview TARGET_ID wallet1,wallet2`
+
+Immediate Sepolia multi-mint:
+
+`/mintmulti TARGET_ID wallet1,wallet2`
+
+Schedule Sepolia multi-mint watch:
+
+`/schedulemintmulti TARGET_ID wallet1,wallet2 2026-07-04T18:00:00Z watch`
 
 Claim an old ownerless wallet record:
 

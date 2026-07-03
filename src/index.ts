@@ -44,6 +44,7 @@ import {
   getMintTargetForOwner,
   listMintTargetsForOwner,
   updateMintTargetDetectedMetadataForOwner,
+  updateMintTargetGasStrategyForOwner,
   updateMintTargetMintSettingsForOwner,
   updateMintTargetForOwner
 } from "./mintTargets.js";
@@ -71,6 +72,25 @@ import {
   updateMintRunForOwner
 } from "./mintRuns.js";
 import type { MintRun, MintRunStatus } from "./mintRuns.js";
+import {
+  createDefaultGasStrategy,
+  formatGasStrategy,
+  parseGasStrategyInput
+} from "./gasStrategy.js";
+import type { GasStrategy } from "./gasStrategy.js";
+import {
+  createMultiMintJob,
+  getMultiMintJobForOwner,
+  listActiveMultiMintJobsForOwner,
+  listResumableMultiMintJobs,
+  summarizeMultiMintJobStatus,
+  updateMultiMintChildResult,
+  updateMultiMintJobForOwner
+} from "./multiMintJobs.js";
+import type {
+  MultiMintJob,
+  MultiMintJobStatus
+} from "./multiMintJobs.js";
 import {
   detectMint,
   detectMintFunctions,
@@ -145,6 +165,15 @@ const BOT_COMMANDS = [
   { command: "runmintcheck", description: "Run mint job check" },
   { command: "runmintjob", description: "Run mint job manually" },
   { command: "schedulerstatus", description: "Show scheduler status" },
+  { command: "setgas", description: "Set mint gas strategy" },
+  { command: "gaspreview", description: "Preview mint gas" },
+  { command: "multigaspreview", description: "Preview gas for wallets" },
+  { command: "mintmulti", description: "Mint with multiple wallets" },
+  { command: "schedulemintmulti", description: "Schedule multi-wallet mint" },
+  { command: "runmultimintjob", description: "Run multi-mint job" },
+  { command: "multimintjob", description: "Show multi-mint job" },
+  { command: "cancelmultimintjob", description: "Cancel multi-mint job" },
+  { command: "multimintstatus", description: "Show multi-mint status" },
   { command: "help", description: "Show commands" }
 ];
 
@@ -398,6 +427,19 @@ Scheduler:
 /runmintjob jobId
 /schedulerstatus
 
+Gas and Multi-Wallet Minting:
+/setgas targetId auto
+/setgas targetId fast
+/setgas targetId custom 25 2
+/gaspreview targetId wallet1
+/multigaspreview targetId wallet1,wallet2
+/mintmulti targetId wallet1,wallet2
+/schedulemintmulti targetId wallet1,wallet2 2026-07-04T18:00:00Z watch
+/runmultimintjob jobId
+/multimintjob jobId
+/cancelmultimintjob jobId
+/multimintstatus
+
 Testing:
 /minttest wallet1 1`;
 }
@@ -645,9 +687,31 @@ type MintConfirmationSession = {
   runId: string;
   targetId?: string;
   jobId?: string;
+  gasStrategy?: GasStrategy;
   createdAt: string;
   expiresAt: string;
   status: MintConfirmationStatus;
+};
+
+type MultiMintConfirmationStatus = "active" | "used" | "cancelled" | "expired";
+
+type MultiMintConfirmationSession = {
+  sessionId: string;
+  ownerTelegramId: string;
+  targetId: string;
+  targetName: string;
+  chain: MintChain;
+  contractAddress: string;
+  functionSignature: SupportedMintFunctionSignature;
+  quantity: number;
+  priceEth: string;
+  walletLabels: string[];
+  walletAddresses: string[];
+  gasStrategy: GasStrategy;
+  multiMintJobId?: string;
+  createdAt: string;
+  expiresAt: string;
+  status: MultiMintConfirmationStatus;
 };
 
 type ValidatedMintConfirmationSession = {
@@ -679,11 +743,29 @@ type MintJobCancelConfirmation = {
   status: MintJobCancelStatus;
 };
 
+type MultiMintJobCancelConfirmation = {
+  sessionId: string;
+  ownerTelegramId: string;
+  jobId: string;
+  targetName: string;
+  createdAt: string;
+  expiresAt: string;
+  status: MintJobCancelStatus;
+};
+
 const MINT_CONFIRMATION_TTL_MS = 10 * 60 * 1000;
+const MULTI_MINT_CONFIRMATION_TTL_MS = 10 * 60 * 1000;
 const MINT_TARGET_DELETE_TTL_MS = 10 * 60 * 1000;
 const MINT_JOB_CANCEL_TTL_MS = 10 * 60 * 1000;
+const MULTI_MINT_JOB_CANCEL_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_MINT_SCHEDULER_POLL_MS = 15_000;
 const MIN_MINT_SCHEDULER_POLL_MS = 5_000;
+const DEFAULT_MAX_MULTI_MINT_WALLETS = 10;
+const HARD_MAX_MULTI_MINT_WALLETS = 10;
+const DEFAULT_MULTI_MINT_CONCURRENCY = 2;
+const HARD_MAX_MULTI_MINT_CONCURRENCY = 3;
+const DEFAULT_MULTI_MINT_DELAY_MS = 1_000;
+const MIN_MULTI_MINT_DELAY_MS = 500;
 const MINT_TARGET_NAME_PATTERN = /^[A-Za-z0-9_-]{2,40}$/;
 const MINT_CONFIRMATION_EXPIRED_MESSAGE =
   "This mint confirmation has expired. Please create it again.";
@@ -692,10 +774,13 @@ const MINT_CONFIRMATION_ALREADY_USED_MESSAGE =
 const MINT_CONFIRMATION_WRONG_USER_MESSAGE =
   "You cannot use this mint confirmation.";
 const mintConfirmations = new Map<string, MintConfirmationSession>();
+const multiMintConfirmations = new Map<string, MultiMintConfirmationSession>();
 const mintTargetDeleteConfirmations =
   new Map<string, MintTargetDeleteConfirmation>();
 const mintJobCancelConfirmations =
   new Map<string, MintJobCancelConfirmation>();
+const multiMintJobCancelConfirmations =
+  new Map<string, MultiMintJobCancelConfirmation>();
 let mintSchedulerTimer: ReturnType<typeof setInterval> | undefined;
 let mintSchedulerTickRunning = false;
 
@@ -735,6 +820,40 @@ function getMintSchedulerPollMs() {
   }
 
   return Math.max(Math.floor(configured), MIN_MINT_SCHEDULER_POLL_MS);
+}
+
+function getMaxMultiMintWallets() {
+  const configured = Number(process.env.MAX_MULTI_MINT_WALLETS);
+
+  if (!Number.isFinite(configured) || configured <= 0) {
+    return DEFAULT_MAX_MULTI_MINT_WALLETS;
+  }
+
+  return Math.min(Math.floor(configured), HARD_MAX_MULTI_MINT_WALLETS);
+}
+
+function getMultiMintConcurrency() {
+  const configured = Number(process.env.MAX_MULTI_MINT_CONCURRENCY);
+
+  if (!Number.isFinite(configured) || configured <= 0) {
+    return DEFAULT_MULTI_MINT_CONCURRENCY;
+  }
+
+  return Math.min(Math.floor(configured), HARD_MAX_MULTI_MINT_CONCURRENCY);
+}
+
+function getMultiMintDelayMs() {
+  const configured = Number(process.env.MULTI_MINT_DELAY_MS);
+
+  if (!Number.isFinite(configured) || configured <= 0) {
+    return DEFAULT_MULTI_MINT_DELAY_MS;
+  }
+
+  return Math.max(Math.floor(configured), MIN_MULTI_MINT_DELAY_MS);
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function sanitizeMintTargetName(name: string): string {
@@ -848,6 +967,7 @@ async function auditMintAction(details: {
   walletAddress?: string | undefined;
   targetId?: string | undefined;
   jobId?: string | undefined;
+  multiMintJobId?: string | undefined;
   runId?: string | undefined;
   chain?: string | undefined;
   collectionSlug?: string | undefined;
@@ -861,6 +981,7 @@ async function auditMintAction(details: {
   priceEth?: string | undefined;
   txHash?: string | undefined;
   mintType?: string | undefined;
+  gasStrategyMode?: string | undefined;
   status?: string | undefined;
   reason?: string | undefined;
 }) {
@@ -899,6 +1020,21 @@ function formatMintPreviewMessage(
     `Price Each: ${preview.priceEth} ETH`,
     `Total Mint Cost: ${preview.totalCostEth} ETH`,
     `Estimated Gas: ${preview.gasEstimate || "Not available"}`,
+    ...(preview.gasStrategyMode
+      ? [
+          `Gas Strategy: ${preview.gasStrategyMode}`,
+          ...(preview.gasLimit ? [`Gas Limit: ${preview.gasLimit}`] : []),
+          ...(preview.maxFeeGwei ? [`Max Fee: ${preview.maxFeeGwei} gwei`] : []),
+          ...(preview.maxPriorityFeeGwei ? [`Priority Fee: ${preview.maxPriorityFeeGwei} gwei`] : []),
+          ...(preview.gasPriceGwei ? [`Gas Price: ${preview.gasPriceGwei} gwei`] : []),
+          ...(preview.estimatedGasCostEth
+            ? [`Estimated Gas Cost: ${preview.estimatedGasCostEth} ETH`]
+            : []),
+          ...(preview.estimatedTotalCostEth
+            ? [`Estimated Total Cost: ${preview.estimatedTotalCostEth} ETH`]
+            : [])
+        ]
+      : []),
     `Minting Lock: ${getMintLockStatusText(preview.chain)}`
   ];
 
@@ -980,6 +1116,7 @@ function createMintConfirmationSession(params: {
   runId: string;
   targetId?: string;
   jobId?: string;
+  gasStrategy?: GasStrategy;
 }) {
   cleanupMintConfirmations();
 
@@ -997,6 +1134,7 @@ function createMintConfirmationSession(params: {
     runId: params.runId,
     ...(params.targetId ? { targetId: params.targetId } : {}),
     ...(params.jobId ? { jobId: params.jobId } : {}),
+    ...(params.gasStrategy ? { gasStrategy: params.gasStrategy } : {}),
     createdAt: createdAt.toISOString(),
     expiresAt: new Date(
       createdAt.getTime() + MINT_CONFIRMATION_TTL_MS
@@ -1096,6 +1234,151 @@ async function validateMintConfirmationSession(
   return { session, actorTelegramId };
 }
 
+function isMultiMintConfirmationExpired(session: MultiMintConfirmationSession) {
+  const expiresAtMs = Date.parse(session.expiresAt);
+  return !Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now();
+}
+
+function cleanupMultiMintConfirmations() {
+  for (const [sessionId, session] of multiMintConfirmations.entries()) {
+    if (session.status === "active" && isMultiMintConfirmationExpired(session)) {
+      session.status = "expired";
+    }
+
+    const expiresAtMs = Date.parse(session.expiresAt);
+    const cleanupAfterMs = Number.isFinite(expiresAtMs)
+      ? expiresAtMs + MULTI_MINT_CONFIRMATION_TTL_MS
+      : Date.now();
+
+    if (cleanupAfterMs <= Date.now()) {
+      multiMintConfirmations.delete(sessionId);
+    }
+  }
+}
+
+function createMultiMintConfirmationSession(params: {
+  ownerTelegramId: string;
+  targetId: string;
+  targetName: string;
+  chain: MintChain;
+  contractAddress: string;
+  functionSignature: SupportedMintFunctionSignature;
+  quantity: number;
+  priceEth: string;
+  walletLabels: string[];
+  walletAddresses: string[];
+  gasStrategy: GasStrategy;
+  multiMintJobId?: string;
+}) {
+  cleanupMultiMintConfirmations();
+
+  const createdAt = new Date();
+  const session: MultiMintConfirmationSession = {
+    sessionId: randomUUID(),
+    ownerTelegramId: params.ownerTelegramId,
+    targetId: params.targetId,
+    targetName: params.targetName,
+    chain: params.chain,
+    contractAddress: params.contractAddress,
+    functionSignature: params.functionSignature,
+    quantity: params.quantity,
+    priceEth: params.priceEth,
+    walletLabels: params.walletLabels,
+    walletAddresses: params.walletAddresses,
+    gasStrategy: params.gasStrategy,
+    ...(params.multiMintJobId ? { multiMintJobId: params.multiMintJobId } : {}),
+    createdAt: createdAt.toISOString(),
+    expiresAt: new Date(
+      createdAt.getTime() + MULTI_MINT_CONFIRMATION_TTL_MS
+    ).toISOString(),
+    status: "active"
+  };
+
+  multiMintConfirmations.set(session.sessionId, session);
+  return session;
+}
+
+async function validateMultiMintConfirmationSession(
+  ctx: Context,
+  sessionId: string
+) {
+  cleanupMultiMintConfirmations();
+
+  const actorTelegramId = getTelegramUserId(ctx);
+
+  if (!actorTelegramId) {
+    await ctx.reply("❌ Could not verify your Telegram account for this action.");
+    return null;
+  }
+
+  const session = multiMintConfirmations.get(sessionId);
+
+  if (!session) {
+    await ctx.reply("This multi-mint confirmation has expired. Please create it again.");
+    return null;
+  }
+
+  if (session.ownerTelegramId !== actorTelegramId) {
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "multi_mint_wallet_blocked",
+      targetId: session.targetId,
+      multiMintJobId: session.multiMintJobId,
+      chain: session.chain,
+      contractAddress: session.contractAddress,
+      functionSignature: session.functionSignature,
+      quantity: session.quantity,
+      priceEth: session.priceEth,
+      gasStrategyMode: session.gasStrategy.mode,
+      status: session.status,
+      reason: `wrong_user:actor=${actorTelegramId}`
+    });
+    await ctx.reply("You cannot use this multi-mint confirmation.");
+    return null;
+  }
+
+  if (session.status === "expired" || isMultiMintConfirmationExpired(session)) {
+    session.status = "expired";
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "multi_mint_wallet_blocked",
+      targetId: session.targetId,
+      multiMintJobId: session.multiMintJobId,
+      chain: session.chain,
+      contractAddress: session.contractAddress,
+      functionSignature: session.functionSignature,
+      quantity: session.quantity,
+      priceEth: session.priceEth,
+      gasStrategyMode: session.gasStrategy.mode,
+      status: session.status,
+      reason: "expired"
+    });
+    await ctx.reply("This multi-mint confirmation has expired. Please create it again.");
+    return null;
+  }
+
+  if (session.status === "used" || session.status === "cancelled") {
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "multi_mint_wallet_blocked",
+      targetId: session.targetId,
+      multiMintJobId: session.multiMintJobId,
+      chain: session.chain,
+      contractAddress: session.contractAddress,
+      functionSignature: session.functionSignature,
+      quantity: session.quantity,
+      priceEth: session.priceEth,
+      gasStrategyMode: session.gasStrategy.mode,
+      status: session.status,
+      reason: "already_used_or_cancelled"
+    });
+    await ctx.reply("This multi-mint confirmation has already been used or cancelled.");
+    return null;
+  }
+
+  return { session, actorTelegramId };
+}
+
 function formatMintTarget(target: MintTarget) {
   const missing = getMintTargetMissingFields(target);
   const metadata = target.detectedMetadata;
@@ -1118,6 +1401,7 @@ function formatMintTarget(target: MintTarget) {
           `Retry Delay: ${target.retryDelayMs ?? getMintTypeDefaults(target.mintType).retryDelayMs}ms`
         ]
       : []),
+    `Gas Strategy: ${formatGasStrategy(target.gasStrategy)}`,
     ...(target.collectionSlug ? [`Collection Slug: ${target.collectionSlug}`] : []),
     ...(target.sourceUrl ? [`Source: ${target.sourceUrl}`] : []),
     ...(metadata?.collectionName ? [`Detected Collection: ${metadata.collectionName}`] : []),
@@ -1149,6 +1433,81 @@ function requireCompleteMintTarget(target: MintTarget) {
     priceEth: target.priceEth,
     targetCompleteness: calculateMintTargetCompleteness(target)
   };
+}
+
+function getTargetGasStrategy(target: MintTarget): GasStrategy {
+  return target.gasStrategy || createDefaultGasStrategy();
+}
+
+function parseWalletLabelList(rawWallets: string) {
+  const labels = rawWallets
+    .split(",")
+    .map((label) => normalizeWalletLabel(label))
+    .filter(Boolean);
+  const seen = new Set<string>();
+
+  if (labels.length === 0) {
+    throw new Error("At least one wallet label is required.");
+  }
+
+  for (const label of labels) {
+    if (!isValidWalletLabel(label)) {
+      throw new Error(`Invalid wallet label: ${label}`);
+    }
+
+    if (seen.has(label)) {
+      throw new Error(`Duplicate wallet label: ${label}`);
+    }
+
+    seen.add(label);
+  }
+
+  const maxWallets = getMaxMultiMintWallets();
+
+  if (labels.length > maxWallets) {
+    throw new Error(`Too many wallets. Maximum allowed is ${maxWallets}.`);
+  }
+
+  return labels;
+}
+
+async function getOwnedActiveWalletSummaries(ownerTelegramId: string, walletLabels: string[]) {
+  const wallets = [];
+
+  for (const walletLabel of walletLabels) {
+    const wallet = await getWalletSummaryByLabelForOwner(walletLabel, ownerTelegramId);
+
+    if (wallet.status === "archived") {
+      throw new Error(`Wallet "${wallet.label}" is archived and cannot be used.`);
+    }
+
+    wallets.push(wallet);
+  }
+
+  return wallets;
+}
+
+function formatGasFields(preview: MintPreviewResult) {
+  return [
+    `Gas Strategy: ${preview.gasStrategyMode || "auto"}`,
+    `Estimated Gas Units: ${preview.gasEstimate || "Not available"}`,
+    ...(preview.gasLimit ? [`Gas Limit: ${preview.gasLimit}`] : []),
+    ...(preview.maxFeeGwei ? [`Max Fee: ${preview.maxFeeGwei} gwei`] : []),
+    ...(preview.maxPriorityFeeGwei ? [`Priority Fee: ${preview.maxPriorityFeeGwei} gwei`] : []),
+    ...(preview.gasPriceGwei ? [`Gas Price: ${preview.gasPriceGwei} gwei`] : []),
+    ...(preview.estimatedGasCostEth
+      ? [`Estimated Gas Cost: ${preview.estimatedGasCostEth} ETH`]
+      : []),
+    ...(preview.estimatedTotalCostEth
+      ? [`Estimated Total Cost: ${preview.estimatedTotalCostEth} ETH`]
+      : []),
+    ...(preview.walletBalanceEth
+      ? [
+          `Wallet Balance: ${preview.walletBalanceEth} ETH`,
+          `Funded Enough: ${preview.fundedEnough ? "yes" : "no"}`
+        ]
+      : [])
+  ].join("\n");
 }
 
 function normalizeMintJobMode(rawMode?: string): MintJobMode {
@@ -1380,6 +1739,766 @@ function formatMintJobList(jobs: MintJob[]) {
     .join("\n\n");
 }
 
+function formatMultiMintJob(job: MultiMintJob) {
+  return [
+    `Multi-Mint Job ID: ${job.jobId}`,
+    `Status: ${job.status}`,
+    `Mode: ${job.mode}`,
+    `Target: ${job.targetName}`,
+    `Target ID: ${job.targetId}`,
+    `Chain: ${job.chain}`,
+    `Contract: ${formatShortAddress(job.contractAddress)}`,
+    `Function: ${job.functionSignature}`,
+    `Qty: ${job.quantity}`,
+    `Price Each: ${job.priceEth} ETH`,
+    `Gas Strategy: ${formatGasStrategy(job.gasStrategy)}`,
+    `Wallet Count: ${job.walletLabels.length}`,
+    `Start: ${job.startTimeISO}`,
+    ...(job.endTimeISO ? [`End: ${job.endTimeISO}`] : []),
+    `Attempts: ${job.attempts}/${job.maxRetries}`,
+    `Retry Delay: ${job.retryDelayMs}ms`,
+    ...(job.lastCheckedAt ? [`Last Checked: ${job.lastCheckedAt}`] : []),
+    ...(job.safeErrorReason ? [`Reason: ${job.safeErrorReason}`] : []),
+    "",
+    "Wallet Results:",
+    ...job.childResults.map((child) =>
+      [
+        `- ${child.walletLabel}: ${child.status}`,
+        `  Address: ${formatShortAddress(child.walletAddress)}`,
+        ...(child.runId ? [`  Run ID: ${child.runId}`] : []),
+        ...(child.txHash ? [`  Tx: ${child.txHash}`] : []),
+        ...(child.safeErrorReason ? [`  Reason: ${child.safeErrorReason}`] : []),
+        `  Attempts: ${child.attempts}`
+      ].join("\n")
+    ),
+    "",
+    `Created: ${job.createdAt}`,
+    `Updated: ${job.updatedAt}`
+  ].join("\n");
+}
+
+function formatMultiMintJobList(jobs: MultiMintJob[]) {
+  if (jobs.length === 0) {
+    return "No active multi-mint jobs found.";
+  }
+
+  return jobs
+    .map((job, index) =>
+      [
+        `${index + 1}. ${job.targetName}`,
+        `Job ID: ${job.jobId}`,
+        `Chain: ${job.chain}`,
+        `Mode: ${job.mode}`,
+        `Status: ${job.status}`,
+        `Start: ${job.startTimeISO}`,
+        `Wallets: ${job.walletLabels.length}`,
+        `Attempts: ${job.attempts}/${job.maxRetries}`
+      ].join("\n")
+    )
+    .join("\n\n");
+}
+
+async function sendMultiMintJobAlert(job: MultiMintJob, message: string) {
+  try {
+    await bot.telegram.sendMessage(job.ownerTelegramId, message);
+  } catch (error) {
+    logSafeError("Multi-mint job alert failed", error);
+  }
+}
+
+async function createMultiMintJobForTarget(params: {
+  ownerTelegramId: string;
+  target: MintTarget;
+  walletLabels: string[];
+  startTimeISO: string;
+  mode: MintJobMode;
+}) {
+  const target = requireCompleteMintTarget(params.target);
+  const wallets = await getOwnedActiveWalletSummaries(
+    params.ownerTelegramId,
+    params.walletLabels
+  );
+  const targetSettings = getTargetMintTypeSettings(target);
+
+  return createMultiMintJob({
+    ownerTelegramId: params.ownerTelegramId,
+    targetId: target.targetId,
+    targetName: target.name,
+    chain: target.chain,
+    contractAddress: target.contractAddress,
+    functionSignature: target.functionSignature,
+    quantity: target.quantity,
+    priceEth: target.priceEth,
+    walletLabels: wallets.map((wallet) => wallet.label),
+    walletAddresses: wallets.map((wallet) => wallet.address),
+    gasStrategy: getTargetGasStrategy(target),
+    mode: params.mode,
+    startTimeISO: params.startTimeISO,
+    maxRetries: targetSettings.maxRetries,
+    retryDelayMs: targetSettings.retryDelayMs
+  });
+}
+
+async function runWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>
+) {
+  let cursor = 0;
+  const workers = Array.from(
+    { length: Math.min(Math.max(concurrency, 1), items.length) },
+    async () => {
+      while (cursor < items.length) {
+        const index = cursor;
+        cursor += 1;
+        await worker(items[index]!, index);
+      }
+    }
+  );
+
+  await Promise.all(workers);
+}
+
+function createSubmissionDelayGate(delayMs: number) {
+  let nextSubmissionAt = 0;
+  let chain = Promise.resolve();
+
+  return async () => {
+    let release!: () => void;
+    const previous = chain;
+    chain = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+
+    try {
+      const waitMs = Math.max(0, nextSubmissionAt - Date.now());
+
+      if (waitMs > 0) {
+        await sleep(waitMs);
+      }
+
+      nextSubmissionAt = Date.now() + delayMs;
+    } finally {
+      release();
+    }
+  };
+}
+
+type MultiMintWalletExecutionResult = {
+  walletLabel: string;
+  walletAddress: string;
+  status: "submitted" | "confirmed" | "failed" | "blocked";
+  runId?: string;
+  txHash?: string;
+  safeErrorReason?: string;
+};
+
+function getMultiMintSummaryStatus(results: MultiMintWalletExecutionResult[]) {
+  const confirmed = results.filter((result) => result.status === "confirmed").length;
+  const submitted = results.filter((result) => result.status === "submitted").length;
+  const failed = results.filter((result) => result.status === "failed").length;
+  const blocked = results.filter((result) => result.status === "blocked").length;
+
+  if (confirmed === results.length) {
+    return "confirmed";
+  }
+
+  if (confirmed > 0 || submitted > 0) {
+    return failed > 0 || blocked > 0 ? "partial" : "submitted";
+  }
+
+  if (blocked > 0 && failed === 0) {
+    return "blocked";
+  }
+
+  return "failed";
+}
+
+function formatMultiMintExecutionSummary(results: MultiMintWalletExecutionResult[]) {
+  const submitted = results.filter((result) => result.status === "submitted").length;
+  const confirmed = results.filter((result) => result.status === "confirmed").length;
+  const failed = results.filter((result) => result.status === "failed").length;
+  const blocked = results.filter((result) => result.status === "blocked").length;
+
+  return [
+    `Submitted: ${submitted}`,
+    `Confirmed: ${confirmed}`,
+    `Failed: ${failed}`,
+    `Blocked: ${blocked}`,
+    "",
+    "Per-wallet results:",
+    ...results.map((result) =>
+      [
+        `- ${result.walletLabel}: ${result.status}`,
+        `  Address: ${formatShortAddress(result.walletAddress)}`,
+        ...(result.runId ? [`  Run ID: ${result.runId}`] : []),
+        ...(result.txHash ? [`  Tx: ${result.txHash}`] : []),
+        ...(result.safeErrorReason ? [`  Reason: ${result.safeErrorReason}`] : [])
+      ].join("\n")
+    )
+  ].join("\n");
+}
+
+async function executeMultiMint(params: {
+  ownerTelegramId: string;
+  targetId: string;
+  targetName: string;
+  chain: MintChain;
+  contractAddress: string;
+  functionSignature: SupportedMintFunctionSignature;
+  quantity: number;
+  priceEth: string;
+  walletLabels: string[];
+  walletAddresses: string[];
+  gasStrategy: GasStrategy;
+  multiMintJobId?: string;
+  requireScheduledMainnetLock: boolean;
+  notify?: (message: string) => Promise<void>;
+}) {
+  if (params.chain === "mainnet" && !isMainnetMintingEnabled()) {
+    throw new Error(MAINNET_MINTING_DISABLED_MESSAGE);
+  }
+
+  if (
+    params.chain === "mainnet" &&
+    params.requireScheduledMainnetLock &&
+    !isScheduledMainnetMintingEnabled()
+  ) {
+    throw new Error(
+      "Scheduled mainnet multi-minting requires ALLOW_SCHEDULED_MAINNET_MINTING=true."
+    );
+  }
+
+  const results: MultiMintWalletExecutionResult[] = params.walletLabels.map(
+    (walletLabel, index) => ({
+      walletLabel,
+      walletAddress: params.walletAddresses[index]!,
+      status: "blocked" as const,
+      safeErrorReason: "not_started"
+    })
+  );
+  const delayGate = createSubmissionDelayGate(getMultiMintDelayMs());
+  const concurrency = getMultiMintConcurrency();
+
+  await auditMintAction({
+    ownerTelegramId: params.ownerTelegramId,
+    action: "multi_mint_started",
+    targetId: params.targetId,
+    multiMintJobId: params.multiMintJobId,
+    chain: params.chain,
+    contractAddress: params.contractAddress,
+    functionSignature: params.functionSignature,
+    quantity: params.quantity,
+    priceEth: params.priceEth,
+    gasStrategyMode: params.gasStrategy.mode,
+    status: "started",
+    reason: `wallets:${params.walletLabels.length};concurrency:${concurrency}`
+  });
+
+  await runWithConcurrency(params.walletLabels, concurrency, async (walletLabel, index) => {
+    const walletAddress = params.walletAddresses[index]!;
+    let run: MintRun | undefined;
+
+    try {
+      const preview = await previewMint({
+        ownerTelegramId: params.ownerTelegramId,
+        walletLabel,
+        contractAddress: params.contractAddress,
+        functionSignature: params.functionSignature,
+        quantity: params.quantity,
+        priceEth: params.priceEth,
+        chain: params.chain,
+        gasStrategy: params.gasStrategy
+      });
+
+      if (preview.walletAddress.toLowerCase() !== walletAddress.toLowerCase()) {
+        throw new Error("Wallet multi-mint snapshot no longer matches the saved wallet.");
+      }
+
+      run = createMintRun({
+        ownerTelegramId: params.ownerTelegramId,
+        targetId: params.targetId,
+        ...(params.multiMintJobId ? { multiMintJobId: params.multiMintJobId } : {}),
+        walletLabel: preview.walletLabel,
+        walletAddress: preview.walletAddress,
+        chain: preview.chain,
+        contractAddress: preview.contractAddress,
+        functionSignature: preview.functionSignature,
+        quantity: preview.quantity,
+        priceEth: preview.priceEth,
+        status: "pending"
+      });
+
+      if (params.multiMintJobId) {
+        updateMultiMintChildResult(
+          params.multiMintJobId,
+          params.ownerTelegramId,
+          walletLabel,
+          {
+            runId: run.runId,
+            attempts: 1
+          }
+        );
+      }
+
+      if (preview.gasEstimateFailed) {
+        const reason = preview.gasEstimateError || "gas_estimation_failed";
+        updateMintRunForOwner(run.runId, params.ownerTelegramId, {
+          status: "blocked",
+          errorReason: reason
+        });
+        if (params.multiMintJobId) {
+          updateMultiMintChildResult(
+            params.multiMintJobId,
+            params.ownerTelegramId,
+            walletLabel,
+            {
+              status: "blocked",
+              safeErrorReason: reason
+            }
+          );
+        }
+        results[index] = {
+          walletLabel,
+          walletAddress: preview.walletAddress,
+          status: "blocked",
+          runId: run.runId,
+          safeErrorReason: reason
+        };
+        await auditMintAction({
+          ownerTelegramId: params.ownerTelegramId,
+          action: "multi_mint_wallet_blocked",
+          targetId: params.targetId,
+          multiMintJobId: params.multiMintJobId,
+          runId: run.runId,
+          walletLabel,
+          walletAddress: preview.walletAddress,
+          chain: params.chain,
+          contractAddress: params.contractAddress,
+          functionSignature: params.functionSignature,
+          quantity: params.quantity,
+          priceEth: params.priceEth,
+          gasStrategyMode: params.gasStrategy.mode,
+          status: "blocked",
+          reason
+        });
+        return;
+      }
+
+      if (preview.fundedEnough === false) {
+        const reason = "insufficient_native_balance_for_estimated_total";
+        updateMintRunForOwner(run.runId, params.ownerTelegramId, {
+          status: "blocked",
+          errorReason: reason
+        });
+        if (params.multiMintJobId) {
+          updateMultiMintChildResult(
+            params.multiMintJobId,
+            params.ownerTelegramId,
+            walletLabel,
+            {
+              status: "blocked",
+              safeErrorReason: reason
+            }
+          );
+        }
+        results[index] = {
+          walletLabel,
+          walletAddress: preview.walletAddress,
+          status: "blocked",
+          runId: run.runId,
+          safeErrorReason: reason
+        };
+        await auditMintAction({
+          ownerTelegramId: params.ownerTelegramId,
+          action: "multi_mint_wallet_blocked",
+          targetId: params.targetId,
+          multiMintJobId: params.multiMintJobId,
+          runId: run.runId,
+          walletLabel,
+          walletAddress: preview.walletAddress,
+          chain: params.chain,
+          contractAddress: params.contractAddress,
+          functionSignature: params.functionSignature,
+          quantity: params.quantity,
+          priceEth: params.priceEth,
+          gasStrategyMode: params.gasStrategy.mode,
+          status: "blocked",
+          reason
+        });
+        return;
+      }
+
+      await delayGate();
+      const submitted = await submitMintTransaction({
+        ownerTelegramId: params.ownerTelegramId,
+        walletLabel,
+        contractAddress: params.contractAddress,
+        functionSignature: params.functionSignature,
+        quantity: params.quantity,
+        priceEth: params.priceEth,
+        chain: params.chain,
+        gasStrategy: params.gasStrategy
+      });
+
+      updateMintRunForOwner(run.runId, params.ownerTelegramId, {
+        status: "submitted",
+        txHash: submitted.txHash
+      });
+      if (params.multiMintJobId) {
+        updateMultiMintChildResult(
+          params.multiMintJobId,
+          params.ownerTelegramId,
+          walletLabel,
+          {
+            status: "submitted",
+            runId: run.runId,
+            txHash: submitted.txHash
+          }
+        );
+      }
+      results[index] = {
+        walletLabel,
+        walletAddress: submitted.walletAddress,
+        status: "submitted",
+        runId: run.runId,
+        txHash: submitted.txHash
+      };
+      await auditMintAction({
+        ownerTelegramId: params.ownerTelegramId,
+        action: "multi_mint_wallet_submitted",
+        targetId: params.targetId,
+        multiMintJobId: params.multiMintJobId,
+        runId: run.runId,
+        walletLabel,
+        walletAddress: submitted.walletAddress,
+        chain: params.chain,
+        contractAddress: params.contractAddress,
+        functionSignature: params.functionSignature,
+        quantity: params.quantity,
+        priceEth: params.priceEth,
+        gasStrategyMode: params.gasStrategy.mode,
+        txHash: submitted.txHash,
+        status: "submitted"
+      });
+      await params.notify?.(
+        `✅ Multi-mint tx sent for ${walletLabel}.
+
+Run ID: ${run.runId}
+Tx:
+${submitted.txHash}`
+      );
+
+      const confirmation = await waitForMintConfirmation(
+        params.chain,
+        submitted.txHash
+      );
+
+      if (confirmation.status === "confirmed") {
+        updateMintRunForOwner(run.runId, params.ownerTelegramId, {
+          status: "confirmed",
+          confirmedAt: new Date().toISOString()
+        });
+        if (params.multiMintJobId) {
+          updateMultiMintChildResult(
+            params.multiMintJobId,
+            params.ownerTelegramId,
+            walletLabel,
+            {
+              status: "confirmed",
+              txHash: submitted.txHash
+            }
+          );
+        }
+        results[index] = {
+          walletLabel,
+          walletAddress: submitted.walletAddress,
+          status: "confirmed",
+          runId: run.runId,
+          txHash: submitted.txHash
+        };
+        await auditMintAction({
+          ownerTelegramId: params.ownerTelegramId,
+          action: "multi_mint_wallet_confirmed",
+          targetId: params.targetId,
+          multiMintJobId: params.multiMintJobId,
+          runId: run.runId,
+          walletLabel,
+          walletAddress: submitted.walletAddress,
+          chain: params.chain,
+          contractAddress: params.contractAddress,
+          functionSignature: params.functionSignature,
+          quantity: params.quantity,
+          priceEth: params.priceEth,
+          gasStrategyMode: params.gasStrategy.mode,
+          txHash: submitted.txHash,
+          status: "confirmed"
+        });
+        return;
+      }
+
+      const reason =
+        confirmation.status === "timeout"
+          ? "confirmation_timeout"
+          : "transaction_failed";
+      updateMintRunForOwner(run.runId, params.ownerTelegramId, {
+        status: confirmation.status === "timeout" ? "submitted" : "failed",
+        errorReason: reason
+      });
+      if (params.multiMintJobId) {
+        updateMultiMintChildResult(
+          params.multiMintJobId,
+          params.ownerTelegramId,
+          walletLabel,
+          {
+            status: confirmation.status === "timeout" ? "submitted" : "failed",
+            txHash: submitted.txHash,
+            safeErrorReason: reason
+          }
+        );
+      }
+      results[index] = {
+        walletLabel,
+        walletAddress: submitted.walletAddress,
+        status: confirmation.status === "timeout" ? "submitted" : "failed",
+        runId: run.runId,
+        txHash: submitted.txHash,
+        safeErrorReason: reason
+      };
+    } catch (error) {
+      const reason = getSafeErrorMessage(error);
+      logSafeError(`Multi-mint wallet failed (${walletLabel})`, error);
+      run =
+        run ||
+        createMintRun({
+          ownerTelegramId: params.ownerTelegramId,
+          targetId: params.targetId,
+          ...(params.multiMintJobId ? { multiMintJobId: params.multiMintJobId } : {}),
+          walletLabel,
+          walletAddress,
+          chain: params.chain,
+          contractAddress: params.contractAddress,
+          functionSignature: params.functionSignature,
+          quantity: params.quantity,
+          priceEth: params.priceEth,
+          status: "failed",
+          errorReason: reason
+        });
+      updateMintRunForOwner(run.runId, params.ownerTelegramId, {
+        status: "failed",
+        errorReason: reason
+      });
+      if (params.multiMintJobId) {
+        updateMultiMintChildResult(
+          params.multiMintJobId,
+          params.ownerTelegramId,
+          walletLabel,
+          {
+            status: "failed",
+            runId: run.runId,
+            safeErrorReason: reason,
+            attempts: 1
+          }
+        );
+      }
+      results[index] = {
+        walletLabel,
+        walletAddress,
+        status: "failed",
+        runId: run.runId,
+        safeErrorReason: reason
+      };
+      await auditMintAction({
+        ownerTelegramId: params.ownerTelegramId,
+        action: "multi_mint_wallet_failed",
+        targetId: params.targetId,
+        multiMintJobId: params.multiMintJobId,
+        runId: run.runId,
+        walletLabel,
+        walletAddress,
+        chain: params.chain,
+        contractAddress: params.contractAddress,
+        functionSignature: params.functionSignature,
+        quantity: params.quantity,
+        priceEth: params.priceEth,
+        gasStrategyMode: params.gasStrategy.mode,
+        status: "failed",
+        reason
+      });
+    }
+  });
+
+  const status = getMultiMintSummaryStatus(results);
+
+  if (params.multiMintJobId) {
+    const job = getMultiMintJobForOwner(
+      params.multiMintJobId,
+      params.ownerTelegramId
+    );
+    updateMultiMintJobForOwner(params.multiMintJobId, params.ownerTelegramId, {
+      status: summarizeMultiMintJobStatus({
+        ...job,
+        childResults: getMultiMintJobForOwner(
+          params.multiMintJobId,
+          params.ownerTelegramId
+        ).childResults
+      }),
+      safeErrorReason: status === "confirmed" ? "" : status
+    });
+  }
+
+  await auditMintAction({
+    ownerTelegramId: params.ownerTelegramId,
+    action: "multi_mint_completed",
+    targetId: params.targetId,
+    multiMintJobId: params.multiMintJobId,
+    chain: params.chain,
+    contractAddress: params.contractAddress,
+    functionSignature: params.functionSignature,
+    quantity: params.quantity,
+    priceEth: params.priceEth,
+    gasStrategyMode: params.gasStrategy.mode,
+    status
+  });
+
+  return { status, results };
+}
+
+async function previewGasForTargetWallet(params: {
+  ownerTelegramId: string;
+  target: MintTarget;
+  walletLabel: string;
+}) {
+  const target = requireCompleteMintTarget(params.target);
+  return previewMint({
+    ownerTelegramId: params.ownerTelegramId,
+    walletLabel: params.walletLabel,
+    contractAddress: target.contractAddress,
+    functionSignature: target.functionSignature,
+    quantity: target.quantity,
+    priceEth: target.priceEth,
+    chain: target.chain,
+    gasStrategy: getTargetGasStrategy(target)
+  });
+}
+
+async function getMultiMintPreflight(params: {
+  ownerTelegramId: string;
+  target: MintTarget;
+  walletLabels: string[];
+}) {
+  const previews: MintPreviewResult[] = [];
+  const failures: Array<{ walletLabel: string; reason: string }> = [];
+
+  for (const walletLabel of params.walletLabels) {
+    try {
+      const preview = await previewGasForTargetWallet({
+        ownerTelegramId: params.ownerTelegramId,
+        target: params.target,
+        walletLabel
+      });
+      previews.push(preview);
+
+      if (preview.gasEstimateFailed) {
+        failures.push({
+          walletLabel,
+          reason: preview.gasEstimateError || "gas_estimation_failed"
+        });
+      } else if (preview.fundedEnough === false) {
+        failures.push({
+          walletLabel,
+          reason: "insufficient_native_balance_for_estimated_total"
+        });
+      }
+    } catch (error) {
+      failures.push({
+        walletLabel,
+        reason: getSafeErrorMessage(error)
+      });
+    }
+  }
+
+  return { previews, failures };
+}
+
+function formatMultiGasPreview(previews: MintPreviewResult[], failures: Array<{ walletLabel: string; reason: string }>) {
+  const lines = [
+    "Multi Gas Preview",
+    "",
+    ...previews.map((preview) =>
+      [
+        `Wallet: ${preview.walletLabel}`,
+        `Address: ${formatShortAddress(preview.walletAddress)}`,
+        `Balance: ${preview.walletBalanceEth || "Unknown"} ETH`,
+        `Estimated Total Cost: ${preview.estimatedTotalCostEth || "Not available"} ETH`,
+        `Funded Enough: ${preview.fundedEnough === undefined ? "unknown" : preview.fundedEnough ? "yes" : "no"}`,
+        `Gas: ${preview.gasEstimate || "Not available"}`,
+        ...(preview.gasEstimateError ? [`Reason: ${preview.gasEstimateError}`] : [])
+      ].join("\n")
+    )
+  ];
+
+  if (failures.length > 0) {
+    lines.push(
+      "",
+      "Issues:",
+      ...failures.map((failure) => `- ${failure.walletLabel}: ${failure.reason}`)
+    );
+  }
+
+  lines.push("", "No transaction was sent.");
+  return lines.join("\n\n");
+}
+
+type MultiMintJobReadinessResult = {
+  ready: boolean;
+  status: "ready" | "not_ready" | "blocked";
+  reason?: string;
+};
+
+async function runMultiMintJobReadinessCheck(
+  job: MultiMintJob,
+  options: { countAttempt?: boolean } = {}
+): Promise<MultiMintJobReadinessResult> {
+  const checkedAt = new Date().toISOString();
+
+  try {
+    const target = getMintTargetForOwner(job.targetId, job.ownerTelegramId);
+    const preflight = await getMultiMintPreflight({
+      ownerTelegramId: job.ownerTelegramId,
+      target,
+      walletLabels: job.walletLabels
+    });
+    const allBlocked =
+      preflight.previews.length === 0 ||
+      preflight.failures.length === job.walletLabels.length;
+    const status = allBlocked ? "blocked" : "ready";
+    const reason = preflight.failures[0]?.reason;
+
+    updateMultiMintJobForOwner(job.jobId, job.ownerTelegramId, {
+      lastCheckedAt: checkedAt,
+      ...(options.countAttempt ? { attempts: job.attempts + 1 } : {}),
+      ...(reason ? { safeErrorReason: reason } : {})
+    });
+
+    return {
+      ready: !allBlocked,
+      status,
+      ...(reason ? { reason } : {})
+    };
+  } catch (error) {
+    const reason = getSafeErrorMessage(error);
+    updateMultiMintJobForOwner(job.jobId, job.ownerTelegramId, {
+      lastCheckedAt: checkedAt,
+      ...(options.countAttempt ? { attempts: job.attempts + 1 } : {}),
+      safeErrorReason: reason
+    });
+
+    return { ready: false, status: "not_ready", reason };
+  }
+}
+
 async function sendMintJobAlert(job: MintJob, message: string) {
   try {
     await bot.telegram.sendMessage(job.ownerTelegramId, message);
@@ -1446,7 +2565,8 @@ async function runMintJobReadinessCheck(
       functionSignature: job.functionSignature,
       quantity: job.quantity,
       priceEth: job.priceEth,
-      chain: job.chain
+      chain: job.chain,
+      gasStrategy: getTargetGasStrategy(target)
     });
 
     if (preview.walletAddress.toLowerCase() !== job.walletAddress.toLowerCase()) {
@@ -2046,6 +3166,7 @@ function formatMintRun(run: MintRun) {
     `Run ID: ${run.runId}`,
     ...(run.targetId ? [`Target ID: ${run.targetId}`] : []),
     ...(run.jobId ? [`Job ID: ${run.jobId}`] : []),
+    ...(run.multiMintJobId ? [`Multi-Mint Job ID: ${run.multiMintJobId}`] : []),
     `Status: ${run.status}`,
     `Wallet: ${run.walletLabel}`,
     `Address: ${formatShortAddress(run.walletAddress)}`,
@@ -2274,6 +3395,112 @@ async function validateMintJobCancelConfirmation(
   return { session, actorTelegramId };
 }
 
+function isMultiMintJobCancelExpired(session: MultiMintJobCancelConfirmation) {
+  const expiresAtMs = Date.parse(session.expiresAt);
+  return !Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now();
+}
+
+function cleanupMultiMintJobCancelConfirmations() {
+  for (const [sessionId, session] of multiMintJobCancelConfirmations.entries()) {
+    if (session.status === "active" && isMultiMintJobCancelExpired(session)) {
+      session.status = "expired";
+    }
+
+    const expiresAtMs = Date.parse(session.expiresAt);
+    const cleanupAfterMs = Number.isFinite(expiresAtMs)
+      ? expiresAtMs + MULTI_MINT_JOB_CANCEL_TTL_MS
+      : Date.now();
+
+    if (cleanupAfterMs <= Date.now()) {
+      multiMintJobCancelConfirmations.delete(sessionId);
+    }
+  }
+}
+
+function createMultiMintJobCancelConfirmation(params: {
+  ownerTelegramId: string;
+  jobId: string;
+  targetName: string;
+}) {
+  cleanupMultiMintJobCancelConfirmations();
+
+  const createdAt = new Date();
+  const session: MultiMintJobCancelConfirmation = {
+    sessionId: randomUUID(),
+    ownerTelegramId: params.ownerTelegramId,
+    jobId: params.jobId,
+    targetName: params.targetName,
+    createdAt: createdAt.toISOString(),
+    expiresAt: new Date(
+      createdAt.getTime() + MULTI_MINT_JOB_CANCEL_TTL_MS
+    ).toISOString(),
+    status: "active"
+  };
+
+  multiMintJobCancelConfirmations.set(session.sessionId, session);
+  return session;
+}
+
+async function validateMultiMintJobCancelConfirmation(
+  ctx: Context,
+  sessionId: string
+) {
+  cleanupMultiMintJobCancelConfirmations();
+
+  const actorTelegramId = getTelegramUserId(ctx);
+
+  if (!actorTelegramId) {
+    await ctx.reply("❌ Could not verify your Telegram account for this action.");
+    return null;
+  }
+
+  const session = multiMintJobCancelConfirmations.get(sessionId);
+
+  if (!session) {
+    await ctx.reply("This multi-mint job cancellation has expired. Run /cancelmultimintjob again.");
+    return null;
+  }
+
+  if (session.ownerTelegramId !== actorTelegramId) {
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "multi_mint_job_blocked",
+      multiMintJobId: session.jobId,
+      status: session.status,
+      reason: `wrong_user:actor=${actorTelegramId}`
+    });
+    await ctx.reply("You cannot use this multi-mint job cancellation.");
+    return null;
+  }
+
+  if (session.status === "expired" || isMultiMintJobCancelExpired(session)) {
+    session.status = "expired";
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "multi_mint_job_blocked",
+      multiMintJobId: session.jobId,
+      status: session.status,
+      reason: "expired"
+    });
+    await ctx.reply("This multi-mint job cancellation has expired. Run /cancelmultimintjob again.");
+    return null;
+  }
+
+  if (session.status === "used" || session.status === "cancelled") {
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "multi_mint_job_blocked",
+      multiMintJobId: session.jobId,
+      status: session.status,
+      reason: "already_used_or_cancelled"
+    });
+    await ctx.reply("This multi-mint job cancellation has already been used or cancelled.");
+    return null;
+  }
+
+  return { session, actorTelegramId };
+}
+
 function shouldCheckMintJob(job: MintJob, nowMs = Date.now()) {
   if (!["scheduled", "watching", "ready"].includes(job.status)) {
     return false;
@@ -2449,6 +3676,7 @@ Reason: Mainnet scheduled auto-minting requires ALLOW_MAINNET_MINTING=true and A
   });
 
   try {
+    const target = getMintTargetForOwner(job.targetId, job.ownerTelegramId);
     const submitted = await submitMintTransaction({
       ownerTelegramId: job.ownerTelegramId,
       walletLabel: job.walletLabel,
@@ -2456,7 +3684,8 @@ Reason: Mainnet scheduled auto-minting requires ALLOW_MAINNET_MINTING=true and A
       functionSignature: job.functionSignature,
       quantity: job.quantity,
       priceEth: job.priceEth,
-      chain: job.chain
+      chain: job.chain,
+      gasStrategy: getTargetGasStrategy(target)
     });
     updateMintRunForOwner(run.runId, job.ownerTelegramId, {
       status: "submitted",
@@ -2675,6 +3904,218 @@ Wallet: ${readyJob.walletLabel}`
   }
 }
 
+function shouldCheckMultiMintJob(job: MultiMintJob, nowMs = Date.now()) {
+  if (!["scheduled", "watching", "ready"].includes(job.status)) {
+    return false;
+  }
+
+  const startMs = Date.parse(job.startTimeISO);
+
+  if (!Number.isFinite(startMs) || startMs > nowMs) {
+    return false;
+  }
+
+  if (job.status === "ready" && job.mode === "watch") {
+    return false;
+  }
+
+  if (!job.lastCheckedAt) {
+    return true;
+  }
+
+  const lastCheckedMs = Date.parse(job.lastCheckedAt);
+
+  if (!Number.isFinite(lastCheckedMs)) {
+    return true;
+  }
+
+  return lastCheckedMs + job.retryDelayMs <= nowMs;
+}
+
+async function markMultiMintJobTerminal(params: {
+  job: MultiMintJob;
+  status: Extract<MultiMintJobStatus, "failed" | "blocked" | "expired">;
+  auditAction: string;
+  reason: string;
+}) {
+  const updated = updateMultiMintJobForOwner(
+    params.job.jobId,
+    params.job.ownerTelegramId,
+    {
+      status: params.status,
+      safeErrorReason: params.reason
+    }
+  );
+
+  await auditMintAction({
+    ownerTelegramId: updated.ownerTelegramId,
+    action: params.auditAction,
+    targetId: updated.targetId,
+    multiMintJobId: updated.jobId,
+    chain: updated.chain,
+    contractAddress: updated.contractAddress,
+    functionSignature: updated.functionSignature,
+    quantity: updated.quantity,
+    priceEth: updated.priceEth,
+    gasStrategyMode: updated.gasStrategy.mode,
+    status: updated.status,
+    reason: params.reason
+  });
+  await sendMultiMintJobAlert(
+    updated,
+    `Multi-mint job ${params.status}.
+
+Job ID: ${updated.jobId}
+Target: ${updated.targetName}
+Reason: ${params.reason}`
+  );
+}
+
+async function executeAutoMultiMintJob(job: MultiMintJob) {
+  if (
+    job.chain === "mainnet" &&
+    (!isMainnetMintingEnabled() || !isScheduledMainnetMintingEnabled())
+  ) {
+    await markMultiMintJobTerminal({
+      job,
+      status: "blocked",
+      auditAction: "multi_mint_job_blocked",
+      reason: "scheduled_mainnet_minting_disabled"
+    });
+    return;
+  }
+
+  const updated = updateMultiMintJobForOwner(job.jobId, job.ownerTelegramId, {
+    status: "submitted"
+  });
+  const result = await executeMultiMint({
+    ownerTelegramId: updated.ownerTelegramId,
+    targetId: updated.targetId,
+    targetName: updated.targetName,
+    chain: updated.chain,
+    contractAddress: updated.contractAddress,
+    functionSignature: updated.functionSignature,
+    quantity: updated.quantity,
+    priceEth: updated.priceEth,
+    walletLabels: updated.walletLabels,
+    walletAddresses: updated.walletAddresses,
+    gasStrategy: updated.gasStrategy,
+    multiMintJobId: updated.jobId,
+    requireScheduledMainnetLock: true,
+    notify: (message) => sendMultiMintJobAlert(updated, message)
+  });
+  const finalJob = updateMultiMintJobForOwner(updated.jobId, updated.ownerTelegramId, {
+    status: result.status as MultiMintJobStatus,
+    safeErrorReason: result.status === "confirmed" ? "" : result.status
+  });
+
+  await auditMintAction({
+    ownerTelegramId: finalJob.ownerTelegramId,
+    action:
+      finalJob.status === "confirmed"
+        ? "multi_mint_job_confirmed"
+        : finalJob.status === "blocked"
+          ? "multi_mint_job_blocked"
+          : finalJob.status === "failed"
+            ? "multi_mint_job_failed"
+            : "multi_mint_completed",
+    targetId: finalJob.targetId,
+    multiMintJobId: finalJob.jobId,
+    chain: finalJob.chain,
+    contractAddress: finalJob.contractAddress,
+    functionSignature: finalJob.functionSignature,
+    quantity: finalJob.quantity,
+    priceEth: finalJob.priceEth,
+    gasStrategyMode: finalJob.gasStrategy.mode,
+    status: finalJob.status
+  });
+  await sendMultiMintJobAlert(
+    finalJob,
+    `Multi-mint job finished.
+
+Job ID: ${finalJob.jobId}
+Status: ${finalJob.status}
+
+${formatMultiMintExecutionSummary(result.results)}`
+  );
+}
+
+async function processMultiMintJob(job: MultiMintJob) {
+  const nowMs = Date.now();
+
+  if (job.endTimeISO) {
+    const endMs = Date.parse(job.endTimeISO);
+
+    if (Number.isFinite(endMs) && endMs <= nowMs) {
+      await markMultiMintJobTerminal({
+        job,
+        status: "expired",
+        auditAction: "multi_mint_job_failed",
+        reason: "job_end_time_passed"
+      });
+      return;
+    }
+  }
+
+  if (job.status === "scheduled") {
+    job = updateMultiMintJobForOwner(job.jobId, job.ownerTelegramId, {
+      status: "watching"
+    });
+  }
+
+  const readiness = await runMultiMintJobReadinessCheck(job, {
+    countAttempt: true
+  });
+  const updated = getMultiMintJobForOwner(job.jobId, job.ownerTelegramId);
+
+  if (readiness.ready) {
+    if (updated.mode === "watch") {
+      const readyJob = updateMultiMintJobForOwner(
+        updated.jobId,
+        updated.ownerTelegramId,
+        { status: "ready" }
+      );
+      await auditMintAction({
+        ownerTelegramId: readyJob.ownerTelegramId,
+        action: "multi_mint_job_ready",
+        targetId: readyJob.targetId,
+        multiMintJobId: readyJob.jobId,
+        chain: readyJob.chain,
+        contractAddress: readyJob.contractAddress,
+        functionSignature: readyJob.functionSignature,
+        quantity: readyJob.quantity,
+        priceEth: readyJob.priceEth,
+        gasStrategyMode: readyJob.gasStrategy.mode,
+        status: readyJob.status
+      });
+      await sendMultiMintJobAlert(
+        readyJob,
+        `Multi-wallet mint target is ready. Use /runmultimintjob ${readyJob.jobId} to confirm.
+
+Job ID: ${readyJob.jobId}
+Target: ${readyJob.targetName}
+Wallets: ${readyJob.walletLabels.join(", ")}`
+      );
+      return;
+    }
+
+    await executeAutoMultiMintJob(updated);
+    return;
+  }
+
+  if (readiness.status === "blocked" || updated.attempts > updated.maxRetries) {
+    await markMultiMintJobTerminal({
+      job: updated,
+      status: readiness.status === "blocked" ? "blocked" : "failed",
+      auditAction:
+        readiness.status === "blocked"
+          ? "multi_mint_job_blocked"
+          : "multi_mint_job_failed",
+      reason: readiness.reason || "retry_limit_exhausted"
+    });
+  }
+}
+
 async function runMintSchedulerTick() {
   if (mintSchedulerTickRunning) {
     return;
@@ -2696,6 +4137,20 @@ async function runMintSchedulerTick() {
         logSafeError("Mint scheduler job failed", error);
       }
     }
+
+    const multiJobs = listResumableMultiMintJobs();
+
+    for (const job of multiJobs) {
+      if (!shouldCheckMultiMintJob(job)) {
+        continue;
+      }
+
+      try {
+        await processMultiMintJob(job);
+      } catch (error) {
+        logSafeError("Mint scheduler multi-job failed", error);
+      }
+    }
   } catch (error) {
     logSafeError("Mint scheduler tick failed", error);
   } finally {
@@ -2711,6 +4166,7 @@ function startMintScheduler() {
 
     const pollMs = getMintSchedulerPollMs();
     const jobs = listResumableMintJobs();
+    const multiJobs = listResumableMultiMintJobs();
 
     for (const job of jobs) {
       void auditMintAction({
@@ -2726,6 +4182,22 @@ function startMintScheduler() {
         quantity: job.quantity,
         priceEth: job.priceEth,
         mintType: job.mintType,
+        status: job.status
+      });
+    }
+
+    for (const job of multiJobs) {
+      void auditMintAction({
+        ownerTelegramId: job.ownerTelegramId,
+        action: "mint_job_resumed",
+        targetId: job.targetId,
+        multiMintJobId: job.jobId,
+        chain: job.chain,
+        contractAddress: job.contractAddress,
+        functionSignature: job.functionSignature,
+        quantity: job.quantity,
+        priceEth: job.priceEth,
+        gasStrategyMode: job.gasStrategy.mode,
         status: job.status
       });
     }
@@ -4361,6 +5833,7 @@ bot.command("checkminteligibility", async (ctx) => {
     const target = requireCompleteMintTarget(
       getMintTargetForOwner(targetId, ownerTelegramId)
     );
+    const gasStrategy = getTargetGasStrategy(target);
     const preview = await previewMint({
       ownerTelegramId,
       walletLabel,
@@ -4368,7 +5841,8 @@ bot.command("checkminteligibility", async (ctx) => {
       functionSignature: target.functionSignature,
       quantity: target.quantity,
       priceEth: target.priceEth,
-      chain: target.chain
+      chain: target.chain,
+      gasStrategy
     });
 
     await auditMintAction({
@@ -4687,6 +6161,364 @@ bot.command("refreshtarget", async (ctx) => {
     logSafeError("Could not refresh mint target", error);
     await ctx.reply(`❌ Could not refresh mint target.\n\nReason:\n${getSafeErrorMessage(error)}`);
   }
+});
+
+bot.command("setgas", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const targetId = parts[1]?.trim();
+
+  if (!targetId || !parts[2]) {
+    await ctx.reply(
+      "Use:\n/setgas targetId auto\n/setgas targetId standard\n/setgas targetId fast\n/setgas targetId custom 25 2"
+    );
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const gasStrategy = parseGasStrategyInput(parts, 2);
+    const target = updateMintTargetGasStrategyForOwner(
+      targetId,
+      ownerTelegramId,
+      { gasStrategy }
+    );
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "gas_strategy_updated",
+      targetId: target.targetId,
+      chain: target.chain,
+      contractAddress: target.contractAddress,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      gasStrategyMode: target.gasStrategy?.mode,
+      status: target.status
+    });
+
+    await ctx.reply(
+      `✅ Gas strategy updated.
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+Gas Strategy: ${formatGasStrategy(target.gasStrategy)}
+
+No transaction was sent.`
+    );
+  } catch (error) {
+    logSafeError("Could not set gas strategy", error);
+    await ctx.reply(`❌ Could not set gas strategy.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("gaspreview", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const targetId = parts[1]?.trim();
+  const walletLabel = parts[2]?.trim();
+
+  if (!targetId || !walletLabel) {
+    await ctx.reply("Use:\n/gaspreview targetId wallet1");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const target = requireCompleteMintTarget(
+      getMintTargetForOwner(targetId, ownerTelegramId)
+    );
+    const preview = await previewGasForTargetWallet({
+      ownerTelegramId,
+      target,
+      walletLabel
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "gas_preview_requested",
+      walletLabel: preview.walletLabel,
+      walletAddress: preview.walletAddress,
+      targetId: target.targetId,
+      chain: preview.chain,
+      contractAddress: preview.contractAddress,
+      functionSignature: preview.functionSignature,
+      quantity: preview.quantity,
+      priceEth: preview.priceEth,
+      gasStrategyMode: preview.gasStrategyMode,
+      status: preview.gasEstimateFailed ? "failed" : "previewed",
+      ...(preview.gasEstimateError ? { reason: preview.gasEstimateError } : {})
+    });
+
+    await ctx.reply(
+      `Gas Preview
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+Wallet: ${preview.walletLabel}
+Address: ${formatShortAddress(preview.walletAddress)}
+Chain: ${preview.chain}
+Contract: ${formatShortAddress(preview.contractAddress)}
+Function: ${preview.functionSignature}
+Quantity: ${preview.quantity}
+Mint Price: ${preview.totalCostEth} ETH
+
+${formatGasFields(preview)}
+
+No transaction was sent.${
+        preview.gasEstimateFailed
+          ? `\n\nGas estimation failed.\nReason: ${preview.gasEstimateError || "Unknown"}`
+          : ""
+      }`
+    );
+  } catch (error) {
+    logSafeError("Could not preview gas", error);
+    await ctx.reply(`❌ Could not preview gas.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("multigaspreview", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const targetId = parts[1]?.trim();
+  const rawWallets = parts[2]?.trim();
+
+  if (!targetId || !rawWallets) {
+    await ctx.reply("Use:\n/multigaspreview targetId wallet1,wallet2,wallet3");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const target = requireCompleteMintTarget(
+      getMintTargetForOwner(targetId, ownerTelegramId)
+    );
+    const walletLabels = parseWalletLabelList(rawWallets);
+    await getOwnedActiveWalletSummaries(ownerTelegramId, walletLabels);
+    const preflight = await getMultiMintPreflight({
+      ownerTelegramId,
+      target,
+      walletLabels
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "multi_gas_preview_requested",
+      targetId: target.targetId,
+      chain: target.chain,
+      contractAddress: target.contractAddress,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      gasStrategyMode: getTargetGasStrategy(target).mode,
+      status: preflight.failures.length > 0 ? "partial" : "previewed",
+      reason: `wallets:${walletLabels.length}`
+    });
+
+    await ctx.reply(
+      `${formatMultiGasPreview(preflight.previews, preflight.failures)}
+
+Gas Strategy: ${formatGasStrategy(getTargetGasStrategy(target))}
+Wallet Cap: ${getMaxMultiMintWallets()}
+Concurrency Cap: ${getMultiMintConcurrency()}`
+    );
+  } catch (error) {
+    logSafeError("Could not preview multi-wallet gas", error);
+    await ctx.reply(`❌ Could not preview multi-wallet gas.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("mintmulti", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const targetId = parts[1]?.trim();
+  const rawWallets = parts[2]?.trim();
+
+  if (!targetId || !rawWallets) {
+    await ctx.reply("Use:\n/mintmulti targetId wallet1,wallet2,wallet3");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const target = requireCompleteMintTarget(
+      getMintTargetForOwner(targetId, ownerTelegramId)
+    );
+    const walletLabels = parseWalletLabelList(rawWallets);
+    const wallets = await getOwnedActiveWalletSummaries(ownerTelegramId, walletLabels);
+    const preflight = await getMultiMintPreflight({
+      ownerTelegramId,
+      target,
+      walletLabels
+    });
+    const gasStrategy = getTargetGasStrategy(target);
+    const session = createMultiMintConfirmationSession({
+      ownerTelegramId,
+      targetId: target.targetId,
+      targetName: target.name,
+      chain: target.chain,
+      contractAddress: target.contractAddress,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      walletLabels: wallets.map((wallet) => wallet.label),
+      walletAddresses: wallets.map((wallet) => wallet.address),
+      gasStrategy
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "multi_mint_confirm_requested",
+      targetId: target.targetId,
+      chain: target.chain,
+      contractAddress: target.contractAddress,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      gasStrategyMode: gasStrategy.mode,
+      status: session.status,
+      reason: `wallets:${wallets.length}`
+    });
+
+    await ctx.reply(
+      `Multi-Mint Confirmation
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+Chain: ${target.chain}
+Contract: ${formatShortAddress(target.contractAddress)}
+Function: ${target.functionSignature}
+Quantity Per Wallet: ${target.quantity}
+Price Per Wallet: ${target.priceEth} ETH
+Gas Strategy: ${formatGasStrategy(gasStrategy)}
+Wallets (${wallets.length}): ${wallets.map((wallet) => wallet.label).join(", ")}
+Concurrency Cap: ${getMultiMintConcurrency()}
+Delay Between Submissions: ${getMultiMintDelayMs()}ms
+Minting Lock: ${getMintLockStatusText(target.chain)}
+
+Preflight:
+${formatMultiGasPreview(preflight.previews, preflight.failures)}
+
+This confirmation expires in 10 minutes.
+
+No transaction will be sent until you press Confirm Multi Mint.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Confirm Multi Mint", `mm:confirm:${session.sessionId}`)],
+        [Markup.button.callback("Cancel", `mm:cancel:${session.sessionId}`)]
+      ])
+    );
+  } catch (error) {
+    logSafeError("Could not create multi-mint confirmation", error);
+    await ctx.reply(`❌ Could not create multi-mint confirmation.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^mm:confirm:([0-9a-f-]+)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const sessionId = ctx.match[1];
+
+  if (!sessionId) {
+    await ctx.reply("This multi-mint confirmation has expired. Please create it again.");
+    return;
+  }
+
+  const validated = await validateMultiMintConfirmationSession(ctx, sessionId);
+
+  if (!validated) {
+    return;
+  }
+
+  const { session } = validated;
+  session.status = "used";
+
+  try {
+    await ctx.reply(
+      `Starting multi-mint.
+
+Target: ${session.targetName}
+Wallets: ${session.walletLabels.join(", ")}
+Concurrency: ${getMultiMintConcurrency()}
+Delay: ${getMultiMintDelayMs()}ms`
+    );
+    const result = await executeMultiMint({
+      ownerTelegramId: session.ownerTelegramId,
+      targetId: session.targetId,
+      targetName: session.targetName,
+      chain: session.chain,
+      contractAddress: session.contractAddress,
+      functionSignature: session.functionSignature,
+      quantity: session.quantity,
+      priceEth: session.priceEth,
+      walletLabels: session.walletLabels,
+      walletAddresses: session.walletAddresses,
+      gasStrategy: session.gasStrategy,
+      ...(session.multiMintJobId ? { multiMintJobId: session.multiMintJobId } : {}),
+      requireScheduledMainnetLock: false,
+      notify: async (message) => {
+        await ctx.reply(message);
+      }
+    });
+
+    await ctx.reply(
+      `Multi-mint finished.
+
+Status: ${result.status}
+
+${formatMultiMintExecutionSummary(result.results)}`
+    );
+  } catch (error) {
+    logSafeError("Multi-mint confirmation failed", error);
+    if (session.multiMintJobId) {
+      updateMultiMintJobForOwner(session.multiMintJobId, session.ownerTelegramId, {
+        status: "blocked",
+        safeErrorReason: getSafeErrorMessage(error)
+      });
+    }
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "multi_mint_wallet_blocked",
+      targetId: session.targetId,
+      multiMintJobId: session.multiMintJobId,
+      chain: session.chain,
+      contractAddress: session.contractAddress,
+      functionSignature: session.functionSignature,
+      quantity: session.quantity,
+      priceEth: session.priceEth,
+      gasStrategyMode: session.gasStrategy.mode,
+      status: "blocked",
+      reason: getSafeErrorMessage(error)
+    });
+    await ctx.reply(`❌ Multi-mint blocked.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^mm:cancel:([0-9a-f-]+)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const sessionId = ctx.match[1];
+
+  if (!sessionId) {
+    await ctx.reply("This multi-mint confirmation has expired. Please create it again.");
+    return;
+  }
+
+  const validated = await validateMultiMintConfirmationSession(ctx, sessionId);
+
+  if (!validated) {
+    return;
+  }
+
+  validated.session.status = "cancelled";
+  await ctx.reply(`Cancelled multi-mint confirmation for ${validated.session.targetName}.`);
 });
 
 bot.command("setminttype", async (ctx) => {
@@ -5134,6 +6966,8 @@ bot.command("runmintjob", async (ctx) => {
       return;
     }
 
+    const target = getMintTargetForOwner(job.targetId, ownerTelegramId);
+    const gasStrategy = getTargetGasStrategy(target);
     const preview = await previewMint({
       ownerTelegramId,
       walletLabel: job.walletLabel,
@@ -5141,7 +6975,8 @@ bot.command("runmintjob", async (ctx) => {
       functionSignature: job.functionSignature,
       quantity: job.quantity,
       priceEth: job.priceEth,
-      chain: job.chain
+      chain: job.chain,
+      gasStrategy
     });
     const run = createRunFromPreview(
       ownerTelegramId,
@@ -5164,7 +6999,8 @@ bot.command("runmintjob", async (ctx) => {
       priceEth: preview.priceEth,
       runId: run.runId,
       targetId: job.targetId,
-      jobId: job.jobId
+      jobId: job.jobId,
+      gasStrategy
     });
 
     await auditMintAction({
@@ -5215,6 +7051,7 @@ bot.command("schedulerstatus", async (ctx) => {
     const ownerTelegramId = getRequiredTelegramUserId(ctx);
     const rpcStatus = getMintRpcStatus();
     const activeJobs = listActiveMintJobsForOwner(ownerTelegramId);
+    const activeMultiJobs = listActiveMultiMintJobsForOwner(ownerTelegramId);
 
     await ctx.reply(
       `Scheduler Status
@@ -5224,6 +7061,10 @@ MINT_SCHEDULER_POLL_MS: ${getMintSchedulerPollMs()}
 ALLOW_MAINNET_MINTING: ${isMainnetMintingEnabled() ? "true" : "false"}
 ALLOW_SCHEDULED_MAINNET_MINTING: ${isScheduledMainnetMintingEnabled() ? "true" : "false"}
 Active jobs for you: ${activeJobs.length}
+Active multi-mint jobs for you: ${activeMultiJobs.length}
+MAX_MULTI_MINT_WALLETS: ${getMaxMultiMintWallets()}
+MAX_MULTI_MINT_CONCURRENCY: ${getMultiMintConcurrency()}
+MULTI_MINT_DELAY_MS: ${getMultiMintDelayMs()}
 ETH_MAINNET_RPC_URL configured: ${rpcStatus.mainnetRpcConfigured ? "yes" : "no"}
 SEPOLIA_RPC_URL or ETH_SEPOLIA_RPC_URL configured: ${rpcStatus.sepoliaRpcConfigured ? "yes" : "no"}
 
@@ -5232,6 +7073,333 @@ Scheduled Ethereum mainnet auto-minting requires both ALLOW_MAINNET_MINTING=true
   } catch (error) {
     logSafeError("Could not show scheduler status", error);
     await ctx.reply(`❌ Could not show scheduler status.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("schedulemintmulti", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const targetId = parts[1]?.trim();
+  const rawWallets = parts[2]?.trim();
+  const rawStartTime = parts[3]?.trim();
+  const rawMode = parts[4]?.trim();
+
+  if (!targetId || !rawWallets || !rawStartTime) {
+    await ctx.reply(
+      "Use:\n/schedulemintmulti targetId wallet1,wallet2 2026-07-04T18:00:00Z [watch|auto]"
+    );
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const target = getMintTargetForOwner(targetId, ownerTelegramId);
+    const missing = getMintTargetMissingFields(target);
+
+    if (missing.length > 0 || !target.functionSignature || target.priceEth === undefined) {
+      await ctx.reply(
+        `This target is incomplete. Missing contract address, function signature, price, or chain.\n\nMissing: ${missing.join(", ") || "unknown"}`
+      );
+      return;
+    }
+
+    const walletLabels = parseWalletLabelList(rawWallets);
+    const mode = normalizeMintJobMode(rawMode);
+    const startTimeISO = validateScheduleStartTime(rawStartTime);
+    const job = await createMultiMintJobForTarget({
+      ownerTelegramId,
+      target,
+      walletLabels,
+      startTimeISO,
+      mode
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "multi_mint_job_created",
+      targetId: job.targetId,
+      multiMintJobId: job.jobId,
+      chain: job.chain,
+      contractAddress: job.contractAddress,
+      functionSignature: job.functionSignature,
+      quantity: job.quantity,
+      priceEth: job.priceEth,
+      gasStrategyMode: job.gasStrategy.mode,
+      status: job.status,
+      reason: `wallets:${job.walletLabels.length}`
+    });
+
+    await ctx.reply(
+      `✅ Multi-mint job scheduled.
+
+${formatMultiMintJob(job)}
+
+Minting Lock: ${getMintLockStatusText(job.chain)}
+Scheduled Lock: ${getScheduledMintLockStatusText(job.chain, job.mode)}${
+        job.chain === "mainnet" && job.mode === "auto"
+          ? "\n\nAuto mainnet multi-minting requires both ALLOW_MAINNET_MINTING=true and ALLOW_SCHEDULED_MAINNET_MINTING=true."
+          : ""
+      }`
+    );
+  } catch (error) {
+    logSafeError("Could not schedule multi-mint", error);
+    await ctx.reply(`❌ Could not schedule multi-mint.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("runmultimintjob", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const jobId = parseCommandParts(ctx.message.text)[1]?.trim();
+
+  if (!jobId) {
+    await ctx.reply("Use:\n/runmultimintjob jobId");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const job = getMultiMintJobForOwner(jobId, ownerTelegramId);
+
+    if (["cancelled", "confirmed", "failed", "expired", "blocked"].includes(job.status)) {
+      await ctx.reply(`Multi-mint job is ${job.status} and cannot be run.`);
+      return;
+    }
+
+    const session = createMultiMintConfirmationSession({
+      ownerTelegramId,
+      targetId: job.targetId,
+      targetName: job.targetName,
+      chain: job.chain,
+      contractAddress: job.contractAddress,
+      functionSignature: job.functionSignature,
+      quantity: job.quantity,
+      priceEth: job.priceEth,
+      walletLabels: job.walletLabels,
+      walletAddresses: job.walletAddresses,
+      gasStrategy: job.gasStrategy,
+      multiMintJobId: job.jobId
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "multi_mint_confirm_requested",
+      targetId: job.targetId,
+      multiMintJobId: job.jobId,
+      chain: job.chain,
+      contractAddress: job.contractAddress,
+      functionSignature: job.functionSignature,
+      quantity: job.quantity,
+      priceEth: job.priceEth,
+      gasStrategyMode: job.gasStrategy.mode,
+      status: session.status,
+      reason: `wallets:${job.walletLabels.length}`
+    });
+
+    await ctx.reply(
+      `Multi-Mint Job Confirmation
+
+${formatMultiMintJob(job)}
+
+This confirmation expires in 10 minutes.
+
+No transaction will be sent until you press Confirm Multi Mint.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Confirm Multi Mint", `mm:confirm:${session.sessionId}`)],
+        [Markup.button.callback("Cancel", `mm:cancel:${session.sessionId}`)]
+      ])
+    );
+  } catch (error) {
+    logSafeError("Could not create multi-mint job confirmation", error);
+    await ctx.reply(`❌ Could not create multi-mint job confirmation.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("multimintjob", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const jobId = parseCommandParts(ctx.message.text)[1]?.trim();
+
+  if (!jobId) {
+    await ctx.reply("Use:\n/multimintjob jobId");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const job = getMultiMintJobForOwner(jobId, ownerTelegramId);
+    await ctx.reply(formatMultiMintJob(job));
+  } catch (error) {
+    logSafeError("Could not show multi-mint job", error);
+    await ctx.reply(`❌ Could not show multi-mint job.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("cancelmultimintjob", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const jobId = parseCommandParts(ctx.message.text)[1]?.trim();
+
+  if (!jobId) {
+    await ctx.reply("Use:\n/cancelmultimintjob jobId");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const job = getMultiMintJobForOwner(jobId, ownerTelegramId);
+
+    if (["cancelled", "confirmed", "failed", "expired", "blocked"].includes(job.status)) {
+      await ctx.reply(`Multi-mint job is already ${job.status}.`);
+      return;
+    }
+
+    const session = createMultiMintJobCancelConfirmation({
+      ownerTelegramId,
+      jobId: job.jobId,
+      targetName: job.targetName
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "multi_mint_job_cancel_requested",
+      targetId: job.targetId,
+      multiMintJobId: job.jobId,
+      chain: job.chain,
+      contractAddress: job.contractAddress,
+      functionSignature: job.functionSignature,
+      quantity: job.quantity,
+      priceEth: job.priceEth,
+      gasStrategyMode: job.gasStrategy.mode,
+      status: job.status
+    });
+
+    await ctx.reply(
+      `Cancel multi-mint job?
+
+Job ID: ${job.jobId}
+Target: ${job.targetName}
+
+This confirmation expires in 10 minutes.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Confirm Cancel", `mmj:cancel_confirm:${session.sessionId}`)],
+        [Markup.button.callback("Keep Job", `mmj:cancel_cancel:${session.sessionId}`)]
+      ])
+    );
+  } catch (error) {
+    logSafeError("Could not request multi-mint cancellation", error);
+    await ctx.reply(`❌ Could not request multi-mint cancellation.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^mmj:cancel_confirm:([0-9a-f-]+)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const sessionId = ctx.match[1];
+
+  if (!sessionId) {
+    await ctx.reply("This multi-mint job cancellation has expired. Run /cancelmultimintjob again.");
+    return;
+  }
+
+  const validated = await validateMultiMintJobCancelConfirmation(ctx, sessionId);
+
+  if (!validated) {
+    return;
+  }
+
+  const { session } = validated;
+
+  try {
+    const job = updateMultiMintJobForOwner(
+      session.jobId,
+      session.ownerTelegramId,
+      {
+        status: "cancelled",
+        safeErrorReason: "cancelled_by_user"
+      }
+    );
+    session.status = "used";
+    await auditMintAction({
+      ownerTelegramId: job.ownerTelegramId,
+      action: "multi_mint_job_cancelled",
+      targetId: job.targetId,
+      multiMintJobId: job.jobId,
+      chain: job.chain,
+      contractAddress: job.contractAddress,
+      functionSignature: job.functionSignature,
+      quantity: job.quantity,
+      priceEth: job.priceEth,
+      gasStrategyMode: job.gasStrategy.mode,
+      status: job.status,
+      reason: "cancelled_by_user"
+    });
+    await ctx.reply(`✅ Multi-mint job cancelled.\n\n${formatMultiMintJob(job)}`);
+  } catch (error) {
+    logSafeError("Could not cancel multi-mint job", error);
+    await ctx.reply(`❌ Could not cancel multi-mint job.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^mmj:cancel_cancel:([0-9a-f-]+)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const sessionId = ctx.match[1];
+
+  if (!sessionId) {
+    await ctx.reply("This multi-mint job cancellation has expired. Run /cancelmultimintjob again.");
+    return;
+  }
+
+  const validated = await validateMultiMintJobCancelConfirmation(ctx, sessionId);
+
+  if (!validated) {
+    return;
+  }
+
+  validated.session.status = "cancelled";
+  await ctx.reply(`Multi-mint job kept: ${validated.session.jobId}`);
+});
+
+bot.command("multimintstatus", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const rpcStatus = getMintRpcStatus();
+    const activeJobs = listActiveMultiMintJobsForOwner(ownerTelegramId);
+    const pendingCount = activeJobs.filter((job) =>
+      ["scheduled", "watching"].includes(job.status)
+    ).length;
+    const readyCount = activeJobs.filter((job) => job.status === "ready").length;
+    const submittedCount = activeJobs.filter((job) =>
+      ["submitted", "partial"].includes(job.status)
+    ).length;
+
+    await ctx.reply(
+      `Multi-Mint Status
+
+MAX_MULTI_MINT_WALLETS: ${getMaxMultiMintWallets()}
+MAX_MULTI_MINT_CONCURRENCY: ${getMultiMintConcurrency()}
+MULTI_MINT_DELAY_MS: ${getMultiMintDelayMs()}
+ALLOW_MAINNET_MINTING: ${isMainnetMintingEnabled() ? "true" : "false"}
+ALLOW_SCHEDULED_MAINNET_MINTING: ${isScheduledMainnetMintingEnabled() ? "true" : "false"}
+Active multi jobs for you: ${activeJobs.length}
+Pending/Watching: ${pendingCount}
+Ready: ${readyCount}
+Submitted/Partial: ${submittedCount}
+Gas strategy support: enabled
+ETH_MAINNET_RPC_URL configured: ${rpcStatus.mainnetRpcConfigured ? "yes" : "no"}
+SEPOLIA_RPC_URL or ETH_SEPOLIA_RPC_URL configured: ${rpcStatus.sepoliaRpcConfigured ? "yes" : "no"}`
+    );
+  } catch (error) {
+    logSafeError("Could not show multi-mint status", error);
+    await ctx.reply(`❌ Could not show multi-mint status.\n\nReason:\n${getSafeErrorMessage(error)}`);
   }
 });
 
@@ -5354,7 +7522,8 @@ bot.action(/^mint:confirm:([0-9a-f-]+)$/, async (ctx) => {
       functionSignature: session.functionSignature,
       quantity: session.quantity,
       priceEth: session.priceEth,
-      chain: session.chain
+      chain: session.chain,
+      ...(session.gasStrategy ? { gasStrategy: session.gasStrategy } : {})
     });
 
     if (preview.walletAddress.toLowerCase() !== session.walletAddress.toLowerCase()) {
@@ -5439,7 +7608,8 @@ bot.action(/^mint:confirm:([0-9a-f-]+)$/, async (ctx) => {
       functionSignature: session.functionSignature,
       quantity: session.quantity,
       priceEth: session.priceEth,
-      chain: session.chain
+      chain: session.chain,
+      ...(session.gasStrategy ? { gasStrategy: session.gasStrategy } : {})
     });
 
     updateMintRunForOwner(session.runId, session.ownerTelegramId, {
@@ -5945,6 +8115,7 @@ bot.command("minttargetpreview", async (ctx) => {
     const target = requireCompleteMintTarget(
       getMintTargetForOwner(targetId, ownerTelegramId)
     );
+    const gasStrategy = getTargetGasStrategy(target);
     const preview = await previewMint({
       ownerTelegramId,
       walletLabel,
@@ -5952,7 +8123,8 @@ bot.command("minttargetpreview", async (ctx) => {
       functionSignature: target.functionSignature,
       quantity: target.quantity,
       priceEth: target.priceEth,
-      chain: target.chain
+      chain: target.chain,
+      gasStrategy
     });
     const run = createRunFromPreview(
       ownerTelegramId,
@@ -6007,6 +8179,7 @@ bot.command("minttargetnow", async (ctx) => {
     const target = requireCompleteMintTarget(
       getMintTargetForOwner(targetId, ownerTelegramId)
     );
+    const gasStrategy = getTargetGasStrategy(target);
     const preview = await previewMint({
       ownerTelegramId,
       walletLabel,
@@ -6014,7 +8187,8 @@ bot.command("minttargetnow", async (ctx) => {
       functionSignature: target.functionSignature,
       quantity: target.quantity,
       priceEth: target.priceEth,
-      chain: target.chain
+      chain: target.chain,
+      gasStrategy
     });
     const run = createRunFromPreview(
       ownerTelegramId,
@@ -6032,7 +8206,8 @@ bot.command("minttargetnow", async (ctx) => {
       quantity: preview.quantity,
       priceEth: preview.priceEth,
       runId: run.runId,
-      targetId: target.targetId
+      targetId: target.targetId,
+      gasStrategy
     });
 
     await auditMintAction({

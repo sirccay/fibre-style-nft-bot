@@ -10,6 +10,11 @@ import type {
   OpenSeaMintStage
 } from "./mintDetector.js";
 import type { MintJobMintType } from "./mintJobs.js";
+import {
+  createDefaultGasStrategy,
+  normalizeGasStrategy
+} from "./gasStrategy.js";
+import type { GasStrategy } from "./gasStrategy.js";
 
 export type MintTargetStatus = "active" | "archived";
 export type MintTargetCompleteness = "complete" | "incomplete";
@@ -55,6 +60,7 @@ export type MintTarget = {
   mintType?: MintJobMintType;
   maxRetries?: number;
   retryDelayMs?: number;
+  gasStrategy?: GasStrategy;
   detectedMetadata?: MintTargetDetectedMetadata;
 };
 
@@ -97,6 +103,10 @@ type UpdateMintTargetMintSettingsParams = {
   mintType: MintJobMintType;
   maxRetries: number;
   retryDelayMs: number;
+};
+
+type UpdateMintTargetGasStrategyParams = {
+  gasStrategy: GasStrategy;
 };
 
 const MINT_TARGETS_PATH = path.join(process.cwd(), "data", "mintTargets.json");
@@ -373,6 +383,9 @@ function normalizeStoredMintTarget(raw: any): MintTarget | null {
   const detectedMetadata = normalizeDetectedMetadata(raw.detectedMetadata);
   const maxRetries = normalizeNumberField(raw.maxRetries);
   const retryDelayMs = normalizeNumberField(raw.retryDelayMs);
+  const gasStrategy = raw.gasStrategy
+    ? normalizeGasStrategy(raw.gasStrategy)
+    : undefined;
 
   return {
     targetId: raw.targetId,
@@ -395,6 +408,7 @@ function normalizeStoredMintTarget(raw: any): MintTarget | null {
     ...(isMintJobMintType(raw.mintType) ? { mintType: raw.mintType } : {}),
     ...(maxRetries !== undefined ? { maxRetries } : {}),
     ...(retryDelayMs !== undefined ? { retryDelayMs } : {}),
+    ...(gasStrategy ? { gasStrategy } : {}),
     ...(detectedMetadata ? { detectedMetadata } : {})
   };
 }
@@ -604,6 +618,37 @@ export function updateMintTargetMintSettingsForOwner(
   target.maxRetries = updates.maxRetries;
   target.retryDelayMs = updates.retryDelayMs;
   target.updatedAt = new Date().toISOString();
+
+  writeMintTargets(file.targets);
+  return target;
+}
+
+export function updateMintTargetGasStrategyForOwner(
+  targetId: string,
+  ownerTelegramId: string,
+  updates: UpdateMintTargetGasStrategyParams
+) {
+  const file = loadMintTargetsFile();
+  const target = file.targets.find(
+    (savedTarget) =>
+      savedTarget.targetId === targetId &&
+      savedTarget.ownerTelegramId === ownerTelegramId
+  );
+
+  if (!target) {
+    throw new Error("Mint target not found for this Telegram user.");
+  }
+
+  if (target.status === "archived") {
+    throw new Error("Mint target is archived and cannot be updated.");
+  }
+
+  const now = new Date().toISOString();
+  target.gasStrategy = {
+    ...normalizeGasStrategy(updates.gasStrategy || createDefaultGasStrategy(now)),
+    updatedAt: now
+  };
+  target.updatedAt = now;
 
   writeMintTargets(file.targets);
   return target;
