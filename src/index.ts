@@ -6593,30 +6593,182 @@ Concurrency Cap: ${getMultiMintConcurrency()}`
   }
 });
 
+function getMintFlowMenuText() {
+  return `🚀 Guided Mint Flow
+
+Choose what you want to do next.
+
+Recommended flow:
+1. Show Targets
+2. Show Wallets
+3. Check Readiness
+4. Quick Mint
+5. Press Confirm only after checking gas + USD budget
+
+Safety:
+- No transaction is sent from this menu.
+- /mintready never sends a transaction.
+- /quickmint only sends after you press Confirm.`;
+}
+
+function getMintFlowKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("✅ Check Readiness", "mf:ready"),
+      Markup.button.callback("🚀 Quick Mint", "mf:quick")
+    ],
+    [
+      Markup.button.callback("🎯 Show Targets", "mf:targets"),
+      Markup.button.callback("👛 Show Wallets", "mf:wallets")
+    ],
+    [
+      Markup.button.callback("⛽ Gas Preview", "mf:gas"),
+      Markup.button.callback("📅 Schedule Multi-Mint", "mf:schedule")
+    ],
+    [Markup.button.callback("🔄 Refresh Menu", "mf:menu")]
+  ]);
+}
+
+async function sendMintFlowMenu(ctx: Context) {
+  await ctx.reply(getMintFlowMenuText(), getMintFlowKeyboard());
+}
+
 bot.command("mintflow", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
+  await sendMintFlowMenu(ctx);
+});
+
+bot.action("mf:menu", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+  await sendMintFlowMenu(ctx);
+});
+
+bot.action("mf:ready", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
   await ctx.reply(
-    `Guided Mint Flow
+    `✅ Check Mint Readiness
 
-1. List saved targets:
-/minttargets
-
-2. Check readiness:
+Use:
 /mintready targetId wallet1[,wallet2,...] [gasStrategy]
 
-3. Create confirmation:
+Examples:
+/mintready 8fce62cc-d032-4e53-9ec2-87aec5be7258 wallet1 fast
+/mintready 8fce62cc-d032-4e53-9ec2-87aec5be7258 wallet1,wallet2 fast
+
+This checks gas, USD budget, wallet funding, and readiness.
+No transaction is sent.`
+  );
+});
+
+bot.action("mf:quick", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    `🚀 Quick Mint
+
+Use:
 /quickmint targetId wallet1[,wallet2,...] [gasStrategy]
 
-4. Press Confirm only after checking gas, USD budget, and wallet funding.
-
 Examples:
-/mintready targetId wallet1,wallet2 fast
-/quickmint targetId wallet1 fast
+/quickmint 8fce62cc-d032-4e53-9ec2-87aec5be7258 wallet1 fast
+/quickmint 8fce62cc-d032-4e53-9ec2-87aec5be7258 wallet1,wallet2 fast
 
-No transaction is sent by /mintflow or /mintready.
-No transaction is sent by /quickmint until you press Confirm.`
+This creates a final confirmation screen with gas + USD budget.
+No transaction is sent until you press Confirm.`
   );
+});
+
+bot.action("mf:gas", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    `⛽ Gas Preview
+
+Single wallet:
+/gaspreview targetId wallet1
+
+Multiple wallets:
+/multigaspreview targetId wallet1,wallet2
+
+Gas preview checks estimated gas, estimated total cost, USD budget, and wallet funding.
+No transaction is sent.`
+  );
+});
+
+bot.action("mf:schedule", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    `📅 Schedule Multi-Mint
+
+Use:
+/schedulemintmulti targetId wallet1,wallet2 2026-07-04T18:00:00Z watch
+
+Then check jobs:
+/mintwatchstatus
+
+When ready, manually run confirmation:
+/runmultimintjob jobId
+
+Scheduled multi-mint still requires final confirmation unless you explicitly use auto mode and mainnet locks are enabled.`
+  );
+});
+
+bot.action("mf:wallets", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  try {
+    await sendWalletsList(ctx);
+  } catch (error) {
+    logSafeError("Could not show wallets from mint flow", error);
+    await ctx.reply(`❌ Could not show wallets.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action("mf:targets", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const targets = listMintTargetsForOwner(ownerTelegramId);
+
+    if (targets.length === 0) {
+      await ctx.reply("No active mint targets found. Add one with /addminttarget.");
+      return;
+    }
+
+    const message = targets
+      .map((target, index) =>
+        [
+          `${index + 1}. ${target.name}`,
+          `Target ID: ${target.targetId}`,
+          `Chain: ${target.chain}`,
+          `Contract: ${target.contractAddress ? formatShortAddress(target.contractAddress) : "Unknown"}`,
+          `Completeness: ${target.targetCompleteness}`,
+          `Function: ${target.functionSignature || "Unknown"}`,
+          `Qty: ${target.quantity}`,
+          `Price: ${target.priceEth === undefined ? "Unknown" : `${target.priceEth} ETH`}`
+        ].join("\n")
+      )
+      .join("\n\n");
+
+    await ctx.reply(`Your mint targets:\n\n${message}`);
+  } catch (error) {
+    logSafeError("Could not show mint targets from mint flow", error);
+    await ctx.reply(`❌ Could not show mint targets.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
 });
 
 bot.command("mintready", async (ctx) => {
