@@ -168,6 +168,9 @@ const BOT_COMMANDS = [
   { command: "setgas", description: "Set mint gas strategy" },
   { command: "gaspreview", description: "Preview mint gas" },
   { command: "multigaspreview", description: "Preview gas for wallets" },
+  { command: "mintready", description: "Check mint readiness" },
+  { command: "quickmint", description: "Guided quick mint" },
+  { command: "mintflow", description: "Show guided mint flow" },
   { command: "mintmulti", description: "Mint with multiple wallets" },
   { command: "schedulemintmulti", description: "Schedule multi-wallet mint" },
   { command: "runmultimintjob", description: "Run multi-mint job" },
@@ -2618,6 +2621,92 @@ function formatMultiGasPreview(previews: MintPreviewResult[], failures: Array<{ 
 
   lines.push("", "No transaction was sent.");
   return lines.join("\n\n");
+}
+
+function parseOptionalCommandGasStrategy(
+  parts: string[],
+  startIndex: number,
+  fallback: GasStrategy
+) {
+  return parts[startIndex]?.trim() ? parseGasStrategyInput(parts, startIndex) : fallback;
+}
+
+function getPreviewReadinessFailures(preview: MintPreviewResult) {
+  const failures: Array<{ walletLabel: string; reason: string }> = [];
+
+  if (preview.gasEstimateFailed) {
+    failures.push({
+      walletLabel: preview.walletLabel,
+      reason: preview.gasEstimateError || "gas_estimation_failed"
+    });
+  } else if (preview.fundedEnough === false) {
+    failures.push({
+      walletLabel: preview.walletLabel,
+      reason: "insufficient_native_balance_for_estimated_total"
+    });
+  }
+
+  return failures;
+}
+
+function formatMintReadinessRecommendation(
+  previews: MintPreviewResult[],
+  failures: Array<{ walletLabel: string; reason: string }>
+) {
+  const insufficientFailureCount = failures.filter((failure) =>
+    failure.reason.toLowerCase().includes("insufficient")
+  ).length;
+  const underfundedCount =
+    previews.filter((preview) => preview.fundedEnough === false).length +
+    insufficientFailureCount;
+  const gasEstimateFailureCount =
+    previews.filter((preview) => preview.gasEstimateFailed).length +
+    failures.filter((failure) => !failure.reason.toLowerCase().includes("insufficient")).length;
+  const highGasCount = previews.filter((preview) =>
+    formatGasAdvisor(preview).toLowerCase().startsWith("high risk")
+  ).length;
+
+  if (underfundedCount > 0) {
+    return "Needs funding: top up the affected wallet(s) with native token, then run /mintready again.";
+  }
+
+  if (gasEstimateFailureCount > 0) {
+    return "Check eligibility: gas estimation failed for at least one wallet. Confirm mint is live, wallet is eligible, function is correct, and price is right.";
+  }
+
+  if (highGasCount > 0) {
+    return "Gas high: wallet(s) look ready, but gas is expensive. Consider waiting or lowering gas strategy.";
+  }
+
+  if (previews.length === 0) {
+    return "Not ready: no wallet preview was created.";
+  }
+
+  return "Ready: checked wallet(s) look ready. You can run /quickmint when you want to create a confirmation.";
+}
+
+function formatMintReadyUsage() {
+  return [
+    "Use:",
+    "/mintready targetId wallet1[,wallet2,...] [gasStrategy]",
+    "",
+    "Examples:",
+    "/mintready 8fce62cc-d032-4e53-9ec2-87aec5be7258 wallet1 fast",
+    "/mintready 8fce62cc-d032-4e53-9ec2-87aec5be7258 wallet1,wallet2 fast"
+  ].join("\n");
+}
+
+function formatQuickMintUsage() {
+  return [
+    "Use:",
+    "/quickmint targetId wallet1[,wallet2,...] [gasStrategy]",
+    "",
+    "Examples:",
+    "/quickmint 8fce62cc-d032-4e53-9ec2-87aec5be7258 wallet1 fast",
+    "/quickmint 8fce62cc-d032-4e53-9ec2-87aec5be7258 wallet1,wallet2 fast",
+    "",
+    "No transaction will be sent until you press the confirmation button."
+  ].join("\n");
 }
 
 type MultiMintJobReadinessResult = {
@@ -6501,6 +6590,319 @@ Concurrency Cap: ${getMultiMintConcurrency()}`
   } catch (error) {
     logSafeError("Could not preview multi-wallet gas", error);
     await ctx.reply(`❌ Could not preview multi-wallet gas.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("mintflow", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.reply(
+    `Guided Mint Flow
+
+1. List saved targets:
+/minttargets
+
+2. Check readiness:
+/mintready targetId wallet1[,wallet2,...] [gasStrategy]
+
+3. Create confirmation:
+/quickmint targetId wallet1[,wallet2,...] [gasStrategy]
+
+4. Press Confirm only after checking gas, USD budget, and wallet funding.
+
+Examples:
+/mintready targetId wallet1,wallet2 fast
+/quickmint targetId wallet1 fast
+
+No transaction is sent by /mintflow or /mintready.
+No transaction is sent by /quickmint until you press Confirm.`
+  );
+});
+
+bot.command("mintready", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const targetId = parts[1]?.trim();
+  const rawWallets = parts[2]?.trim();
+
+  if (!targetId || !rawWallets) {
+    await ctx.reply(formatMintReadyUsage());
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const target = requireCompleteMintTarget(
+      getMintTargetForOwner(targetId, ownerTelegramId)
+    );
+    const walletLabels = parseWalletLabelList(rawWallets);
+    const gasStrategy = parseOptionalCommandGasStrategy(
+      parts,
+      3,
+      getTargetGasStrategy(target)
+    );
+
+    if (walletLabels.length === 1) {
+      const walletLabel = walletLabels[0]!;
+      const preview = await previewGasForTargetWallet({
+        ownerTelegramId,
+        target,
+        walletLabel,
+        gasStrategy
+      });
+      const failures = getPreviewReadinessFailures(preview);
+
+      await auditMintAction({
+        ownerTelegramId,
+        action: "mint_ready_checked",
+        walletLabel: preview.walletLabel,
+        walletAddress: preview.walletAddress,
+        targetId: target.targetId,
+        chain: preview.chain,
+        contractAddress: preview.contractAddress,
+        functionSignature: preview.functionSignature,
+        quantity: preview.quantity,
+        priceEth: preview.priceEth,
+        gasStrategyMode: gasStrategy.mode,
+        status: failures.length > 0 ? "blocked" : "ready",
+        ...(failures[0]?.reason ? { reason: failures[0].reason } : {})
+      });
+
+      await ctx.reply(
+        `Mint Readiness
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+Wallet Count: 1
+Gas Strategy: ${formatGasStrategy(gasStrategy)}
+
+Wallet: ${preview.walletLabel}
+Address: ${formatShortAddress(preview.walletAddress)}
+
+${formatGasFields(preview)}
+
+Recommendation:
+${formatMintReadinessRecommendation([preview], failures)}
+
+No transaction was sent.`
+      );
+      return;
+    }
+
+    const wallets = await getOwnedActiveWalletSummaries(ownerTelegramId, walletLabels);
+    const preflight = await getMultiMintPreflight({
+      ownerTelegramId,
+      target,
+      walletLabels,
+      gasStrategy
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "multi_mint_ready_checked",
+      targetId: target.targetId,
+      chain: target.chain,
+      contractAddress: target.contractAddress,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      gasStrategyMode: gasStrategy.mode,
+      status: preflight.failures.length > 0 ? "partial" : "ready",
+      reason: `wallets:${wallets.length}`
+    });
+
+    await ctx.reply(
+      `Mint Readiness
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+Wallet Count: ${wallets.length}
+Wallets: ${wallets.map((wallet) => wallet.label).join(", ")}
+Gas Strategy: ${formatGasStrategy(gasStrategy)}
+
+${formatMultiGasPreview(preflight.previews, preflight.failures)}
+
+Recommendation:
+${formatMintReadinessRecommendation(preflight.previews, preflight.failures)}`
+    );
+  } catch (error) {
+    logSafeError("Could not check mint readiness", error);
+    const reason = getSafeErrorMessage(error);
+    await ctx.reply(
+      `❌ Could not check mint readiness.
+
+Reason:
+${reason}
+
+Next:
+- Run /minttargets and copy the real Target ID.
+- Run /wallets and confirm the wallet label.
+- Then run /mintready again.`
+    );
+  }
+});
+
+bot.command("quickmint", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const targetId = parts[1]?.trim();
+  const rawWallets = parts[2]?.trim();
+
+  if (!targetId || !rawWallets) {
+    await ctx.reply(formatQuickMintUsage());
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const target = requireCompleteMintTarget(
+      getMintTargetForOwner(targetId, ownerTelegramId)
+    );
+    const walletLabels = parseWalletLabelList(rawWallets);
+    const gasStrategy = parseOptionalCommandGasStrategy(
+      parts,
+      3,
+      getTargetGasStrategy(target)
+    );
+
+    if (walletLabels.length === 1) {
+      const walletLabel = walletLabels[0]!;
+      const preview = await previewGasForTargetWallet({
+        ownerTelegramId,
+        target,
+        walletLabel,
+        gasStrategy
+      });
+      const run = createRunFromPreview(ownerTelegramId, preview, "pending", target.targetId);
+      const session = createMintConfirmationSession({
+        ownerTelegramId,
+        walletLabel: preview.walletLabel,
+        walletAddress: preview.walletAddress,
+        chain: preview.chain,
+        contractAddress: preview.contractAddress,
+        functionSignature: preview.functionSignature,
+        quantity: preview.quantity,
+        priceEth: preview.priceEth,
+        runId: run.runId,
+        targetId: target.targetId,
+        gasStrategy
+      });
+
+      await auditMintAction({
+        ownerTelegramId,
+        action: "quick_mint_confirmation_created",
+        walletLabel: preview.walletLabel,
+        walletAddress: preview.walletAddress,
+        targetId: target.targetId,
+        runId: run.runId,
+        chain: preview.chain,
+        contractAddress: preview.contractAddress,
+        functionSignature: preview.functionSignature,
+        quantity: preview.quantity,
+        priceEth: preview.priceEth,
+        gasStrategyMode: gasStrategy.mode,
+        status: session.status
+      });
+
+      await ctx.reply(
+        `${formatMintPreviewMessage(preview, {
+          title: `Quick Mint Confirmation: ${target.name}`,
+          targetId: target.targetId,
+          runId: run.runId
+        })}
+
+This confirmation expires in 10 minutes.
+
+No transaction will be sent until you press Confirm Mint.`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback("Confirm Mint", `mint:confirm:${session.sessionId}`)],
+          [Markup.button.callback("Cancel", `mint:cancel:${session.sessionId}`)]
+        ])
+      );
+      return;
+    }
+
+    const wallets = await getOwnedActiveWalletSummaries(ownerTelegramId, walletLabels);
+    const preflight = await getMultiMintPreflight({
+      ownerTelegramId,
+      target,
+      walletLabels,
+      gasStrategy
+    });
+    const session = createMultiMintConfirmationSession({
+      ownerTelegramId,
+      targetId: target.targetId,
+      targetName: target.name,
+      chain: target.chain,
+      contractAddress: target.contractAddress,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      walletLabels: wallets.map((wallet) => wallet.label),
+      walletAddresses: wallets.map((wallet) => wallet.address),
+      gasStrategy
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "quick_multi_mint_confirmation_created",
+      targetId: target.targetId,
+      chain: target.chain,
+      contractAddress: target.contractAddress,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      gasStrategyMode: gasStrategy.mode,
+      status: session.status,
+      reason: `wallets:${wallets.length}`
+    });
+
+    await ctx.reply(
+      `Quick Multi-Mint Confirmation
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+Chain: ${target.chain}
+Contract: ${formatShortAddress(target.contractAddress)}
+Function: ${target.functionSignature}
+Quantity Per Wallet: ${target.quantity}
+Price Per Wallet: ${target.priceEth} ETH
+Gas Strategy: ${formatGasStrategy(gasStrategy)}
+Wallets (${wallets.length}): ${wallets.map((wallet) => wallet.label).join(", ")}
+Concurrency Cap: ${getMultiMintConcurrency()}
+Delay Between Submissions: ${getMultiMintDelayMs()}ms
+Minting Lock: ${getMintLockStatusText(target.chain)}
+
+Preflight:
+${formatMultiGasPreview(preflight.previews, preflight.failures)}
+
+Recommendation:
+${formatMintReadinessRecommendation(preflight.previews, preflight.failures)}
+
+This confirmation expires in 10 minutes.
+
+No transaction will be sent until you press Confirm Multi Mint.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Confirm Multi Mint", `mm:confirm:${session.sessionId}`)],
+        [Markup.button.callback("Cancel", `mm:cancel:${session.sessionId}`)]
+      ])
+    );
+  } catch (error) {
+    logSafeError("Could not create quick mint confirmation", error);
+    const reason = getSafeErrorMessage(error);
+    await ctx.reply(
+      `❌ Could not create quick mint confirmation.
+
+Reason:
+${reason}
+
+Next:
+- Run /minttargets and copy the real Target ID.
+- Run /wallets and confirm the wallet label.
+- Run /mintready first if you want to check gas/funding before confirmation.`
+    );
   }
 });
 
