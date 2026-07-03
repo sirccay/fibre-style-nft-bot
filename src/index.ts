@@ -59,6 +59,7 @@ import {
   detectMintFunctions,
   toSupportedMintChain
 } from "./mintDetector.js";
+import { getConfiguredDetectorRpcStatus } from "./mintDetectorV2.js";
 import type {
   DetectedChainName,
   MintDetectionResult,
@@ -204,8 +205,15 @@ function redactSensitiveText(text: string): string {
     "SEPOLIA_RPC_URL",
     "ETH_SEPOLIA_RPC_URL",
     "ETH_MAINNET_RPC_URL",
+    "BASE_RPC_URL",
+    "ETH_BASE_RPC_URL",
+    "ARBITRUM_RPC_URL",
+    "ETH_ARBITRUM_RPC_URL",
+    "POLYGON_RPC_URL",
+    "ETH_POLYGON_RPC_URL",
     "OPENSEA_API_KEY",
     "RESERVOIR_API_KEY",
+    "ETHERSCAN_API_KEY",
     "VAULT_SECRET"
   ];
 
@@ -1215,6 +1223,42 @@ function formatOpenSeaMintMetadata(openSeaMint?: OpenSeaMintMetadata) {
   return lines;
 }
 
+function formatStructuredDetectorDetails(detection: MintDetectionResult) {
+  const structured = detection.structured;
+
+  return [
+    "Detector Details:",
+    `Platform: ${structured.contract.platform}`,
+    `Verified Source: ${structured.contract.verifiedSource ? "yes" : "no"}`,
+    `Token Standard: ${structured.contract.tokenStandard}`,
+    `Likely Function: ${
+      structured.mint.function.name
+        ? `${structured.mint.function.name} (${structured.mint.function.selector || "selector unknown"}, ${structured.mint.function.confidence})`
+        : "Unknown"
+    }`,
+    ...(structured.mint.function.signature
+      ? [`Function Signature: ${structured.mint.function.signature}`]
+      : []),
+    `Price: ${
+      structured.mint.price.eth
+        ? `${structured.mint.price.eth} ETH (${structured.mint.price.source}, ${structured.mint.price.confidence})`
+        : `Unknown (${structured.mint.price.source})`
+    }`,
+    `Phase: ${structured.mint.phase.status} (${structured.mint.phase.confidence})`,
+    ...(structured.mint.phase.startTime ? [`Start: ${structured.mint.phase.startTime}`] : []),
+    ...(structured.mint.phase.endTime ? [`End: ${structured.mint.phase.endTime}`] : []),
+    ...(structured.eligibility
+      ? [
+          `Allowlist Detected: ${structured.eligibility.allowlistDetected ? "yes" : "no"}`,
+          `Wallet On Allowlist: ${structured.eligibility.walletOnAllowlist}`,
+          `Wallet Already Minted: ${structured.eligibility.walletAlreadyMinted ?? "unknown"}`,
+          `Max Per Wallet: ${structured.eligibility.maxPerWallet ?? "unknown"}`,
+          `Eligibility Estimate: ${structured.eligibility.estimate}`
+        ]
+      : [])
+  ];
+}
+
 function getDetectionMetadata(detection: MintDetectionResult) {
   return {
     lastCheckedAt: detection.detectedAt,
@@ -1237,6 +1281,12 @@ function getDetectionMetadata(detection: MintDetectionResult) {
     phaseTypeEvidence: detection.mint.phaseTypeEvidence,
     phaseConfidence: detection.mint.confidence,
     ...(detection.mint.openSeaMint ? { openSeaMint: detection.mint.openSeaMint } : {}),
+    detector: {
+      chain: detection.structured.chain,
+      contract: detection.structured.contract,
+      mint: detection.structured.mint,
+      eligibility: detection.structured.eligibility
+    },
     warnings: detection.warnings.slice(0, 10)
   };
 }
@@ -1312,6 +1362,8 @@ function formatMintDetectionResult(detection: MintDetectionResult) {
       : []),
     ...(detection.contract.tokenId ? [`Token ID: ${detection.contract.tokenId}`] : []),
     ...(openSeaMint ? ["", ...formatOpenSeaMintMetadata(openSeaMint)] : []),
+    "",
+    ...formatStructuredDetectorDetails(detection),
     "",
     "Detected:",
     ...(detected.length > 0 ? detected.map((item) => `- ${item}`) : ["- None"]),
@@ -2721,34 +2773,45 @@ bot.command("parserstatus", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
   const rpcStatus = getMintRpcStatus();
+  const detectorRpcStatus = getConfiguredDetectorRpcStatus();
 
   await ctx.reply(
     `Parser Status
 
 OPENSEA_API_KEY configured: ${getConfiguredStatus(process.env.OPENSEA_API_KEY)}
 RESERVOIR_API_KEY configured: ${getConfiguredStatus(process.env.RESERVOIR_API_KEY)}
+ETHERSCAN_API_KEY configured: ${getConfiguredStatus(process.env.ETHERSCAN_API_KEY)}
 ETH_MAINNET_RPC_URL configured: ${rpcStatus.mainnetRpcConfigured ? "yes" : "no"}
 SEPOLIA_RPC_URL or ETH_SEPOLIA_RPC_URL configured: ${rpcStatus.sepoliaRpcConfigured ? "yes" : "no"}
 OpenSea page metadata fallback: enabled
 Reservoir mint-stage lookup: ${getConfiguredStatus(process.env.RESERVOIR_API_KEY) === "yes" ? "enabled" : "disabled"}
+Etherscan V2 ABI fallback: ${getConfiguredStatus(process.env.ETHERSCAN_API_KEY) === "yes" ? "enabled" : "disabled"}
+4byte selector lookup fallback: enabled
+
+Detector RPCs:
+${detectorRpcStatus.map((chain) => `- ${chain.name}: ${chain.configured ? "yes" : "no"}`).join("\n")}
 
 Supported platforms:
 - OpenSea collection and asset URLs
 - Zora collect URL parsing
+- Magic Eden / Blur / Manifold visible-address parsing
 - Explorer address links
 - Raw addresses
 - Generic URL/text address detection
 
 Supported function detection:
 - Selector scan for supported mint functions
+- Reservoir mint-stage function hints
+- Etherscan V2 verified ABI scan
+- 4byte lookup for unverified bytecode selectors
 
 Supported phase detection:
 - Common read-only contract fields
+- Reservoir mint stages
 
 Future upgrades:
-- Etherscan ABI lookup
-- 4byte selector lookup
-- transaction-history price inference`
+- Platform-specific canonical ABI packs for advanced Seadrop/Manifold/Thirdweb/Zora mints
+- Advanced allowlist membership APIs`
   );
 });
 

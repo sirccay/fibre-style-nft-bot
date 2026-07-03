@@ -26,6 +26,12 @@ export type MintTargetDetectedMetadata = {
   phaseTypeEvidence?: string;
   phaseConfidence?: string;
   openSeaMint?: OpenSeaMintMetadata;
+  detector?: {
+    chain?: unknown;
+    contract?: unknown;
+    mint?: unknown;
+    eligibility?: unknown;
+  };
   warnings?: string[];
 };
 
@@ -213,6 +219,21 @@ function normalizeOpenSeaMintMetadata(raw: any): OpenSeaMintMetadata | undefined
     : undefined;
 }
 
+function normalizeDetectorSnapshot(raw: any): MintTargetDetectedMetadata["detector"] | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+
+  return {
+    ...(raw.chain && typeof raw.chain === "object" ? { chain: raw.chain } : {}),
+    ...(raw.contract && typeof raw.contract === "object" ? { contract: raw.contract } : {}),
+    ...(raw.mint && typeof raw.mint === "object" ? { mint: raw.mint } : {}),
+    ...(raw.eligibility && typeof raw.eligibility === "object"
+      ? { eligibility: raw.eligibility }
+      : {})
+  };
+}
+
 export function getMintTargetMissingFields(target: {
   contractAddress?: string;
   functionSignature?: string;
@@ -257,6 +278,7 @@ function normalizeDetectedMetadata(raw: any): MintTargetDetectedMetadata | undef
   }
 
   const openSeaMint = normalizeOpenSeaMintMetadata(raw.openSeaMint);
+  const detector = normalizeDetectorSnapshot(raw.detector);
   const metadata: MintTargetDetectedMetadata = {
     ...(typeof raw.lastCheckedAt === "string" ? { lastCheckedAt: raw.lastCheckedAt } : {}),
     ...(typeof raw.collectionName === "string" ? { collectionName: raw.collectionName } : {}),
@@ -286,6 +308,7 @@ function normalizeDetectedMetadata(raw: any): MintTargetDetectedMetadata | undef
       ? { phaseConfidence: raw.phaseConfidence }
       : {}),
     ...(openSeaMint ? { openSeaMint } : {}),
+    ...(detector ? { detector } : {}),
     ...(Array.isArray(raw.warnings)
       ? {
           warnings: raw.warnings

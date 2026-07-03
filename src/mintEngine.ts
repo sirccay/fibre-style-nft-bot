@@ -171,7 +171,11 @@ function redactMintErrorText(text: string): string {
     "SEPOLIA_RPC_URL",
     "ETH_SEPOLIA_RPC_URL",
     "ETH_MAINNET_RPC_URL",
+    "BASE_RPC_URL",
+    "ETH_BASE_RPC_URL",
     "OPENSEA_API_KEY",
+    "RESERVOIR_API_KEY",
+    "ETHERSCAN_API_KEY",
     "VAULT_SECRET"
   ];
 
