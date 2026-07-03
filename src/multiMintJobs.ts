@@ -1,4 +1,3 @@
-import fs from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
 import type {
@@ -11,6 +10,11 @@ import {
 } from "./gasStrategy.js";
 import type { GasStrategy } from "./gasStrategy.js";
 import type { MintJobMode } from "./mintJobs.js";
+import {
+  loadJsonFile,
+  saveJsonFileAtomic,
+  updateJsonFileSync
+} from "./jsonStore.js";
 
 export type MultiMintJobStatus =
   | "scheduled"
@@ -103,6 +107,7 @@ type UpdateMultiMintJobParams = Partial<{
 }>;
 
 const MULTI_MINT_JOBS_PATH = path.join(process.cwd(), "data", "multiMintJobs.json");
+const EMPTY_MULTI_MINT_JOBS_FILE: MultiMintJobsFile = { jobs: [] };
 const SUPPORTED_STORED_MINT_SIGNATURES: SupportedMintFunctionSignature[] = [
   "mint(uint256)",
   "publicMint(uint256)",
@@ -284,46 +289,34 @@ function normalizeStoredMultiMintJob(raw: any): MultiMintJob | null {
   };
 }
 
-function writeMultiMintJobs(jobs: MultiMintJob[]) {
-  const dir = path.dirname(MULTI_MINT_JOBS_PATH);
-
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-
-  fs.writeFileSync(
-    MULTI_MINT_JOBS_PATH,
-    JSON.stringify({ jobs }, null, 2),
-    "utf8"
-  );
-}
-
-function loadMultiMintJobsFile(): MultiMintJobsFile {
-  if (!fs.existsSync(MULTI_MINT_JOBS_PATH)) {
-    return { jobs: [] };
-  }
-
-  const raw = fs.readFileSync(MULTI_MINT_JOBS_PATH, "utf8");
-
-  if (!raw.trim()) {
-    return { jobs: [] };
-  }
-
-  const parsed = JSON.parse(raw);
+function normalizeMultiMintJobsFile(parsed: MultiMintJobsFile): MultiMintJobsFile {
   const rawJobs: any[] = Array.isArray(parsed.jobs) ? parsed.jobs : [];
   const jobs = rawJobs
     .map(normalizeStoredMultiMintJob)
     .filter((job): job is MultiMintJob => Boolean(job));
 
-  if (jobs.length !== rawJobs.length) {
-    writeMultiMintJobs(jobs);
-  }
-
   return { jobs };
 }
 
+function writeMultiMintJobs(jobs: MultiMintJob[]) {
+  saveJsonFileAtomic(MULTI_MINT_JOBS_PATH, { jobs });
+}
+
+function loadMultiMintJobsFile(): MultiMintJobsFile {
+  const parsed = loadJsonFile<MultiMintJobsFile>(
+    MULTI_MINT_JOBS_PATH,
+    EMPTY_MULTI_MINT_JOBS_FILE
+  );
+  const file = normalizeMultiMintJobsFile(parsed);
+
+  if (file.jobs.length !== (Array.isArray(parsed.jobs) ? parsed.jobs.length : 0)) {
+    writeMultiMintJobs(file.jobs);
+  }
+
+  return file;
+}
+
 export function createMultiMintJob(params: CreateMultiMintJobParams): MultiMintJob {
-  const file = loadMultiMintJobsFile();
   const now = new Date().toISOString();
   const childResults = params.walletLabels.map((walletLabel, index) => ({
     walletLabel,
@@ -357,8 +350,15 @@ export function createMultiMintJob(params: CreateMultiMintJobParams): MultiMintJ
     updatedAt: now
   };
 
-  file.jobs.push(job);
-  writeMultiMintJobs(file.jobs);
+  updateJsonFileSync<MultiMintJobsFile>(
+    MULTI_MINT_JOBS_PATH,
+    EMPTY_MULTI_MINT_JOBS_FILE,
+    (current) => {
+      const file = normalizeMultiMintJobsFile(current);
+      file.jobs.push(job);
+      return file;
+    }
+  );
   return job;
 }
 
@@ -398,43 +398,53 @@ export function updateMultiMintJobForOwner(
   ownerTelegramId: string,
   updates: UpdateMultiMintJobParams
 ) {
-  const file = loadMultiMintJobsFile();
-  const job = file.jobs.find(
-    (savedJob) =>
-      savedJob.jobId === jobId && savedJob.ownerTelegramId === ownerTelegramId
+  let updatedJob: MultiMintJob | undefined;
+
+  updateJsonFileSync<MultiMintJobsFile>(
+    MULTI_MINT_JOBS_PATH,
+    EMPTY_MULTI_MINT_JOBS_FILE,
+    (current) => {
+      const file = normalizeMultiMintJobsFile(current);
+      const job = file.jobs.find(
+        (savedJob) =>
+          savedJob.jobId === jobId && savedJob.ownerTelegramId === ownerTelegramId
+      );
+
+      if (!job) {
+        throw new Error("Multi-mint job not found for this Telegram user.");
+      }
+
+      if (updates.status) {
+        job.status = updates.status;
+      }
+
+      if (updates.attempts !== undefined) {
+        job.attempts = Math.max(0, Math.floor(updates.attempts));
+      }
+
+      if (updates.lastCheckedAt) {
+        job.lastCheckedAt = updates.lastCheckedAt;
+      }
+
+      if (updates.safeErrorReason !== undefined) {
+        job.safeErrorReason = updates.safeErrorReason.slice(0, 300);
+      }
+
+      if (updates.endTimeISO) {
+        job.endTimeISO = updates.endTimeISO;
+      }
+
+      if (updates.childResults) {
+        job.childResults = updates.childResults;
+      }
+
+      job.updatedAt = new Date().toISOString();
+      updatedJob = job;
+      return file;
+    }
   );
 
-  if (!job) {
-    throw new Error("Multi-mint job not found for this Telegram user.");
-  }
-
-  if (updates.status) {
-    job.status = updates.status;
-  }
-
-  if (updates.attempts !== undefined) {
-    job.attempts = Math.max(0, Math.floor(updates.attempts));
-  }
-
-  if (updates.lastCheckedAt) {
-    job.lastCheckedAt = updates.lastCheckedAt;
-  }
-
-  if (updates.safeErrorReason !== undefined) {
-    job.safeErrorReason = updates.safeErrorReason.slice(0, 300);
-  }
-
-  if (updates.endTimeISO) {
-    job.endTimeISO = updates.endTimeISO;
-  }
-
-  if (updates.childResults) {
-    job.childResults = updates.childResults;
-  }
-
-  job.updatedAt = new Date().toISOString();
-  writeMultiMintJobs(file.jobs);
-  return job;
+  return updatedJob!;
 }
 
 export function updateMultiMintChildResult(
@@ -449,28 +459,55 @@ export function updateMultiMintChildResult(
     attempts: number;
   }>
 ) {
-  const job = getMultiMintJobForOwner(jobId, ownerTelegramId);
-  const childResults = job.childResults.map((child) => {
-    if (child.walletLabel !== walletLabel) {
-      return child;
+  let updatedJob: MultiMintJob | undefined;
+
+  updateJsonFileSync<MultiMintJobsFile>(
+    MULTI_MINT_JOBS_PATH,
+    EMPTY_MULTI_MINT_JOBS_FILE,
+    (current) => {
+      const file = normalizeMultiMintJobsFile(current);
+      const job = file.jobs.find(
+        (savedJob) =>
+          savedJob.jobId === jobId && savedJob.ownerTelegramId === ownerTelegramId
+      );
+
+      if (!job) {
+        throw new Error("Multi-mint job not found for this Telegram user.");
+      }
+
+      let childFound = false;
+      job.childResults = job.childResults.map((child) => {
+        if (child.walletLabel !== walletLabel) {
+          return child;
+        }
+
+        childFound = true;
+        return {
+          ...child,
+          ...(updates.status ? { status: updates.status } : {}),
+          ...(updates.runId ? { runId: updates.runId } : {}),
+          ...(updates.txHash ? { txHash: updates.txHash } : {}),
+          ...(updates.safeErrorReason
+            ? { safeErrorReason: updates.safeErrorReason.slice(0, 300) }
+            : {}),
+          ...(updates.attempts !== undefined
+            ? { attempts: Math.max(0, Math.floor(updates.attempts)) }
+            : {}),
+          updatedAt: new Date().toISOString()
+        };
+      });
+
+      if (!childFound) {
+        throw new Error("Multi-mint child wallet not found for this job.");
+      }
+
+      job.updatedAt = new Date().toISOString();
+      updatedJob = job;
+      return file;
     }
+  );
 
-    return {
-      ...child,
-      ...(updates.status ? { status: updates.status } : {}),
-      ...(updates.runId ? { runId: updates.runId } : {}),
-      ...(updates.txHash ? { txHash: updates.txHash } : {}),
-      ...(updates.safeErrorReason
-        ? { safeErrorReason: updates.safeErrorReason.slice(0, 300) }
-        : {}),
-      ...(updates.attempts !== undefined
-        ? { attempts: Math.max(0, Math.floor(updates.attempts)) }
-        : {}),
-      updatedAt: new Date().toISOString()
-    };
-  });
-
-  return updateMultiMintJobForOwner(jobId, ownerTelegramId, { childResults });
+  return updatedJob!;
 }
 
 export function summarizeMultiMintJobStatus(job: MultiMintJob): MultiMintJobStatus {

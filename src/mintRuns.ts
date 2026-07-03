@@ -1,10 +1,14 @@
-import fs from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
 import type {
   MintChain,
   SupportedMintFunctionSignature
 } from "./mintEngine.js";
+import {
+  loadJsonFile,
+  saveJsonFileAtomic,
+  updateJsonFileSync
+} from "./jsonStore.js";
 
 export type MintRunStatus =
   | "previewed"
@@ -67,6 +71,7 @@ type UpdateMintRunParams = Partial<{
 }>;
 
 const MINT_RUNS_PATH = path.join(process.cwd(), "data", "mintRuns.json");
+const EMPTY_MINT_RUNS_FILE: MintRunsFile = { runs: [] };
 const SUPPORTED_STORED_MINT_SIGNATURES: SupportedMintFunctionSignature[] = [
   "mint(uint256)",
   "publicMint(uint256)",
@@ -151,46 +156,34 @@ function normalizeStoredMintRun(raw: any): MintRun | null {
   };
 }
 
-function writeMintRuns(runs: MintRun[]) {
-  const dir = path.dirname(MINT_RUNS_PATH);
-
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-
-  fs.writeFileSync(
-    MINT_RUNS_PATH,
-    JSON.stringify({ runs }, null, 2),
-    "utf8"
-  );
-}
-
-function loadMintRunsFile(): MintRunsFile {
-  if (!fs.existsSync(MINT_RUNS_PATH)) {
-    return { runs: [] };
-  }
-
-  const raw = fs.readFileSync(MINT_RUNS_PATH, "utf8");
-
-  if (!raw.trim()) {
-    return { runs: [] };
-  }
-
-  const parsed = JSON.parse(raw);
+function normalizeMintRunsFile(parsed: MintRunsFile): MintRunsFile {
   const rawRuns: any[] = Array.isArray(parsed.runs) ? parsed.runs : [];
   const runs = rawRuns
     .map(normalizeStoredMintRun)
     .filter((run): run is MintRun => Boolean(run));
 
-  if (runs.length !== rawRuns.length) {
-    writeMintRuns(runs);
-  }
-
   return { runs };
 }
 
+function writeMintRuns(runs: MintRun[]) {
+  saveJsonFileAtomic(MINT_RUNS_PATH, { runs });
+}
+
+function loadMintRunsFile(): MintRunsFile {
+  const parsed = loadJsonFile<MintRunsFile>(
+    MINT_RUNS_PATH,
+    EMPTY_MINT_RUNS_FILE
+  );
+  const file = normalizeMintRunsFile(parsed);
+
+  if (file.runs.length !== (Array.isArray(parsed.runs) ? parsed.runs.length : 0)) {
+    writeMintRuns(file.runs);
+  }
+
+  return file;
+}
+
 export function createMintRun(params: CreateMintRunParams): MintRun {
-  const file = loadMintRunsFile();
   const now = new Date().toISOString();
   const run: MintRun = {
     runId: randomUUID(),
@@ -212,8 +205,15 @@ export function createMintRun(params: CreateMintRunParams): MintRun {
     updatedAt: now
   };
 
-  file.runs.push(run);
-  writeMintRuns(file.runs);
+  updateJsonFileSync<MintRunsFile>(
+    MINT_RUNS_PATH,
+    EMPTY_MINT_RUNS_FILE,
+    (current) => {
+      const file = normalizeMintRunsFile(current);
+      file.runs.push(run);
+      return file;
+    }
+  );
   return run;
 }
 
@@ -222,43 +222,53 @@ export function updateMintRunForOwner(
   ownerTelegramId: string,
   updates: UpdateMintRunParams
 ) {
-  const file = loadMintRunsFile();
-  const run = file.runs.find(
-    (savedRun) =>
-      savedRun.runId === runId && savedRun.ownerTelegramId === ownerTelegramId
+  let updatedRun: MintRun | undefined;
+
+  updateJsonFileSync<MintRunsFile>(
+    MINT_RUNS_PATH,
+    EMPTY_MINT_RUNS_FILE,
+    (current) => {
+      const file = normalizeMintRunsFile(current);
+      const run = file.runs.find(
+        (savedRun) =>
+          savedRun.runId === runId && savedRun.ownerTelegramId === ownerTelegramId
+      );
+
+      if (!run) {
+        throw new Error("Mint run not found for this Telegram user.");
+      }
+
+      if (updates.status) {
+        run.status = updates.status;
+      }
+
+      if (updates.txHash) {
+        run.txHash = updates.txHash;
+      }
+
+      if (updates.errorReason) {
+        run.errorReason = updates.errorReason;
+      }
+
+      if (updates.confirmedAt) {
+        run.confirmedAt = updates.confirmedAt;
+      }
+
+      if (updates.jobId) {
+        run.jobId = updates.jobId;
+      }
+
+      if (updates.multiMintJobId) {
+        run.multiMintJobId = updates.multiMintJobId;
+      }
+
+      run.updatedAt = new Date().toISOString();
+      updatedRun = run;
+      return file;
+    }
   );
 
-  if (!run) {
-    throw new Error("Mint run not found for this Telegram user.");
-  }
-
-  if (updates.status) {
-    run.status = updates.status;
-  }
-
-  if (updates.txHash) {
-    run.txHash = updates.txHash;
-  }
-
-  if (updates.errorReason) {
-    run.errorReason = updates.errorReason;
-  }
-
-  if (updates.confirmedAt) {
-    run.confirmedAt = updates.confirmedAt;
-  }
-
-  if (updates.jobId) {
-    run.jobId = updates.jobId;
-  }
-
-  if (updates.multiMintJobId) {
-    run.multiMintJobId = updates.multiMintJobId;
-  }
-
-  run.updatedAt = new Date().toISOString();
-  writeMintRuns(file.runs);
-  return run;
+  return updatedRun!;
 }
 
 export function listMintRunsForOwner(ownerTelegramId: string, limit = 10) {
