@@ -20,11 +20,13 @@ type WalletAuditEvent = {
   priceEth?: number;
   targetId?: string;
   jobId?: string;
+  multiMintJobId?: string;
   runId?: string;
   chain?: string;
   functionSignature?: string;
   quantity?: number;
   mintType?: string;
+  gasStrategyMode?: string;
   candidateFunctions?: string[];
   phaseStatus?: string;
   phaseTypeEstimate?: string;
@@ -49,11 +51,13 @@ type SessionAuditEvent = {
   priceEth?: number;
   targetId?: string;
   jobId?: string;
+  multiMintJobId?: string;
   runId?: string;
   chain?: string;
   functionSignature?: string;
   quantity?: number;
   mintType?: string;
+  gasStrategyMode?: string;
   candidateFunctions?: string[];
   phaseStatus?: string;
   phaseTypeEstimate?: string;

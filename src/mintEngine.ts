@@ -4,6 +4,11 @@ import {
   getWalletSignerByLabelForOwner,
   getWalletSummaryByLabelForOwner
 } from "./vault.js";
+import {
+  previewGasForMint,
+  resolveGasOverrides
+} from "./gasStrategy.js";
+import type { GasStrategy } from "./gasStrategy.js";
 
 export type MintChain = "mainnet" | "sepolia";
 
@@ -27,6 +32,18 @@ export type MintPreviewResult = {
   gasEstimate: string | null;
   gasEstimateFailed: boolean;
   gasEstimateError?: string;
+  gasStrategyMode?: string;
+  gasLimit?: string;
+  maxFeeGwei?: string;
+  maxPriorityFeeGwei?: string;
+  gasPriceGwei?: string;
+  estimatedGasCostWei?: bigint;
+  estimatedGasCostEth?: string;
+  estimatedTotalCostWei?: bigint;
+  estimatedTotalCostEth?: string;
+  walletBalanceWei?: bigint;
+  walletBalanceEth?: string;
+  fundedEnough?: boolean;
 };
 
 export type MintSubmitResult = {
@@ -57,6 +74,7 @@ type MintActionParams = {
   quantity: number;
   priceEth: string;
   chain: MintChain;
+  gasStrategy?: GasStrategy;
 };
 
 type BuiltMintTransaction = {
@@ -281,10 +299,19 @@ export async function previewMint(params: MintActionParams): Promise<MintPreview
 
   let gasEstimate: string | null = null;
   let gasEstimateError: string | undefined;
+  let gasPreview:
+    | Awaited<ReturnType<typeof previewGasForMint>>
+    | undefined;
 
   try {
-    const estimated = await estimateMintGas(wallet, tx);
-    gasEstimate = estimated.toString();
+    gasPreview = await previewGasForMint({
+      provider,
+      signer: wallet,
+      tx,
+      walletAddress: wallet.address,
+      ...(params.gasStrategy ? { gasStrategy: params.gasStrategy } : {})
+    });
+    gasEstimate = gasPreview.estimatedGasUnits;
   } catch (error) {
     gasEstimateError = getMintSafeErrorReason(error);
   }
@@ -301,6 +328,28 @@ export async function previewMint(params: MintActionParams): Promise<MintPreview
     totalCostEth: tx.totalCostEth,
     gasEstimate,
     gasEstimateFailed: gasEstimate === null,
+    ...(gasPreview
+      ? {
+          gasStrategyMode: gasPreview.mode,
+          gasLimit: gasPreview.gasLimit,
+          ...(gasPreview.maxFeeGwei ? { maxFeeGwei: gasPreview.maxFeeGwei } : {}),
+          ...(gasPreview.maxPriorityFeeGwei
+            ? { maxPriorityFeeGwei: gasPreview.maxPriorityFeeGwei }
+            : {}),
+          ...(gasPreview.gasPriceGwei ? { gasPriceGwei: gasPreview.gasPriceGwei } : {}),
+          estimatedGasCostWei: gasPreview.estimatedGasCostWei,
+          estimatedGasCostEth: gasPreview.estimatedGasCostEth,
+          estimatedTotalCostWei: gasPreview.estimatedTotalCostWei,
+          estimatedTotalCostEth: gasPreview.estimatedTotalCostEth,
+          ...(gasPreview.walletBalanceWei === undefined
+            ? {}
+            : {
+                walletBalanceWei: gasPreview.walletBalanceWei,
+                walletBalanceEth: gasPreview.walletBalanceEth,
+                fundedEnough: gasPreview.fundedEnough
+              })
+        }
+      : {}),
     ...(gasEstimateError ? { gasEstimateError } : {})
   };
 }
@@ -327,20 +376,41 @@ export async function submitMintTransaction(
     walletAddress: wallet.address
   });
 
-  const gasEstimate = await estimateMintGas(wallet, tx);
-
-  const response = await wallet.sendTransaction({
+  const gasOverrides = await resolveGasOverrides({
+    provider,
+    signer: wallet,
+    tx,
+    ...(params.gasStrategy ? { gasStrategy: params.gasStrategy } : {})
+  });
+  const sendParams: ethers.TransactionRequest = {
     to: tx.to,
     data: tx.data,
     value: tx.value,
-    gasLimit: gasEstimate
-  });
+    gasLimit: gasOverrides.gasLimit
+  };
+
+  if (gasOverrides.maxFeePerGas !== undefined) {
+    sendParams.maxFeePerGas = gasOverrides.maxFeePerGas;
+  }
+
+  if (gasOverrides.maxPriorityFeePerGas !== undefined) {
+    sendParams.maxPriorityFeePerGas = gasOverrides.maxPriorityFeePerGas;
+  }
+
+  if (
+    gasOverrides.gasPrice !== undefined &&
+    gasOverrides.maxFeePerGas === undefined
+  ) {
+    sendParams.gasPrice = gasOverrides.gasPrice;
+  }
+
+  const response = await wallet.sendTransaction(sendParams);
 
   return {
     txHash: response.hash,
     walletAddress: wallet.address,
     chain: params.chain,
-    gasEstimate: gasEstimate.toString()
+    gasEstimate: gasOverrides.estimatedGasUnits.toString()
   };
 }
 
