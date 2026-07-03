@@ -151,6 +151,23 @@ type OpenSeaCollectionDetails = {
   openSeaMint?: OpenSeaMintMetadata;
 };
 
+export type OpenSeaContractResolutionCandidate = {
+  address: string;
+  confidence: Confidence;
+  source: string;
+  chainName?: DetectedChainName;
+  tokenStandard?: string;
+  evidence?: string;
+};
+
+export type OpenSeaContractResolutionResult = {
+  input: string;
+  candidates: OpenSeaContractResolutionCandidate[];
+  warnings: string[];
+  slug?: string;
+  collectionName?: string;
+};
+
 const ADDRESS_PATTERN = /0x[a-fA-F0-9]{40}/;
 
 const CHAIN_DETAILS: Record<
@@ -496,6 +513,449 @@ async function fetchOpenSeaCollectionDetails(
   } catch {
     return null;
   }
+}
+
+function getOpenSeaSlugFromInput(input: string): string | undefined {
+  const trimmed = input.trim();
+
+  try {
+    const url = new URL(trimmed);
+    const parts = url.pathname
+      .split("/")
+      .map((part) => part.trim())
+      .filter(Boolean);
+    const collectionIndex = parts.indexOf("collection");
+
+    if (
+      url.hostname.toLowerCase().endsWith("opensea.io") &&
+      collectionIndex !== -1 &&
+      parts[collectionIndex + 1]
+    ) {
+      return parts[collectionIndex + 1];
+    }
+  } catch {
+    // Plain slugs are handled below.
+  }
+
+  const slug = trimmed
+    .replace(/^\/+|\/+$/g, "")
+    .split(/[/?#]/)[0]
+    ?.trim();
+
+  return slug && /^[a-z0-9][a-z0-9_-]{1,80}$/i.test(slug) ? slug : undefined;
+}
+
+function getConfidenceScore(confidence: Confidence) {
+  if (confidence === "high") return 3;
+  if (confidence === "medium") return 2;
+  if (confidence === "low") return 1;
+  return 0;
+}
+
+const IGNORED_OPENSEA_CONTRACT_CANDIDATES = new Set([
+  "0x0000000000000000000000000000000000000000",
+  "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+  "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+  "0xdac17f958d2ee523a2206206994597c13d831ec7",
+  "0x6b175474e89094c44da98b954eedeac495271d0f"
+]);
+
+function addOpenSeaContractCandidate(
+  candidates: Map<string, OpenSeaContractResolutionCandidate>,
+  candidate: OpenSeaContractResolutionCandidate
+) {
+  if (!ethers.isAddress(candidate.address)) {
+    return;
+  }
+
+  const address = ethers.getAddress(candidate.address);
+  const key = address.toLowerCase();
+
+  if (IGNORED_OPENSEA_CONTRACT_CANDIDATES.has(key)) {
+    return;
+  }
+
+  const existing = candidates.get(key);
+  const normalized: OpenSeaContractResolutionCandidate = {
+    address,
+    confidence: candidate.confidence,
+    source: candidate.source,
+    ...(candidate.chainName ? { chainName: candidate.chainName } : {}),
+    ...(candidate.tokenStandard ? { tokenStandard: candidate.tokenStandard } : {}),
+    ...(candidate.evidence ? { evidence: candidate.evidence.slice(0, 160) } : {})
+  };
+
+  if (!existing || getConfidenceScore(normalized.confidence) > getConfidenceScore(existing.confidence)) {
+    candidates.set(key, normalized);
+    return;
+  }
+
+  if (existing.source !== normalized.source) {
+    existing.source = `${existing.source}, ${normalized.source}`;
+  }
+
+  if (!existing.evidence && normalized.evidence) {
+    existing.evidence = normalized.evidence;
+  }
+}
+
+function getOpenSeaApiContractCandidates(
+  data: any,
+  candidates: Map<string, OpenSeaContractResolutionCandidate>
+) {
+  const collection = data?.collection ?? data;
+  const rawCandidates = [
+    ...(Array.isArray(collection?.contracts) ? collection.contracts : []),
+    ...(Array.isArray(collection?.primary_asset_contracts)
+      ? collection.primary_asset_contracts
+      : []),
+    collection?.primary_asset_contract,
+    collection?.contract,
+    collection?.asset_contract
+  ].filter(Boolean);
+
+  for (const contract of rawCandidates) {
+    const address =
+      contract?.address ||
+      contract?.contractAddress ||
+      contract?.contract_address;
+
+    if (!address || !ethers.isAddress(address)) {
+      continue;
+    }
+
+    const chainRaw = contract.chain || collection?.chain || collection?.network;
+    const chain = normalizeChain(chainRaw);
+    const tokenStandard =
+      contract.token_standard ||
+      contract.tokenStandard ||
+      contract.schema_name ||
+      collection?.token_standard ||
+      collection?.tokenStandard;
+
+    addOpenSeaContractCandidate(candidates, {
+      address,
+      confidence: "high",
+      source: "opensea_api_collection",
+      ...(chain.name !== "unknown" ? { chainName: chain.name } : {}),
+      ...(typeof tokenStandard === "string" ? { tokenStandard } : {}),
+      evidence: "OpenSea collection API returned a collection contract."
+    });
+  }
+
+  const singleAddress =
+    collection?.contract_address ||
+    collection?.contractAddress ||
+    collection?.nft_contract_address;
+
+  if (singleAddress && ethers.isAddress(singleAddress)) {
+    const chain = normalizeChain(collection?.chain || collection?.network);
+    addOpenSeaContractCandidate(candidates, {
+      address: singleAddress,
+      confidence: "high",
+      source: "opensea_api_collection",
+      ...(chain.name !== "unknown" ? { chainName: chain.name } : {}),
+      evidence: "OpenSea collection API returned a top-level contract address."
+    });
+  }
+}
+
+async function fetchOpenSeaCollectionRaw(
+  slug: string,
+  warnings: string[]
+): Promise<any | null> {
+  const apiKey = process.env.OPENSEA_API_KEY;
+
+  if (!apiKey) {
+    return null;
+  }
+
+  try {
+    const response = await fetchWithTimeout(
+      `https://api.opensea.io/api/v2/collections/${encodeURIComponent(slug)}`,
+      {
+        method: "GET",
+        headers: {
+          accept: "application/json",
+          "x-api-key": apiKey
+        }
+      },
+      OPEN_SEA_MINT_FETCH_TIMEOUT_MS
+    );
+
+    if (response.status === 401 || response.status === 403 || response.status === 429) {
+      warnings.push(`OpenSea collection API returned HTTP ${response.status}.`);
+      return null;
+    }
+
+    if (!response.ok) {
+      warnings.push(`OpenSea collection API returned HTTP ${response.status}.`);
+      return null;
+    }
+
+    return await response.json();
+  } catch (error) {
+    warnings.push(`OpenSea collection API unavailable: ${getMintSafeErrorReason(error)}`);
+    return null;
+  }
+}
+
+function shouldUseOpenSeaAddressPath(path: string) {
+  const normalized = path.toLowerCase();
+
+  if (!/(contract|nftcontract|assetcontract)/i.test(normalized)) {
+    return false;
+  }
+
+  if (/(owner|wallet|maker|seller|buyer|creator|fee|payment|currency|token\.|price|offer|listing|user|account|recipient|\.from\.|\.to\.)/i.test(normalized)) {
+    return false;
+  }
+
+  return true;
+}
+
+function collectOpenSeaContractCandidatesFromObject(
+  value: unknown,
+  candidates: Map<string, OpenSeaContractResolutionCandidate>,
+  source: string,
+  path: string[] = [],
+  depth = 0
+) {
+  if (!value || depth > 12) {
+    return;
+  }
+
+  if (typeof value === "string") {
+    if (ethers.isAddress(value) && shouldUseOpenSeaAddressPath(path.join("."))) {
+      addOpenSeaContractCandidate(candidates, {
+        address: value,
+        confidence: path.some((part) => /contract/i.test(part)) ? "medium" : "low",
+        source,
+        evidence: `Embedded field ${path.join(".")}`
+      });
+    }
+
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    value.forEach((item, index) =>
+      collectOpenSeaContractCandidatesFromObject(
+        item,
+        candidates,
+        source,
+        [...path, String(index)],
+        depth + 1
+      )
+    );
+    return;
+  }
+
+  if (typeof value !== "object") {
+    return;
+  }
+
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    collectOpenSeaContractCandidatesFromObject(
+      child,
+      candidates,
+      source,
+      [...path, key],
+      depth + 1
+    );
+  }
+}
+
+function collectOpenSeaContractCandidatesFromText(
+  text: string,
+  candidates: Map<string, OpenSeaContractResolutionCandidate>,
+  source: string
+) {
+  const fieldPattern =
+    /\b(?:contractAddress|contract_address|nftContractAddress|assetContractAddress|collectionContractAddress)\b[^0-9a-fA-F]{0,80}(0x[a-fA-F0-9]{40})/gi;
+
+  for (const match of text.matchAll(fieldPattern)) {
+    if (!match[1] || !ethers.isAddress(match[1])) {
+      continue;
+    }
+
+    addOpenSeaContractCandidate(candidates, {
+      address: match[1],
+      confidence: "medium",
+      source,
+      evidence: "Embedded contract-address field"
+    });
+  }
+}
+
+async function fetchOpenSeaPageHtmls(slug: string, warnings: string[]) {
+  const urls = [
+    `https://opensea.io/collection/${encodeURIComponent(slug)}/overview`,
+    `https://opensea.io/collection/${encodeURIComponent(slug)}/mint`,
+    `https://opensea.io/collection/${encodeURIComponent(slug)}`
+  ];
+  const htmls: string[] = [];
+
+  for (const url of urls) {
+    try {
+      const response = await fetchWithTimeout(
+        url,
+        {
+          method: "GET",
+          headers: {
+            accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "user-agent": OPEN_SEA_PAGE_USER_AGENT
+          }
+        },
+        OPEN_SEA_MINT_FETCH_TIMEOUT_MS
+      );
+
+      if (!response.ok) {
+        warnings.push(`OpenSea page fetch returned HTTP ${response.status}.`);
+        continue;
+      }
+
+      htmls.push(await response.text());
+    } catch (error) {
+      warnings.push(`OpenSea page fetch unavailable: ${getMintSafeErrorReason(error)}`);
+    }
+  }
+
+  return htmls;
+}
+
+function getOpenSeaChainIdentifier(chainName?: DetectedChainName) {
+  if (chainName === "base") return "base";
+  if (chainName === "arbitrum") return "arbitrum";
+  if (chainName === "polygon") return "matic";
+  if (chainName === "sepolia") return "sepolia";
+  return "ethereum";
+}
+
+async function tryOpenSeaContractEndpoint(
+  candidate: OpenSeaContractResolutionCandidate,
+  warnings: string[]
+) {
+  const apiKey = process.env.OPENSEA_API_KEY;
+
+  if (!apiKey) {
+    return candidate;
+  }
+
+  try {
+    const response = await fetchWithTimeout(
+      `https://api.opensea.io/api/v2/chain/${getOpenSeaChainIdentifier(candidate.chainName)}/contract/${candidate.address}`,
+      {
+        method: "GET",
+        headers: {
+          accept: "application/json",
+          "x-api-key": apiKey
+        }
+      },
+      OPEN_SEA_MINT_FETCH_TIMEOUT_MS
+    );
+
+    if (response.status === 401 || response.status === 403 || response.status === 429) {
+      warnings.push(`OpenSea contract API returned HTTP ${response.status}.`);
+      return candidate;
+    }
+
+    if (!response.ok) {
+      return candidate;
+    }
+
+    const data: any = await response.json();
+    const tokenStandard =
+      data?.token_standard ||
+      data?.tokenStandard ||
+      data?.schema_name ||
+      candidate.tokenStandard;
+
+    return {
+      ...candidate,
+      confidence: "high" as Confidence,
+      source: candidate.source.includes("opensea_contract")
+        ? candidate.source
+        : `${candidate.source}, opensea_contract`,
+      ...(typeof tokenStandard === "string" ? { tokenStandard } : {})
+    };
+  } catch (error) {
+    warnings.push(`OpenSea contract API unavailable: ${getMintSafeErrorReason(error)}`);
+    return candidate;
+  }
+}
+
+export async function resolveOpenSeaContracts(
+  input: string
+): Promise<OpenSeaContractResolutionResult> {
+  const warnings: string[] = [];
+  const slug = getOpenSeaSlugFromInput(input);
+  const candidates = new Map<string, OpenSeaContractResolutionCandidate>();
+  let collectionName: string | undefined;
+
+  if (!slug) {
+    return {
+      input,
+      candidates: [],
+      warnings: ["Input was not recognized as an OpenSea collection slug or URL."]
+    };
+  }
+
+  const collectionRaw = await fetchOpenSeaCollectionRaw(slug, warnings);
+
+  if (collectionRaw) {
+    const collection = collectionRaw.collection ?? collectionRaw;
+    collectionName = typeof collection?.name === "string" ? collection.name : collectionName;
+    getOpenSeaApiContractCandidates(collectionRaw, candidates);
+  }
+
+  const htmls = await fetchOpenSeaPageHtmls(slug, warnings);
+
+  for (const html of htmls) {
+    collectionName = collectionName || extractOpenSeaCollectionNameFromHtml(html);
+
+    for (const payload of extractOpenSeaUrqlPayloads(html)) {
+      collectOpenSeaContractCandidatesFromObject(
+        payload,
+        candidates,
+        "opensea_page_embedded_json"
+      );
+    }
+
+    for (const scriptText of extractJsonScriptText(html)) {
+      try {
+        collectOpenSeaContractCandidatesFromObject(
+          JSON.parse(scriptText),
+          candidates,
+          "opensea_page_embedded_json"
+        );
+      } catch {
+        // Skip opaque script text for contract resolution. The parser can use it
+        // for mint-stage text, but contract resolution must stay tied to
+        // structured collection/page fields.
+      }
+    }
+  }
+
+  const validated = await Promise.all(
+    [...candidates.values()].map((candidate) =>
+      tryOpenSeaContractEndpoint(candidate, warnings)
+    )
+  );
+
+  return {
+    input,
+    slug,
+    candidates: validated
+      .filter((candidate) => candidate.confidence !== "low")
+      .sort(
+        (a, b) =>
+          getConfidenceScore(b.confidence) - getConfidenceScore(a.confidence) ||
+          a.address.localeCompare(b.address)
+      ),
+    warnings: [...new Set(warnings)].slice(0, 8),
+    ...(collectionName ? { collectionName } : {})
+  };
 }
 
 const OPEN_SEA_MINT_FETCH_TIMEOUT_MS = 8_000;
@@ -1708,6 +2168,146 @@ function applyOpenSeaMintToStructured(
   }
 }
 
+type FinalMintPhaseSummary = {
+  phaseStatus: MintPhaseStatus;
+  phaseTypeEstimate: MintPhaseTypeEstimate;
+  phaseTypeConfidence: Confidence;
+  phaseTypeEvidence: string;
+  confidence: Confidence;
+  startTime?: string;
+  endTime?: string;
+};
+
+function summarizeStagePhase(
+  stage: OpenSeaMintStage,
+  reason: "current" | "live" | "upcoming" | "ended"
+): FinalMintPhaseSummary {
+  const stageName = stage.stageName || "Unknown stage";
+  const fallbackType = estimatePhaseTypeFromTexts(
+    [stageName, stage.evidence || ""],
+    stage.phaseTypeConfidence
+  );
+  const phaseTypeEstimate =
+    stage.phaseTypeEstimate !== "unknown"
+      ? stage.phaseTypeEstimate
+      : fallbackType.phaseTypeEstimate;
+  const phaseTypeConfidence =
+    stage.phaseTypeEstimate !== "unknown"
+      ? stage.phaseTypeConfidence
+      : fallbackType.phaseTypeConfidence;
+  const phaseTypeEvidence =
+    reason === "current"
+      ? `Current live stage is ${stageName}.`
+      : reason === "live"
+        ? `Highest-confidence live stage is ${stageName}.`
+        : reason === "upcoming"
+          ? `Nearest upcoming stage is ${stageName}.`
+          : `All detected stages have ended; latest detected stage is ${stageName}.`;
+
+  return {
+    phaseStatus: reason === "ended" ? "ended" : stage.status,
+    phaseTypeEstimate,
+    phaseTypeConfidence,
+    phaseTypeEvidence,
+    confidence: phaseTypeConfidence,
+    ...(stage.startTimeText ? { startTime: stage.startTimeText } : {}),
+    ...(stage.endTimeText ? { endTime: stage.endTimeText } : {})
+  };
+}
+
+function getOpenSeaCurrentStage(openSeaMint: OpenSeaMintMetadata) {
+  if (!openSeaMint.currentStageName) {
+    return undefined;
+  }
+
+  return openSeaMint.mintSchedule.find(
+    (stage) =>
+      stage.stageName?.toLowerCase() === openSeaMint.currentStageName?.toLowerCase()
+  );
+}
+
+function summarizeOpenSeaFinalPhase(
+  openSeaMint?: OpenSeaMintMetadata
+): FinalMintPhaseSummary | null {
+  if (!openSeaMint || openSeaMint.mintSchedule.length === 0) {
+    const status = classifyStatusFromMintText(openSeaMint?.mintStatusText);
+
+    return status === "unknown"
+      ? null
+      : {
+          phaseStatus: status,
+          phaseTypeEstimate: "unknown",
+          phaseTypeConfidence: "unknown",
+          phaseTypeEvidence:
+            "OpenSea mint status was detected, but no stage label was available.",
+          confidence: openSeaMint?.confidence || "unknown"
+        };
+  }
+
+  const currentStage = getOpenSeaCurrentStage(openSeaMint);
+
+  if (currentStage && currentStage.status === "live") {
+    return summarizeStagePhase(currentStage, "current");
+  }
+
+  const liveStages = openSeaMint.mintSchedule
+    .filter((stage) => stage.status === "live")
+    .sort(
+      (a, b) =>
+        getConfidenceScore(b.phaseTypeConfidence) -
+        getConfidenceScore(a.phaseTypeConfidence)
+    );
+
+  if (liveStages[0]) {
+    return summarizeStagePhase(liveStages[0], "live");
+  }
+
+  if (currentStage) {
+    return summarizeStagePhase(
+      currentStage,
+      currentStage.status === "not_live_yet"
+        ? "upcoming"
+        : currentStage.status === "ended"
+          ? "ended"
+          : "current"
+    );
+  }
+
+  const upcomingStages = openSeaMint.mintSchedule
+    .filter((stage) => stage.status === "not_live_yet")
+    .sort((a, b) => {
+      const aTime = a.startTimeText ? Date.parse(a.startTimeText) : Number.POSITIVE_INFINITY;
+      const bTime = b.startTimeText ? Date.parse(b.startTimeText) : Number.POSITIVE_INFINITY;
+      return aTime - bTime;
+    });
+
+  if (upcomingStages[0]) {
+    return summarizeStagePhase(upcomingStages[0], "upcoming");
+  }
+
+  if (openSeaMint.mintSchedule.every((stage) => stage.status === "ended")) {
+    return summarizeStagePhase(
+      openSeaMint.mintSchedule.at(-1) || openSeaMint.mintSchedule[0]!,
+      "ended"
+    );
+  }
+
+  const status = classifyStatusFromMintText(openSeaMint.mintStatusText);
+
+  if (status !== "unknown") {
+    return {
+      phaseStatus: status,
+      phaseTypeEstimate: "unknown",
+      phaseTypeConfidence: "unknown",
+      phaseTypeEvidence:
+        "OpenSea mint status was detected, but the current stage type was not clear.",
+      confidence: openSeaMint.confidence
+    };
+  }
+
+  return null;
+}
+
 export async function detectMint(
   input: string,
   walletAddress?: string
@@ -1907,6 +2507,21 @@ export async function detectMint(
     if (contractAddress && !supportedChain) {
       warnings.push("Read-only function and phase detection currently supports mainnet and sepolia only.");
     }
+  }
+
+  const openSeaFinalPhase = summarizeOpenSeaFinalPhase(openSeaMint);
+
+  if (openSeaFinalPhase) {
+    phaseStatus = openSeaFinalPhase.phaseStatus;
+    phaseTypeEstimate = openSeaFinalPhase.phaseTypeEstimate;
+    phaseTypeConfidence = openSeaFinalPhase.phaseTypeConfidence;
+    phaseTypeEvidence = openSeaFinalPhase.phaseTypeEvidence;
+    startTime = openSeaFinalPhase.startTime || startTime;
+    endTime = openSeaFinalPhase.endTime || endTime;
+    mintConfidence =
+      getConfidenceScore(openSeaFinalPhase.confidence) > getConfidenceScore(mintConfidence)
+        ? openSeaFinalPhase.confidence
+        : mintConfidence;
   }
 
   return {
