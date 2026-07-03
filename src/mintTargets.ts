@@ -1,4 +1,3 @@
-import fs from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
 import type {
@@ -15,6 +14,11 @@ import {
   normalizeGasStrategy
 } from "./gasStrategy.js";
 import type { GasStrategy } from "./gasStrategy.js";
+import {
+  loadJsonFile,
+  saveJsonFileAtomic,
+  updateJsonFileSync
+} from "./jsonStore.js";
 
 export type MintTargetStatus = "active" | "archived";
 export type MintTargetCompleteness = "complete" | "incomplete";
@@ -110,6 +114,7 @@ type UpdateMintTargetGasStrategyParams = {
 };
 
 const MINT_TARGETS_PATH = path.join(process.cwd(), "data", "mintTargets.json");
+const EMPTY_MINT_TARGETS_FILE: MintTargetsFile = { targets: [] };
 const SUPPORTED_STORED_MINT_SIGNATURES: SupportedMintFunctionSignature[] = [
   "mint(uint256)",
   "publicMint(uint256)",
@@ -413,46 +418,34 @@ function normalizeStoredMintTarget(raw: any): MintTarget | null {
   };
 }
 
-function writeMintTargets(targets: MintTarget[]) {
-  const dir = path.dirname(MINT_TARGETS_PATH);
-
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-
-  fs.writeFileSync(
-    MINT_TARGETS_PATH,
-    JSON.stringify({ targets }, null, 2),
-    "utf8"
-  );
-}
-
-function loadMintTargetsFile(): MintTargetsFile {
-  if (!fs.existsSync(MINT_TARGETS_PATH)) {
-    return { targets: [] };
-  }
-
-  const raw = fs.readFileSync(MINT_TARGETS_PATH, "utf8");
-
-  if (!raw.trim()) {
-    return { targets: [] };
-  }
-
-  const parsed = JSON.parse(raw);
+function normalizeMintTargetsFile(parsed: MintTargetsFile): MintTargetsFile {
   const rawTargets: any[] = Array.isArray(parsed.targets) ? parsed.targets : [];
   const targets = rawTargets
     .map(normalizeStoredMintTarget)
     .filter((target): target is MintTarget => Boolean(target));
 
-  if (targets.length !== rawTargets.length) {
-    writeMintTargets(targets);
-  }
-
   return { targets };
 }
 
+function writeMintTargets(targets: MintTarget[]) {
+  saveJsonFileAtomic(MINT_TARGETS_PATH, { targets });
+}
+
+function loadMintTargetsFile(): MintTargetsFile {
+  const parsed = loadJsonFile<MintTargetsFile>(
+    MINT_TARGETS_PATH,
+    EMPTY_MINT_TARGETS_FILE
+  );
+  const file = normalizeMintTargetsFile(parsed);
+
+  if (file.targets.length !== (Array.isArray(parsed.targets) ? parsed.targets.length : 0)) {
+    writeMintTargets(file.targets);
+  }
+
+  return file;
+}
+
 export function createMintTarget(params: CreateMintTargetParams): MintTarget {
-  const file = loadMintTargetsFile();
   const now = new Date().toISOString();
   const quantity = params.quantity || 1;
   const target: MintTarget = {
@@ -481,9 +474,53 @@ export function createMintTarget(params: CreateMintTargetParams): MintTarget {
     ...(params.detectedMetadata ? { detectedMetadata: params.detectedMetadata } : {})
   };
 
-  file.targets.push(target);
-  writeMintTargets(file.targets);
+  updateJsonFileSync<MintTargetsFile>(
+    MINT_TARGETS_PATH,
+    EMPTY_MINT_TARGETS_FILE,
+    (current) => {
+      const file = normalizeMintTargetsFile(current);
+      file.targets.push(target);
+      return file;
+    }
+  );
   return target;
+}
+
+function updateMintTargetRecord(
+  targetId: string,
+  ownerTelegramId: string,
+  updater: (target: MintTarget) => void,
+  options: { includeArchived?: boolean; archivedError?: string } = {}
+) {
+  let updatedTarget: MintTarget | undefined;
+
+  updateJsonFileSync<MintTargetsFile>(
+    MINT_TARGETS_PATH,
+    EMPTY_MINT_TARGETS_FILE,
+    (current) => {
+      const file = normalizeMintTargetsFile(current);
+      const target = file.targets.find(
+        (savedTarget) =>
+          savedTarget.targetId === targetId &&
+          savedTarget.ownerTelegramId === ownerTelegramId
+      );
+
+      if (!target) {
+        throw new Error("Mint target not found for this Telegram user.");
+      }
+
+      if (!options.includeArchived && target.status === "archived") {
+        throw new Error(options.archivedError || "Mint target is archived and cannot be updated.");
+      }
+
+      updater(target);
+      target.updatedAt = new Date().toISOString();
+      updatedTarget = target;
+      return file;
+    }
+  );
+
+  return updatedTarget!;
 }
 
 export function listMintTargetsForOwner(ownerTelegramId: string) {
@@ -520,34 +557,17 @@ export function updateMintTargetForOwner(
   ownerTelegramId: string,
   updates: UpdateMintTargetParams
 ) {
-  const file = loadMintTargetsFile();
-  const target = file.targets.find(
-    (savedTarget) =>
-      savedTarget.targetId === targetId &&
-      savedTarget.ownerTelegramId === ownerTelegramId
-  );
+  return updateMintTargetRecord(targetId, ownerTelegramId, (target) => {
+    if (updates.contractAddress !== undefined) {
+      target.contractAddress = updates.contractAddress;
+    }
 
-  if (!target) {
-    throw new Error("Mint target not found for this Telegram user.");
-  }
-
-  if (target.status === "archived") {
-    throw new Error("Mint target is archived and cannot be updated.");
-  }
-
-  if (updates.contractAddress !== undefined) {
-    target.contractAddress = updates.contractAddress;
-  }
-
-  target.chain = updates.chain;
-  target.functionSignature = updates.functionSignature;
-  target.quantity = updates.quantity;
-  target.priceEth = updates.priceEth;
-  target.targetCompleteness = calculateMintTargetCompleteness(target);
-  target.updatedAt = new Date().toISOString();
-
-  writeMintTargets(file.targets);
-  return target;
+    target.chain = updates.chain;
+    target.functionSignature = updates.functionSignature;
+    target.quantity = updates.quantity;
+    target.priceEth = updates.priceEth;
+    target.targetCompleteness = calculateMintTargetCompleteness(target);
+  });
 }
 
 export function updateMintTargetDetectedMetadataForOwner(
@@ -555,43 +575,31 @@ export function updateMintTargetDetectedMetadataForOwner(
   ownerTelegramId: string,
   updates: UpdateMintTargetMetadataParams
 ) {
-  const file = loadMintTargetsFile();
-  const target = file.targets.find(
-    (savedTarget) =>
-      savedTarget.targetId === targetId &&
-      savedTarget.ownerTelegramId === ownerTelegramId
+  return updateMintTargetRecord(
+    targetId,
+    ownerTelegramId,
+    (target) => {
+      if (updates.sourceUrl) {
+        target.sourceUrl = updates.sourceUrl;
+      }
+
+      if (updates.collectionSlug) {
+        target.collectionSlug = updates.collectionSlug;
+      }
+
+      if (updates.contractAddress) {
+        target.contractAddress = updates.contractAddress;
+      }
+
+      if (updates.chain) {
+        target.chain = updates.chain;
+      }
+
+      target.detectedMetadata = updates.detectedMetadata;
+      target.targetCompleteness = calculateMintTargetCompleteness(target);
+    },
+    { archivedError: "Mint target is archived and cannot be refreshed." }
   );
-
-  if (!target) {
-    throw new Error("Mint target not found for this Telegram user.");
-  }
-
-  if (target.status === "archived") {
-    throw new Error("Mint target is archived and cannot be refreshed.");
-  }
-
-  if (updates.sourceUrl) {
-    target.sourceUrl = updates.sourceUrl;
-  }
-
-  if (updates.collectionSlug) {
-    target.collectionSlug = updates.collectionSlug;
-  }
-
-  if (updates.contractAddress) {
-    target.contractAddress = updates.contractAddress;
-  }
-
-  if (updates.chain) {
-    target.chain = updates.chain;
-  }
-
-  target.detectedMetadata = updates.detectedMetadata;
-  target.targetCompleteness = calculateMintTargetCompleteness(target);
-  target.updatedAt = new Date().toISOString();
-
-  writeMintTargets(file.targets);
-  return target;
 }
 
 export function updateMintTargetMintSettingsForOwner(
@@ -599,28 +607,11 @@ export function updateMintTargetMintSettingsForOwner(
   ownerTelegramId: string,
   updates: UpdateMintTargetMintSettingsParams
 ) {
-  const file = loadMintTargetsFile();
-  const target = file.targets.find(
-    (savedTarget) =>
-      savedTarget.targetId === targetId &&
-      savedTarget.ownerTelegramId === ownerTelegramId
-  );
-
-  if (!target) {
-    throw new Error("Mint target not found for this Telegram user.");
-  }
-
-  if (target.status === "archived") {
-    throw new Error("Mint target is archived and cannot be updated.");
-  }
-
-  target.mintType = updates.mintType;
-  target.maxRetries = updates.maxRetries;
-  target.retryDelayMs = updates.retryDelayMs;
-  target.updatedAt = new Date().toISOString();
-
-  writeMintTargets(file.targets);
-  return target;
+  return updateMintTargetRecord(targetId, ownerTelegramId, (target) => {
+    target.mintType = updates.mintType;
+    target.maxRetries = updates.maxRetries;
+    target.retryDelayMs = updates.retryDelayMs;
+  });
 }
 
 export function updateMintTargetGasStrategyForOwner(
@@ -628,52 +619,27 @@ export function updateMintTargetGasStrategyForOwner(
   ownerTelegramId: string,
   updates: UpdateMintTargetGasStrategyParams
 ) {
-  const file = loadMintTargetsFile();
-  const target = file.targets.find(
-    (savedTarget) =>
-      savedTarget.targetId === targetId &&
-      savedTarget.ownerTelegramId === ownerTelegramId
-  );
-
-  if (!target) {
-    throw new Error("Mint target not found for this Telegram user.");
-  }
-
-  if (target.status === "archived") {
-    throw new Error("Mint target is archived and cannot be updated.");
-  }
-
-  const now = new Date().toISOString();
-  target.gasStrategy = {
-    ...normalizeGasStrategy(updates.gasStrategy || createDefaultGasStrategy(now)),
-    updatedAt: now
-  };
-  target.updatedAt = now;
-
-  writeMintTargets(file.targets);
-  return target;
+  return updateMintTargetRecord(targetId, ownerTelegramId, (target) => {
+    const now = new Date().toISOString();
+    target.gasStrategy = {
+      ...normalizeGasStrategy(updates.gasStrategy || createDefaultGasStrategy(now)),
+      updatedAt: now
+    };
+  });
 }
 
 export function archiveMintTargetForOwner(
   targetId: string,
   ownerTelegramId: string
 ) {
-  const file = loadMintTargetsFile();
-  const target = file.targets.find(
-    (savedTarget) =>
-      savedTarget.targetId === targetId &&
-      savedTarget.ownerTelegramId === ownerTelegramId
+  return updateMintTargetRecord(
+    targetId,
+    ownerTelegramId,
+    (target) => {
+      if (target.status !== "archived") {
+        target.status = "archived";
+      }
+    },
+    { includeArchived: true }
   );
-
-  if (!target) {
-    throw new Error("Mint target not found for this Telegram user.");
-  }
-
-  if (target.status !== "archived") {
-    target.status = "archived";
-    target.updatedAt = new Date().toISOString();
-    writeMintTargets(file.targets);
-  }
-
-  return target;
 }

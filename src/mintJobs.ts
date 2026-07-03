@@ -1,10 +1,14 @@
-import fs from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
 import type {
   MintChain,
   SupportedMintFunctionSignature
 } from "./mintEngine.js";
+import {
+  loadJsonFile,
+  saveJsonFileAtomic,
+  updateJsonFileSync
+} from "./jsonStore.js";
 
 export type MintJobMintType =
   | "manual"
@@ -92,6 +96,7 @@ type UpdateMintJobParams = Partial<{
 }>;
 
 const MINT_JOBS_PATH = path.join(process.cwd(), "data", "mintJobs.json");
+const EMPTY_MINT_JOBS_FILE: MintJobsFile = { jobs: [] };
 const MAX_MINT_JOB_RETRIES = 5;
 const SUPPORTED_STORED_MINT_SIGNATURES: SupportedMintFunctionSignature[] = [
   "mint(uint256)",
@@ -260,46 +265,34 @@ function normalizeStoredMintJob(raw: any): MintJob | null {
   };
 }
 
-function writeMintJobs(jobs: MintJob[]) {
-  const dir = path.dirname(MINT_JOBS_PATH);
-
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-
-  fs.writeFileSync(
-    MINT_JOBS_PATH,
-    JSON.stringify({ jobs }, null, 2),
-    "utf8"
-  );
-}
-
-function loadMintJobsFile(): MintJobsFile {
-  if (!fs.existsSync(MINT_JOBS_PATH)) {
-    return { jobs: [] };
-  }
-
-  const raw = fs.readFileSync(MINT_JOBS_PATH, "utf8");
-
-  if (!raw.trim()) {
-    return { jobs: [] };
-  }
-
-  const parsed = JSON.parse(raw);
+function normalizeMintJobsFile(parsed: MintJobsFile): MintJobsFile {
   const rawJobs: any[] = Array.isArray(parsed.jobs) ? parsed.jobs : [];
   const jobs = rawJobs
     .map(normalizeStoredMintJob)
     .filter((job): job is MintJob => Boolean(job));
 
-  if (jobs.length !== rawJobs.length) {
-    writeMintJobs(jobs);
-  }
-
   return { jobs };
 }
 
+function writeMintJobs(jobs: MintJob[]) {
+  saveJsonFileAtomic(MINT_JOBS_PATH, { jobs });
+}
+
+function loadMintJobsFile(): MintJobsFile {
+  const parsed = loadJsonFile<MintJobsFile>(
+    MINT_JOBS_PATH,
+    EMPTY_MINT_JOBS_FILE
+  );
+  const file = normalizeMintJobsFile(parsed);
+
+  if (file.jobs.length !== (Array.isArray(parsed.jobs) ? parsed.jobs.length : 0)) {
+    writeMintJobs(file.jobs);
+  }
+
+  return file;
+}
+
 export function createMintJob(params: CreateMintJobParams): MintJob {
-  const file = loadMintJobsFile();
   const now = new Date().toISOString();
   const defaults = getMintTypeDefaults(params.mintType);
   const maxRetries = clampMintJobRetries(params.maxRetries ?? defaults.maxRetries);
@@ -333,8 +326,15 @@ export function createMintJob(params: CreateMintJobParams): MintJob {
     updatedAt: now
   };
 
-  file.jobs.push(job);
-  writeMintJobs(file.jobs);
+  updateJsonFileSync<MintJobsFile>(
+    MINT_JOBS_PATH,
+    EMPTY_MINT_JOBS_FILE,
+    (current) => {
+      const file = normalizeMintJobsFile(current);
+      file.jobs.push(job);
+      return file;
+    }
+  );
   return job;
 }
 
@@ -374,47 +374,57 @@ export function updateMintJobForOwner(
   ownerTelegramId: string,
   updates: UpdateMintJobParams
 ) {
-  const file = loadMintJobsFile();
-  const job = file.jobs.find(
-    (savedJob) =>
-      savedJob.jobId === jobId && savedJob.ownerTelegramId === ownerTelegramId
+  let updatedJob: MintJob | undefined;
+
+  updateJsonFileSync<MintJobsFile>(
+    MINT_JOBS_PATH,
+    EMPTY_MINT_JOBS_FILE,
+    (current) => {
+      const file = normalizeMintJobsFile(current);
+      const job = file.jobs.find(
+        (savedJob) =>
+          savedJob.jobId === jobId && savedJob.ownerTelegramId === ownerTelegramId
+      );
+
+      if (!job) {
+        throw new Error("Mint job not found for this Telegram user.");
+      }
+
+      if (updates.status) {
+        job.status = updates.status;
+      }
+
+      if (updates.attempts !== undefined) {
+        job.attempts = Math.max(0, Math.floor(updates.attempts));
+      }
+
+      if (updates.lastCheckedAt) {
+        job.lastCheckedAt = updates.lastCheckedAt;
+      }
+
+      if (updates.lastRunId) {
+        job.lastRunId = updates.lastRunId;
+      }
+
+      if (updates.txHash) {
+        job.txHash = updates.txHash;
+      }
+
+      if (updates.safeErrorReason) {
+        job.safeErrorReason = updates.safeErrorReason.slice(0, 300);
+      }
+
+      if (updates.endTimeISO) {
+        job.endTimeISO = updates.endTimeISO;
+      }
+
+      job.updatedAt = new Date().toISOString();
+      updatedJob = job;
+      return file;
+    }
   );
 
-  if (!job) {
-    throw new Error("Mint job not found for this Telegram user.");
-  }
-
-  if (updates.status) {
-    job.status = updates.status;
-  }
-
-  if (updates.attempts !== undefined) {
-    job.attempts = Math.max(0, Math.floor(updates.attempts));
-  }
-
-  if (updates.lastCheckedAt) {
-    job.lastCheckedAt = updates.lastCheckedAt;
-  }
-
-  if (updates.lastRunId) {
-    job.lastRunId = updates.lastRunId;
-  }
-
-  if (updates.txHash) {
-    job.txHash = updates.txHash;
-  }
-
-  if (updates.safeErrorReason) {
-    job.safeErrorReason = updates.safeErrorReason.slice(0, 300);
-  }
-
-  if (updates.endTimeISO) {
-    job.endTimeISO = updates.endTimeISO;
-  }
-
-  job.updatedAt = new Date().toISOString();
-  writeMintJobs(file.jobs);
-  return job;
+  return updatedJob!;
 }
 
 export function updateMintJobStatus(
@@ -428,4 +438,3 @@ export function updateMintJobStatus(
     ...(safeErrorReason ? { safeErrorReason } : {})
   });
 }
-
