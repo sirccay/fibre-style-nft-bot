@@ -1018,23 +1018,8 @@ function formatMintPreviewMessage(
     `Function: ${preview.functionSignature}`,
     `Quantity: ${preview.quantity}`,
     `Price Each: ${preview.priceEth} ETH`,
-    `Total Mint Cost: ${preview.totalCostEth} ETH`,
-    `Estimated Gas: ${preview.gasEstimate || "Not available"}`,
-    ...(preview.gasStrategyMode
-      ? [
-          `Gas Strategy: ${preview.gasStrategyMode}`,
-          ...(preview.gasLimit ? [`Gas Limit: ${preview.gasLimit}`] : []),
-          ...(preview.maxFeeGwei ? [`Max Fee: ${preview.maxFeeGwei} gwei`] : []),
-          ...(preview.maxPriorityFeeGwei ? [`Priority Fee: ${preview.maxPriorityFeeGwei} gwei`] : []),
-          ...(preview.gasPriceGwei ? [`Gas Price: ${preview.gasPriceGwei} gwei`] : []),
-          ...(preview.estimatedGasCostEth
-            ? [`Estimated Gas Cost: ${preview.estimatedGasCostEth} ETH`]
-            : []),
-          ...(preview.estimatedTotalCostEth
-            ? [`Estimated Total Cost: ${preview.estimatedTotalCostEth} ETH`]
-            : [])
-        ]
-      : []),
+    `Total Mint Cost: ${formatEthWithUsd(preview.totalCostEth)}`,
+    ...formatGasFields(preview).split("\n"),
     `Minting Lock: ${getMintLockStatusText(preview.chain)}`
   ];
 
@@ -1487,6 +1472,131 @@ async function getOwnedActiveWalletSummaries(ownerTelegramId: string, walletLabe
   return wallets;
 }
 
+function getEthUsdPrice(): number | null {
+  const rawPrice = process.env.ETH_USD_PRICE || process.env.ETH_PRICE_USD;
+
+  if (!rawPrice?.trim()) {
+    return null;
+  }
+
+  const parsed = Number(rawPrice);
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+
+  return parsed;
+}
+
+function formatUsd(value: number): string {
+  return `$${value.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  })}`;
+}
+
+function formatEthWithUsd(ethValue?: string | null): string {
+  if (!ethValue) {
+    return "Not available";
+  }
+
+  const ethUsdPrice = getEthUsdPrice();
+
+  if (!ethUsdPrice) {
+    return `${ethValue} ETH`;
+  }
+
+  const parsedEth = Number(ethValue);
+
+  if (!Number.isFinite(parsedEth)) {
+    return `${ethValue} ETH`;
+  }
+
+  return `${ethValue} ETH (~${formatUsd(parsedEth * ethUsdPrice)})`;
+}
+
+function formatEthUsdSourceLine(): string {
+  const ethUsdPrice = getEthUsdPrice();
+
+  if (!ethUsdPrice) {
+    return "USD Budget: Set ETH_USD_PRICE in .env to show USD estimates.";
+  }
+
+  return `USD Budget Rate: 1 ETH = ${formatUsd(ethUsdPrice)}`;
+}
+
+function getPreviewFeeGwei(preview: MintPreviewResult): number | null {
+  const rawFee = preview.maxFeeGwei || preview.gasPriceGwei;
+
+  if (!rawFee) {
+    return null;
+  }
+
+  const parsed = Number(rawFee);
+
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatGasAdvisor(preview: MintPreviewResult): string {
+  if (preview.gasEstimateFailed) {
+    return "Blocked: gas estimation failed. Check mint live status, wallet eligibility, price, and function.";
+  }
+
+  if (preview.fundedEnough === false) {
+    return "Blocked: wallet balance is below the estimated mint plus gas total.";
+  }
+
+  const feeGwei = getPreviewFeeGwei(preview);
+
+  if (feeGwei !== null && feeGwei >= 150) {
+    return "High risk: fee cap is very high. Consider waiting, lowering gas, or using a smaller wallet set.";
+  }
+
+  if (feeGwei !== null && feeGwei >= 60) {
+    return "Elevated: gas is above normal. Confirm only if speed matters.";
+  }
+
+  const gasCostEth = Number(preview.estimatedGasCostEth || "0");
+  const mintCostEth = Number(preview.totalCostEth);
+
+  if (
+    Number.isFinite(gasCostEth) &&
+    Number.isFinite(mintCostEth) &&
+    mintCostEth > 0 &&
+    gasCostEth > mintCostEth * 0.5
+  ) {
+    return "Review: gas cost is high compared with the mint price.";
+  }
+
+  return "Normal: gas looks acceptable for the selected strategy.";
+}
+
+function formatMultiGasBudgetSummary(previews: MintPreviewResult[]) {
+  if (previews.length === 0) {
+    return ["Wallets Previewed: 0"];
+  }
+
+  const estimatedGasCostWei = previews.reduce(
+    (total, preview) => total + (preview.estimatedGasCostWei ?? 0n),
+    0n
+  );
+  const estimatedTotalCostWei = previews.reduce(
+    (total, preview) => total + (preview.estimatedTotalCostWei ?? 0n),
+    0n
+  );
+  const underfundedCount = previews.filter((preview) => preview.fundedEnough === false).length;
+  const failedGasCount = previews.filter((preview) => preview.gasEstimateFailed).length;
+
+  return [
+    `Wallets Previewed: ${previews.length}`,
+    `Estimated Gas Budget: ${formatEthWithUsd(ethers.formatEther(estimatedGasCostWei))}`,
+    `Estimated Total Budget: ${formatEthWithUsd(ethers.formatEther(estimatedTotalCostWei))}`,
+    `Underfunded Wallets: ${underfundedCount}`,
+    `Gas Estimate Failures: ${failedGasCount}`,
+    formatEthUsdSourceLine()
+  ];
+}
+
 function formatGasFields(preview: MintPreviewResult) {
   return [
     `Gas Strategy: ${preview.gasStrategyMode || "auto"}`,
@@ -1496,17 +1606,19 @@ function formatGasFields(preview: MintPreviewResult) {
     ...(preview.maxPriorityFeeGwei ? [`Priority Fee: ${preview.maxPriorityFeeGwei} gwei`] : []),
     ...(preview.gasPriceGwei ? [`Gas Price: ${preview.gasPriceGwei} gwei`] : []),
     ...(preview.estimatedGasCostEth
-      ? [`Estimated Gas Cost: ${preview.estimatedGasCostEth} ETH`]
+      ? [`Estimated Gas Cost: ${formatEthWithUsd(preview.estimatedGasCostEth)}`]
       : []),
     ...(preview.estimatedTotalCostEth
-      ? [`Estimated Total Cost: ${preview.estimatedTotalCostEth} ETH`]
+      ? [`Estimated Total Cost: ${formatEthWithUsd(preview.estimatedTotalCostEth)}`]
       : []),
     ...(preview.walletBalanceEth
       ? [
-          `Wallet Balance: ${preview.walletBalanceEth} ETH`,
+          `Wallet Balance: ${formatEthWithUsd(preview.walletBalanceEth)}`,
           `Funded Enough: ${preview.fundedEnough ? "yes" : "no"}`
         ]
-      : [])
+      : []),
+    `Gas Advisor: ${formatGasAdvisor(preview)}`,
+    formatEthUsdSourceLine()
   ].join("\n");
 }
 
@@ -2365,13 +2477,36 @@ ${submitted.txHash}`
   return { status, results };
 }
 
+async function previewGasForMintSnapshot(params: {
+  ownerTelegramId: string;
+  walletLabel: string;
+  contractAddress: string;
+  functionSignature: SupportedMintFunctionSignature;
+  quantity: number;
+  priceEth: string;
+  chain: MintChain;
+  gasStrategy: GasStrategy;
+}) {
+  return previewMint({
+    ownerTelegramId: params.ownerTelegramId,
+    walletLabel: params.walletLabel,
+    contractAddress: params.contractAddress,
+    functionSignature: params.functionSignature,
+    quantity: params.quantity,
+    priceEth: params.priceEth,
+    chain: params.chain,
+    gasStrategy: params.gasStrategy
+  });
+}
+
 async function previewGasForTargetWallet(params: {
   ownerTelegramId: string;
   target: MintTarget;
   walletLabel: string;
+  gasStrategy?: GasStrategy;
 }) {
   const target = requireCompleteMintTarget(params.target);
-  return previewMint({
+  return previewGasForMintSnapshot({
     ownerTelegramId: params.ownerTelegramId,
     walletLabel: params.walletLabel,
     contractAddress: target.contractAddress,
@@ -2379,24 +2514,34 @@ async function previewGasForTargetWallet(params: {
     quantity: target.quantity,
     priceEth: target.priceEth,
     chain: target.chain,
-    gasStrategy: getTargetGasStrategy(target)
+    gasStrategy: params.gasStrategy || getTargetGasStrategy(target)
   });
 }
 
-async function getMultiMintPreflight(params: {
+async function getMultiMintPreflightForSnapshot(params: {
   ownerTelegramId: string;
-  target: MintTarget;
   walletLabels: string[];
+  contractAddress: string;
+  functionSignature: SupportedMintFunctionSignature;
+  quantity: number;
+  priceEth: string;
+  chain: MintChain;
+  gasStrategy: GasStrategy;
 }) {
   const previews: MintPreviewResult[] = [];
   const failures: Array<{ walletLabel: string; reason: string }> = [];
 
   for (const walletLabel of params.walletLabels) {
     try {
-      const preview = await previewGasForTargetWallet({
+      const preview = await previewGasForMintSnapshot({
         ownerTelegramId: params.ownerTelegramId,
-        target: params.target,
-        walletLabel
+        walletLabel,
+        contractAddress: params.contractAddress,
+        functionSignature: params.functionSignature,
+        quantity: params.quantity,
+        priceEth: params.priceEth,
+        chain: params.chain,
+        gasStrategy: params.gasStrategy
       });
       previews.push(preview);
 
@@ -2422,18 +2567,42 @@ async function getMultiMintPreflight(params: {
   return { previews, failures };
 }
 
+async function getMultiMintPreflight(params: {
+  ownerTelegramId: string;
+  target: MintTarget;
+  walletLabels: string[];
+  gasStrategy?: GasStrategy;
+}) {
+  const target = requireCompleteMintTarget(params.target);
+
+  return getMultiMintPreflightForSnapshot({
+    ownerTelegramId: params.ownerTelegramId,
+    walletLabels: params.walletLabels,
+    contractAddress: target.contractAddress,
+    functionSignature: target.functionSignature,
+    quantity: target.quantity,
+    priceEth: target.priceEth,
+    chain: target.chain,
+    gasStrategy: params.gasStrategy || getTargetGasStrategy(target)
+  });
+}
+
 function formatMultiGasPreview(previews: MintPreviewResult[], failures: Array<{ walletLabel: string; reason: string }>) {
   const lines = [
     "Multi Gas Preview",
+    "",
+    formatMultiGasBudgetSummary(previews).join("\n"),
     "",
     ...previews.map((preview) =>
       [
         `Wallet: ${preview.walletLabel}`,
         `Address: ${formatShortAddress(preview.walletAddress)}`,
-        `Balance: ${preview.walletBalanceEth || "Unknown"} ETH`,
-        `Estimated Total Cost: ${preview.estimatedTotalCostEth || "Not available"} ETH`,
+        `Balance: ${preview.walletBalanceEth ? formatEthWithUsd(preview.walletBalanceEth) : "Unknown"}`,
+        `Estimated Gas Cost: ${formatEthWithUsd(preview.estimatedGasCostEth)}`,
+        `Estimated Total Cost: ${formatEthWithUsd(preview.estimatedTotalCostEth)}`,
         `Funded Enough: ${preview.fundedEnough === undefined ? "unknown" : preview.fundedEnough ? "yes" : "no"}`,
         `Gas: ${preview.gasEstimate || "Not available"}`,
+        `Gas Advisor: ${formatGasAdvisor(preview)}`,
         ...(preview.gasEstimateError ? [`Reason: ${preview.gasEstimateError}`] : [])
       ].join("\n")
     )
@@ -2464,11 +2633,15 @@ async function runMultiMintJobReadinessCheck(
   const checkedAt = new Date().toISOString();
 
   try {
-    const target = getMintTargetForOwner(job.targetId, job.ownerTelegramId);
-    const preflight = await getMultiMintPreflight({
+    const preflight = await getMultiMintPreflightForSnapshot({
       ownerTelegramId: job.ownerTelegramId,
-      target,
-      walletLabels: job.walletLabels
+      walletLabels: job.walletLabels,
+      contractAddress: job.contractAddress,
+      functionSignature: job.functionSignature,
+      quantity: job.quantity,
+      priceEth: job.priceEth,
+      chain: job.chain,
+      gasStrategy: job.gasStrategy
     });
     const allBlocked =
       preflight.previews.length === 0 ||
@@ -7167,6 +7340,17 @@ bot.command("runmultimintjob", async (ctx) => {
       return;
     }
 
+    const preflight = await getMultiMintPreflightForSnapshot({
+      ownerTelegramId,
+      walletLabels: job.walletLabels,
+      contractAddress: job.contractAddress,
+      functionSignature: job.functionSignature,
+      quantity: job.quantity,
+      priceEth: job.priceEth,
+      chain: job.chain,
+      gasStrategy: job.gasStrategy
+    });
+
     const session = createMultiMintConfirmationSession({
       ownerTelegramId,
       targetId: job.targetId,
@@ -7201,6 +7385,9 @@ bot.command("runmultimintjob", async (ctx) => {
       `Multi-Mint Job Confirmation
 
 ${formatMultiMintJob(job)}
+
+Preflight with saved job gas strategy:
+${formatMultiGasPreview(preflight.previews, preflight.failures)}
 
 This confirmation expires in 10 minutes.
 
