@@ -19,6 +19,7 @@ export type MintRun = {
   runId: string;
   ownerTelegramId: string;
   targetId?: string;
+  jobId?: string;
   walletLabel: string;
   walletAddress: string;
   chain: MintChain;
@@ -41,6 +42,7 @@ type MintRunsFile = {
 type CreateMintRunParams = {
   ownerTelegramId: string;
   targetId?: string;
+  jobId?: string;
   walletLabel: string;
   walletAddress: string;
   chain: MintChain;
@@ -58,6 +60,7 @@ type UpdateMintRunParams = Partial<{
   status: MintRunStatus;
   errorReason: string;
   confirmedAt: string;
+  jobId: string;
 }>;
 
 const MINT_RUNS_PATH = path.join(process.cwd(), "data", "mintRuns.json");
@@ -121,6 +124,7 @@ function normalizeStoredMintRun(raw: any): MintRun | null {
     runId: raw.runId,
     ownerTelegramId: raw.ownerTelegramId,
     ...(typeof raw.targetId === "string" ? { targetId: raw.targetId } : {}),
+    ...(typeof raw.jobId === "string" ? { jobId: raw.jobId } : {}),
     walletLabel: raw.walletLabel,
     walletAddress: raw.walletAddress,
     chain: raw.chain === "sepolia" ? "sepolia" : "mainnet",
@@ -186,6 +190,7 @@ export function createMintRun(params: CreateMintRunParams): MintRun {
     runId: randomUUID(),
     ownerTelegramId: params.ownerTelegramId,
     ...(params.targetId ? { targetId: params.targetId } : {}),
+    ...(params.jobId ? { jobId: params.jobId } : {}),
     walletLabel: params.walletLabel,
     walletAddress: params.walletAddress,
     chain: params.chain,
@@ -234,6 +239,10 @@ export function updateMintRunForOwner(
 
   if (updates.confirmedAt) {
     run.confirmedAt = updates.confirmedAt;
+  }
+
+  if (updates.jobId) {
+    run.jobId = updates.jobId;
   }
 
   run.updatedAt = new Date().toISOString();

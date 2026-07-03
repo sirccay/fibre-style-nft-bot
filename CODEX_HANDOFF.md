@@ -247,6 +247,58 @@ Core stack:
 
 - Mint audit events include `mint_previewed`, `mint_confirmation_created`, `mint_blocked`, `mint_submitted`, `mint_confirmed`, `mint_failed`, `mint_target_created`, `mint_target_updated`, `mint_target_archived`, and `mint_run_viewed`.
 
+### Mint scheduling and watcher
+
+- Scheduled mint jobs are saved in `data/mintJobs.json` and are owner-scoped to `ctx.from.id`.
+
+- Commands:
+
+  - `/setminttype targetId manual|team|holder|gtd|fcfs|public`
+
+  - `/schedulemint targetId wallet1 2026-07-04T18:00:00Z [watch|auto]`
+
+  - `/schedulemintphase targetId wallet1 public [watch|auto]`
+
+  - `/mintwatchstatus`
+
+  - `/mintjob jobId`
+
+  - `/cancelmintjob jobId`
+
+  - `/runmintcheck jobId`
+
+  - `/runmintjob jobId`
+
+  - `/schedulerstatus`
+
+- Mint job schema includes `jobId`, `ownerTelegramId`, `targetId`, target/wallet snapshots, chain/contract/function/quantity/price, `mintType`, optional `phaseTypeEstimate`, `startTimeISO`, optional `endTimeISO`, `status`, `mode`, `autoSubmit`, retry settings, attempts, last check/run fields, tx hash, and safe error reason.
+
+- Scheduler behavior:
+
+  - In-process scheduler starts after `bot.launch()` and does not block startup.
+
+  - Active jobs with status `scheduled`, `watching`, or `ready` are reloaded on startup.
+
+  - Poll interval defaults to `MINT_SCHEDULER_POLL_MS=15000` and is clamped to at least 5000ms.
+
+  - Watch mode runs readiness checks and alerts the user when ready. It does not send transactions.
+
+  - Auto mode may submit only when readiness checks pass and safety locks allow it.
+
+  - Retries are capped at 5. Defaults: manual 0/3000ms, team 1/3000ms, holder 2/3000ms, GTD 2/3000ms, FCFS 3/1000ms, public 2/2000ms.
+
+- Scheduled Ethereum mainnet auto-minting requires both:
+
+  `ALLOW_MAINNET_MINTING=true`
+
+  `ALLOW_SCHEDULED_MAINNET_MINTING=true`
+
+- Sepolia scheduled test minting can auto-submit without mainnet locks.
+
+- Manual `/runmintjob` creates the same 10-minute owner-scoped confirmation session as `/minttargetnow`; final confirmation is single-use and mainnet still requires `ALLOW_MAINNET_MINTING=true`.
+
+- Scheduler readiness checks are read-only until auto-submit is explicitly allowed. They validate owner-scoped wallet access, wallet snapshot match, target availability, phase status, native balance for mint price, and gas estimation. No raw tx payloads or secrets are logged.
+
 
 ### Mint parser and phase detector
 

@@ -44,9 +44,26 @@ import {
   getMintTargetForOwner,
   listMintTargetsForOwner,
   updateMintTargetDetectedMetadataForOwner,
+  updateMintTargetMintSettingsForOwner,
   updateMintTargetForOwner
 } from "./mintTargets.js";
 import type { MintTarget } from "./mintTargets.js";
+import {
+  createMintJob,
+  getMintJobForOwner,
+  getMintTypeDefaults,
+  listActiveMintJobsForOwner,
+  listResumableMintJobs,
+  normalizeMintJobMintType,
+  updateMintJobForOwner,
+  updateMintJobStatus
+} from "./mintJobs.js";
+import type {
+  MintJob,
+  MintJobMintType,
+  MintJobMode,
+  MintJobStatus
+} from "./mintJobs.js";
 import {
   createMintRun,
   getMintRunForOwner,
@@ -66,7 +83,8 @@ import type {
   MintDetectionResult,
   MintFunctionCandidate,
   OpenSeaContractResolutionResult,
-  OpenSeaMintMetadata
+  OpenSeaMintMetadata,
+  OpenSeaMintStage
 } from "./mintDetector.js";
 import { detectMintPhase } from "./mintPhaseDetector.js";
 import type { MintPhaseDetectionResult } from "./mintPhaseDetector.js";
@@ -118,6 +136,15 @@ const BOT_COMMANDS = [
   { command: "checkmintreadiness", description: "Check mint readiness" },
   { command: "refreshtarget", description: "Refresh mint target metadata" },
   { command: "parserstatus", description: "Show parser status" },
+  { command: "setminttype", description: "Set mint target type" },
+  { command: "schedulemint", description: "Schedule mint target" },
+  { command: "schedulemintphase", description: "Schedule target phase" },
+  { command: "mintwatchstatus", description: "Show mint watcher jobs" },
+  { command: "mintjob", description: "Show mint job" },
+  { command: "cancelmintjob", description: "Cancel mint job" },
+  { command: "runmintcheck", description: "Run mint job check" },
+  { command: "runmintjob", description: "Run mint job manually" },
+  { command: "schedulerstatus", description: "Show scheduler status" },
   { command: "help", description: "Show commands" }
 ];
 
@@ -359,6 +386,17 @@ Minting:
 /parserstatus
 
 You can also paste an OpenSea/Zora/explorer mint link directly in private chat.
+
+Scheduler:
+/setminttype targetId gtd
+/schedulemint targetId wallet1 2026-07-04T18:00:00Z watch
+/schedulemintphase targetId wallet1 public watch
+/mintwatchstatus
+/mintjob jobId
+/cancelmintjob jobId
+/runmintcheck jobId
+/runmintjob jobId
+/schedulerstatus
 
 Testing:
 /minttest wallet1 1`;
@@ -606,6 +644,7 @@ type MintConfirmationSession = {
   priceEth: string;
   runId: string;
   targetId?: string;
+  jobId?: string;
   createdAt: string;
   expiresAt: string;
   status: MintConfirmationStatus;
@@ -628,8 +667,23 @@ type MintTargetDeleteConfirmation = {
   status: MintTargetDeleteStatus;
 };
 
+type MintJobCancelStatus = "active" | "used" | "cancelled" | "expired";
+
+type MintJobCancelConfirmation = {
+  sessionId: string;
+  ownerTelegramId: string;
+  jobId: string;
+  targetName: string;
+  createdAt: string;
+  expiresAt: string;
+  status: MintJobCancelStatus;
+};
+
 const MINT_CONFIRMATION_TTL_MS = 10 * 60 * 1000;
 const MINT_TARGET_DELETE_TTL_MS = 10 * 60 * 1000;
+const MINT_JOB_CANCEL_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_MINT_SCHEDULER_POLL_MS = 15_000;
+const MIN_MINT_SCHEDULER_POLL_MS = 5_000;
 const MINT_TARGET_NAME_PATTERN = /^[A-Za-z0-9_-]{2,40}$/;
 const MINT_CONFIRMATION_EXPIRED_MESSAGE =
   "This mint confirmation has expired. Please create it again.";
@@ -640,6 +694,10 @@ const MINT_CONFIRMATION_WRONG_USER_MESSAGE =
 const mintConfirmations = new Map<string, MintConfirmationSession>();
 const mintTargetDeleteConfirmations =
   new Map<string, MintTargetDeleteConfirmation>();
+const mintJobCancelConfirmations =
+  new Map<string, MintJobCancelConfirmation>();
+let mintSchedulerTimer: ReturnType<typeof setInterval> | undefined;
+let mintSchedulerTickRunning = false;
 
 function getMintLockStatusText(chain: MintChain): string {
   if (chain === "sepolia") {
@@ -649,6 +707,34 @@ function getMintLockStatusText(chain: MintChain): string {
   return isMainnetMintingEnabled()
     ? "ALLOW_MAINNET_MINTING=true - live mainnet mint sends are enabled."
     : "ALLOW_MAINNET_MINTING=false - live mainnet mint sends are blocked.";
+}
+
+function isScheduledMainnetMintingEnabled(): boolean {
+  return process.env.ALLOW_SCHEDULED_MAINNET_MINTING === "true";
+}
+
+function getScheduledMintLockStatusText(chain: MintChain, mode: MintJobMode) {
+  if (chain === "sepolia") {
+    return "Sepolia scheduled test minting can auto-submit without mainnet locks.";
+  }
+
+  if (mode !== "auto") {
+    return "Watch mode never auto-sends mainnet transactions.";
+  }
+
+  return isMainnetMintingEnabled() && isScheduledMainnetMintingEnabled()
+    ? "Mainnet scheduled auto-mint locks are enabled."
+    : "Mainnet scheduled auto-minting requires ALLOW_MAINNET_MINTING=true and ALLOW_SCHEDULED_MAINNET_MINTING=true.";
+}
+
+function getMintSchedulerPollMs() {
+  const configured = Number(process.env.MINT_SCHEDULER_POLL_MS);
+
+  if (!Number.isFinite(configured) || configured <= 0) {
+    return DEFAULT_MINT_SCHEDULER_POLL_MS;
+  }
+
+  return Math.max(Math.floor(configured), MIN_MINT_SCHEDULER_POLL_MS);
 }
 
 function sanitizeMintTargetName(name: string): string {
@@ -761,6 +847,7 @@ async function auditMintAction(details: {
   walletLabel?: string | undefined;
   walletAddress?: string | undefined;
   targetId?: string | undefined;
+  jobId?: string | undefined;
   runId?: string | undefined;
   chain?: string | undefined;
   collectionSlug?: string | undefined;
@@ -773,6 +860,7 @@ async function auditMintAction(details: {
   phaseTypeConfidence?: string | undefined;
   priceEth?: string | undefined;
   txHash?: string | undefined;
+  mintType?: string | undefined;
   status?: string | undefined;
   reason?: string | undefined;
 }) {
@@ -840,11 +928,13 @@ function createRunFromPreview(
   ownerTelegramId: string,
   preview: MintPreviewResult,
   status: MintRunStatus,
-  targetId?: string
+  targetId?: string,
+  jobId?: string
 ) {
   return createMintRun({
     ownerTelegramId,
     ...(targetId ? { targetId } : {}),
+    ...(jobId ? { jobId } : {}),
     walletLabel: preview.walletLabel,
     walletAddress: preview.walletAddress,
     chain: preview.chain,
@@ -889,6 +979,7 @@ function createMintConfirmationSession(params: {
   priceEth: string;
   runId: string;
   targetId?: string;
+  jobId?: string;
 }) {
   cleanupMintConfirmations();
 
@@ -905,6 +996,7 @@ function createMintConfirmationSession(params: {
     priceEth: params.priceEth,
     runId: params.runId,
     ...(params.targetId ? { targetId: params.targetId } : {}),
+    ...(params.jobId ? { jobId: params.jobId } : {}),
     createdAt: createdAt.toISOString(),
     expiresAt: new Date(
       createdAt.getTime() + MINT_CONFIRMATION_TTL_MS
@@ -1019,6 +1111,13 @@ function formatMintTarget(target: MintTarget) {
     `Function: ${target.functionSignature || "Unknown"}`,
     `Qty: ${target.quantity}`,
     `Price: ${target.priceEth === undefined ? "Unknown" : `${target.priceEth} ETH`}`,
+    ...(target.mintType
+      ? [
+          `Mint Type: ${target.mintType}`,
+          `Retries: ${target.maxRetries ?? getMintTypeDefaults(target.mintType).maxRetries}`,
+          `Retry Delay: ${target.retryDelayMs ?? getMintTypeDefaults(target.mintType).retryDelayMs}ms`
+        ]
+      : []),
     ...(target.collectionSlug ? [`Collection Slug: ${target.collectionSlug}`] : []),
     ...(target.sourceUrl ? [`Source: ${target.sourceUrl}`] : []),
     ...(metadata?.collectionName ? [`Detected Collection: ${metadata.collectionName}`] : []),
@@ -1050,6 +1149,347 @@ function requireCompleteMintTarget(target: MintTarget) {
     priceEth: target.priceEth,
     targetCompleteness: calculateMintTargetCompleteness(target)
   };
+}
+
+function normalizeMintJobMode(rawMode?: string): MintJobMode {
+  const normalized = rawMode?.trim().toLowerCase();
+
+  if (!normalized || normalized === "watch") {
+    return "watch";
+  }
+
+  if (normalized === "auto") {
+    return "auto";
+  }
+
+  throw new Error("Mode must be watch or auto.");
+}
+
+function validateScheduleStartTime(rawStartTime: string) {
+  const parsed = Date.parse(rawStartTime);
+
+  if (!Number.isFinite(parsed)) {
+    throw new Error("Start time must be a valid ISO date/time.");
+  }
+
+  return new Date(parsed).toISOString();
+}
+
+function phaseTypeEstimateToMintType(
+  phaseTypeEstimate?: string
+): MintJobMintType | undefined {
+  if (phaseTypeEstimate === "team_phase") return "team";
+  if (phaseTypeEstimate === "holder_phase") return "holder";
+  if (phaseTypeEstimate === "gtd_phase") return "gtd";
+  if (phaseTypeEstimate === "fcfs_phase") return "fcfs";
+  if (phaseTypeEstimate === "public_phase") return "public";
+  return undefined;
+}
+
+function mintTypeToPhaseTypeEstimate(mintType: MintJobMintType) {
+  if (mintType === "team") return "team_phase";
+  if (mintType === "holder") return "holder_phase";
+  if (mintType === "gtd") return "gtd_phase";
+  if (mintType === "fcfs") return "fcfs_phase";
+  if (mintType === "public") return "public_phase";
+  return "unknown";
+}
+
+function normalizePhaseMintType(rawPhaseType: string): MintJobMintType {
+  const mintType = normalizeMintJobMintType(rawPhaseType);
+
+  if (mintType === "manual") {
+    throw new Error("Use /schedulemint with an ISO time for manual schedules.");
+  }
+
+  return mintType;
+}
+
+function getTargetPhaseTypeEstimate(target: MintTarget) {
+  const currentStage = getOpenSeaMintCurrentStage(
+    target.detectedMetadata?.openSeaMint
+  );
+
+  return (
+    currentStage?.phaseTypeEstimate ||
+    target.detectedMetadata?.phaseTypeEstimate ||
+    undefined
+  );
+}
+
+function getTargetMintType(target: MintTarget): MintJobMintType {
+  return (
+    target.mintType ||
+    phaseTypeEstimateToMintType(getTargetPhaseTypeEstimate(target)) ||
+    "manual"
+  );
+}
+
+function getTargetMintTypeSettings(target: MintTarget) {
+  const mintType = getTargetMintType(target);
+  const defaults = getMintTypeDefaults(mintType);
+
+  return {
+    mintType,
+    maxRetries:
+      target.maxRetries === undefined
+        ? defaults.maxRetries
+        : Math.min(Math.max(Math.floor(target.maxRetries), 0), 5),
+    retryDelayMs:
+      target.retryDelayMs === undefined
+        ? defaults.retryDelayMs
+        : Math.max(0, Math.floor(target.retryDelayMs))
+  };
+}
+
+function findMintScheduleStageForType(
+  target: MintTarget,
+  mintType: MintJobMintType
+): OpenSeaMintStage | undefined {
+  const phaseTypeEstimate = mintTypeToPhaseTypeEstimate(mintType);
+
+  return target.detectedMetadata?.openSeaMint?.mintSchedule.find(
+    (stage) => stage.phaseTypeEstimate === phaseTypeEstimate
+  );
+}
+
+function getStageStartTimeISO(stage: OpenSeaMintStage) {
+  const rawStart = stage.startTimeText;
+
+  if (!rawStart) {
+    throw new Error("Matching phase was detected, but no start time is available.");
+  }
+
+  return validateScheduleStartTime(rawStart);
+}
+
+async function createMintJobForTarget(params: {
+  ownerTelegramId: string;
+  target: MintTarget;
+  walletLabel: string;
+  startTimeISO: string;
+  mode: MintJobMode;
+  mintType?: MintJobMintType;
+}) {
+  const target = requireCompleteMintTarget(params.target);
+  const wallet = await getWalletSummaryByLabelForOwner(
+    params.walletLabel,
+    params.ownerTelegramId
+  );
+  const targetSettings = getTargetMintTypeSettings(target);
+  const mintType = params.mintType || targetSettings.mintType;
+  const defaults = getMintTypeDefaults(mintType);
+  const phaseTypeEstimate = getTargetPhaseTypeEstimate(target);
+
+  return createMintJob({
+    ownerTelegramId: params.ownerTelegramId,
+    targetId: target.targetId,
+    targetName: target.name,
+    walletLabel: wallet.label,
+    walletAddress: wallet.address,
+    chain: target.chain,
+    contractAddress: target.contractAddress,
+    functionSignature: target.functionSignature,
+    quantity: target.quantity,
+    priceEth: target.priceEth,
+    mintType,
+    ...(phaseTypeEstimate ? { phaseTypeEstimate } : {}),
+    startTimeISO: params.startTimeISO,
+    mode: params.mode,
+    maxRetries:
+      params.mintType && params.mintType !== targetSettings.mintType
+        ? defaults.maxRetries
+        : targetSettings.maxRetries,
+    retryDelayMs:
+      params.mintType && params.mintType !== targetSettings.mintType
+        ? defaults.retryDelayMs
+        : targetSettings.retryDelayMs
+  });
+}
+
+function formatMintTypeWarning(mintType: MintJobMintType) {
+  if (mintType === "team") {
+    return "Team mint warning: normal users may not be eligible.";
+  }
+
+  if (mintType === "holder") {
+    return "Holder mint warning: holder eligibility must be verified separately unless readiness/gas check succeeds.";
+  }
+
+  if (mintType === "gtd") {
+    return "GTD mint note: this is intended for guaranteed/allowlist style minting, but eligibility is not guaranteed.";
+  }
+
+  if (mintType === "fcfs") {
+    return "FCFS mint note: retries are limited and success is never guaranteed.";
+  }
+
+  return "";
+}
+
+function formatMintJob(job: MintJob) {
+  return [
+    `Job ID: ${job.jobId}`,
+    `Status: ${job.status}`,
+    `Mode: ${job.mode}`,
+    `Auto-submit: ${job.autoSubmit ? "yes" : "no"}`,
+    `Target: ${job.targetName}`,
+    `Target ID: ${job.targetId}`,
+    `Wallet: ${job.walletLabel}`,
+    `Address: ${formatShortAddress(job.walletAddress)}`,
+    `Chain: ${job.chain}`,
+    `Contract: ${formatShortAddress(job.contractAddress)}`,
+    `Function: ${job.functionSignature}`,
+    `Qty: ${job.quantity}`,
+    `Price Each: ${job.priceEth} ETH`,
+    `Mint Type: ${job.mintType}`,
+    ...(job.phaseTypeEstimate ? [`Phase Estimate: ${job.phaseTypeEstimate}`] : []),
+    `Start: ${job.startTimeISO}`,
+    ...(job.endTimeISO ? [`End: ${job.endTimeISO}`] : []),
+    `Attempts: ${job.attempts}/${job.maxRetries}`,
+    `Retry Delay: ${job.retryDelayMs}ms`,
+    ...(job.lastCheckedAt ? [`Last Checked: ${job.lastCheckedAt}`] : []),
+    ...(job.lastRunId ? [`Last Run ID: ${job.lastRunId}`] : []),
+    ...(job.txHash ? [`Tx: ${job.txHash}`] : []),
+    ...(job.safeErrorReason ? [`Reason: ${job.safeErrorReason}`] : []),
+    `Created: ${job.createdAt}`,
+    `Updated: ${job.updatedAt}`
+  ].join("\n");
+}
+
+function formatMintJobList(jobs: MintJob[]) {
+  if (jobs.length === 0) {
+    return "No active mint jobs found.";
+  }
+
+  return jobs
+    .map((job, index) =>
+      [
+        `${index + 1}. ${job.targetName}`,
+        `Job ID: ${job.jobId}`,
+        `Wallet: ${job.walletLabel}`,
+        `Chain: ${job.chain}`,
+        `Mint Type: ${job.mintType}`,
+        `Start: ${job.startTimeISO}`,
+        `Mode: ${job.mode}`,
+        `Status: ${job.status}`,
+        `Attempts: ${job.attempts}/${job.maxRetries}`,
+        `Last Checked: ${job.lastCheckedAt || "Never"}`
+      ].join("\n")
+    )
+    .join("\n\n");
+}
+
+async function sendMintJobAlert(job: MintJob, message: string) {
+  try {
+    await bot.telegram.sendMessage(job.ownerTelegramId, message);
+  } catch (error) {
+    logSafeError("Mint job alert failed", error);
+  }
+}
+
+type MintJobReadinessResult = {
+  ready: boolean;
+  status: "ready" | "not_ready" | "blocked";
+  reason?: string;
+  preview?: MintPreviewResult;
+};
+
+async function runMintJobReadinessCheck(
+  job: MintJob,
+  options: { countAttempt?: boolean } = {}
+): Promise<MintJobReadinessResult> {
+  const checkedAt = new Date().toISOString();
+
+  try {
+    const target = getMintTargetForOwner(job.targetId, job.ownerTelegramId);
+    const phase = await detectMintPhase({
+      contractAddress: job.contractAddress,
+      chain: job.chain,
+      evidenceTexts: [
+        target.name,
+        target.collectionSlug || "",
+        target.sourceUrl || "",
+        target.notes || ""
+      ]
+    });
+    const startMs = Date.parse(job.startTimeISO);
+
+    if (phase.phaseStatus === "paused" || phase.phaseStatus === "ended") {
+      const reason = `phase_${phase.phaseStatus}`;
+      updateMintJobForOwner(job.jobId, job.ownerTelegramId, {
+        lastCheckedAt: checkedAt,
+        ...(options.countAttempt ? { attempts: job.attempts + 1 } : {}),
+        safeErrorReason: reason
+      });
+      return { ready: false, status: "blocked", reason };
+    }
+
+    if (
+      phase.phaseStatus === "not_live_yet" &&
+      Number.isFinite(startMs) &&
+      Date.now() < startMs
+    ) {
+      const reason = "phase_not_live_yet";
+      updateMintJobForOwner(job.jobId, job.ownerTelegramId, {
+        lastCheckedAt: checkedAt,
+        ...(options.countAttempt ? { attempts: job.attempts + 1 } : {}),
+        safeErrorReason: reason
+      });
+      return { ready: false, status: "not_ready", reason };
+    }
+
+    const preview = await previewMint({
+      ownerTelegramId: job.ownerTelegramId,
+      walletLabel: job.walletLabel,
+      contractAddress: job.contractAddress,
+      functionSignature: job.functionSignature,
+      quantity: job.quantity,
+      priceEth: job.priceEth,
+      chain: job.chain
+    });
+
+    if (preview.walletAddress.toLowerCase() !== job.walletAddress.toLowerCase()) {
+      throw new Error("Wallet job snapshot no longer matches the saved wallet.");
+    }
+
+    const provider = getMintProvider(job.chain);
+    const balanceWei = await provider.getBalance(preview.walletAddress);
+
+    if (balanceWei < preview.totalCostWei) {
+      const reason = "insufficient_native_balance_for_mint_price";
+      updateMintJobForOwner(job.jobId, job.ownerTelegramId, {
+        lastCheckedAt: checkedAt,
+        ...(options.countAttempt ? { attempts: job.attempts + 1 } : {}),
+        safeErrorReason: reason
+      });
+      return { ready: false, status: "blocked", reason, preview };
+    }
+
+    if (preview.gasEstimateFailed) {
+      const reason = preview.gasEstimateError || "gas_estimation_failed";
+      updateMintJobForOwner(job.jobId, job.ownerTelegramId, {
+        lastCheckedAt: checkedAt,
+        ...(options.countAttempt ? { attempts: job.attempts + 1 } : {}),
+        safeErrorReason: reason
+      });
+      return { ready: false, status: "not_ready", reason, preview };
+    }
+
+    updateMintJobForOwner(job.jobId, job.ownerTelegramId, {
+      lastCheckedAt: checkedAt,
+      ...(options.countAttempt ? { attempts: job.attempts + 1 } : {})
+    });
+    return { ready: true, status: "ready", preview };
+  } catch (error) {
+    const reason = getSafeErrorMessage(error);
+    updateMintJobForOwner(job.jobId, job.ownerTelegramId, {
+      lastCheckedAt: checkedAt,
+      ...(options.countAttempt ? { attempts: job.attempts + 1 } : {}),
+      safeErrorReason: reason
+    });
+    return { ready: false, status: "not_ready", reason };
+  }
 }
 
 function getCommandRemainder(text: string): string {
@@ -1605,6 +2045,7 @@ function formatMintRun(run: MintRun) {
   return [
     `Run ID: ${run.runId}`,
     ...(run.targetId ? [`Target ID: ${run.targetId}`] : []),
+    ...(run.jobId ? [`Job ID: ${run.jobId}`] : []),
     `Status: ${run.status}`,
     `Wallet: ${run.walletLabel}`,
     `Address: ${formatShortAddress(run.walletAddress)}`,
@@ -1725,6 +2166,584 @@ async function validateMintTargetDeleteConfirmation(
   }
 
   return { session, actorTelegramId };
+}
+
+function isMintJobCancelExpired(session: MintJobCancelConfirmation) {
+  const expiresAtMs = Date.parse(session.expiresAt);
+  return !Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now();
+}
+
+function cleanupMintJobCancelConfirmations() {
+  for (const [sessionId, session] of mintJobCancelConfirmations.entries()) {
+    if (session.status === "active" && isMintJobCancelExpired(session)) {
+      session.status = "expired";
+    }
+
+    const expiresAtMs = Date.parse(session.expiresAt);
+    const cleanupAfterMs = Number.isFinite(expiresAtMs)
+      ? expiresAtMs + MINT_JOB_CANCEL_TTL_MS
+      : Date.now();
+
+    if (cleanupAfterMs <= Date.now()) {
+      mintJobCancelConfirmations.delete(sessionId);
+    }
+  }
+}
+
+function createMintJobCancelConfirmation(params: {
+  ownerTelegramId: string;
+  jobId: string;
+  targetName: string;
+}) {
+  cleanupMintJobCancelConfirmations();
+
+  const createdAt = new Date();
+  const session: MintJobCancelConfirmation = {
+    sessionId: randomUUID(),
+    ownerTelegramId: params.ownerTelegramId,
+    jobId: params.jobId,
+    targetName: params.targetName,
+    createdAt: createdAt.toISOString(),
+    expiresAt: new Date(
+      createdAt.getTime() + MINT_JOB_CANCEL_TTL_MS
+    ).toISOString(),
+    status: "active"
+  };
+
+  mintJobCancelConfirmations.set(session.sessionId, session);
+  return session;
+}
+
+async function validateMintJobCancelConfirmation(
+  ctx: Context,
+  sessionId: string
+) {
+  cleanupMintJobCancelConfirmations();
+
+  const actorTelegramId = getTelegramUserId(ctx);
+
+  if (!actorTelegramId) {
+    await ctx.reply("❌ Could not verify your Telegram account for this action.");
+    return null;
+  }
+
+  const session = mintJobCancelConfirmations.get(sessionId);
+
+  if (!session) {
+    await ctx.reply("This mint job cancellation has expired. Run /cancelmintjob again.");
+    return null;
+  }
+
+  if (session.ownerTelegramId !== actorTelegramId) {
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "mint_job_cancel_blocked",
+      jobId: session.jobId,
+      status: session.status,
+      reason: `wrong_user:actor=${actorTelegramId}`
+    });
+    await ctx.reply("You cannot use this mint job cancellation.");
+    return null;
+  }
+
+  if (session.status === "expired" || isMintJobCancelExpired(session)) {
+    session.status = "expired";
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "mint_job_cancel_blocked",
+      jobId: session.jobId,
+      status: session.status,
+      reason: "expired"
+    });
+    await ctx.reply("This mint job cancellation has expired. Run /cancelmintjob again.");
+    return null;
+  }
+
+  if (session.status === "used" || session.status === "cancelled") {
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "mint_job_cancel_blocked",
+      jobId: session.jobId,
+      status: session.status,
+      reason: "already_used_or_cancelled"
+    });
+    await ctx.reply("This mint job cancellation has already been used or cancelled.");
+    return null;
+  }
+
+  return { session, actorTelegramId };
+}
+
+function shouldCheckMintJob(job: MintJob, nowMs = Date.now()) {
+  if (!["scheduled", "watching", "ready"].includes(job.status)) {
+    return false;
+  }
+
+  const startMs = Date.parse(job.startTimeISO);
+
+  if (!Number.isFinite(startMs) || startMs > nowMs) {
+    return false;
+  }
+
+  if (job.endTimeISO) {
+    const endMs = Date.parse(job.endTimeISO);
+
+    if (Number.isFinite(endMs) && endMs <= nowMs) {
+      return true;
+    }
+  }
+
+  if (job.status === "ready" && job.mode === "watch") {
+    return false;
+  }
+
+  if (!job.lastCheckedAt) {
+    return true;
+  }
+
+  const lastCheckedMs = Date.parse(job.lastCheckedAt);
+
+  if (!Number.isFinite(lastCheckedMs)) {
+    return true;
+  }
+
+  return lastCheckedMs + job.retryDelayMs <= nowMs;
+}
+
+async function markMintJobTerminal(params: {
+  job: MintJob;
+  status: Extract<MintJobStatus, "failed" | "blocked" | "expired">;
+  auditAction: string;
+  reason: string;
+}) {
+  const currentJob = getMintJobForOwner(
+    params.job.jobId,
+    params.job.ownerTelegramId
+  );
+  const run = currentJob.lastRunId
+    ? null
+    : createMintRun({
+        ownerTelegramId: currentJob.ownerTelegramId,
+        targetId: currentJob.targetId,
+        jobId: currentJob.jobId,
+        walletLabel: currentJob.walletLabel,
+        walletAddress: currentJob.walletAddress,
+        chain: currentJob.chain,
+        contractAddress: currentJob.contractAddress,
+        functionSignature: currentJob.functionSignature,
+        quantity: currentJob.quantity,
+        priceEth: currentJob.priceEth,
+        status: params.status === "failed" ? "failed" : "blocked",
+        errorReason: params.reason
+      });
+  const updated = updateMintJobStatus(
+    currentJob.jobId,
+    currentJob.ownerTelegramId,
+    params.status,
+    params.reason
+  );
+
+  if (run) {
+    updateMintJobForOwner(updated.jobId, updated.ownerTelegramId, {
+      lastRunId: run.runId
+    });
+  }
+
+  await auditMintAction({
+    ownerTelegramId: updated.ownerTelegramId,
+    action: params.auditAction,
+    targetId: updated.targetId,
+    jobId: updated.jobId,
+    ...(run || updated.lastRunId ? { runId: run?.runId || updated.lastRunId } : {}),
+    walletLabel: updated.walletLabel,
+    walletAddress: updated.walletAddress,
+    chain: updated.chain,
+    contractAddress: updated.contractAddress,
+    functionSignature: updated.functionSignature,
+    quantity: updated.quantity,
+    priceEth: updated.priceEth,
+    mintType: updated.mintType,
+    status: updated.status,
+    reason: params.reason
+  });
+  await sendMintJobAlert(
+    updated,
+    `Mint job ${params.status}.
+
+Job ID: ${updated.jobId}
+Target: ${updated.targetName}
+Reason: ${params.reason}`
+  );
+}
+
+async function executeAutoMintJob(job: MintJob, preview: MintPreviewResult) {
+  if (
+    job.chain === "mainnet" &&
+    (!isMainnetMintingEnabled() || !isScheduledMainnetMintingEnabled())
+  ) {
+    const reason = "scheduled_mainnet_minting_disabled";
+    const run = createMintRun({
+      ownerTelegramId: job.ownerTelegramId,
+      targetId: job.targetId,
+      jobId: job.jobId,
+      walletLabel: preview.walletLabel,
+      walletAddress: preview.walletAddress,
+      chain: preview.chain,
+      contractAddress: preview.contractAddress,
+      functionSignature: preview.functionSignature,
+      quantity: preview.quantity,
+      priceEth: preview.priceEth,
+      status: "blocked",
+      errorReason: reason
+    });
+    const updated = updateMintJobForOwner(job.jobId, job.ownerTelegramId, {
+      status: "blocked",
+      lastRunId: run.runId,
+      safeErrorReason: reason
+    });
+
+    await auditMintAction({
+      ownerTelegramId: updated.ownerTelegramId,
+      action: "mint_job_blocked",
+      targetId: updated.targetId,
+      jobId: updated.jobId,
+      runId: run.runId,
+      walletLabel: updated.walletLabel,
+      walletAddress: updated.walletAddress,
+      chain: updated.chain,
+      contractAddress: updated.contractAddress,
+      functionSignature: updated.functionSignature,
+      quantity: updated.quantity,
+      priceEth: updated.priceEth,
+      mintType: updated.mintType,
+      status: updated.status,
+      reason
+    });
+
+    await sendMintJobAlert(
+      updated,
+      `Mint job blocked.
+
+Job ID: ${updated.jobId}
+Target: ${updated.targetName}
+Reason: Mainnet scheduled auto-minting requires ALLOW_MAINNET_MINTING=true and ALLOW_SCHEDULED_MAINNET_MINTING=true.`
+    );
+    return;
+  }
+
+  const run = createMintRun({
+    ownerTelegramId: job.ownerTelegramId,
+    targetId: job.targetId,
+    jobId: job.jobId,
+    walletLabel: preview.walletLabel,
+    walletAddress: preview.walletAddress,
+    chain: preview.chain,
+    contractAddress: preview.contractAddress,
+    functionSignature: preview.functionSignature,
+    quantity: preview.quantity,
+    priceEth: preview.priceEth,
+    status: "pending"
+  });
+  updateMintJobForOwner(job.jobId, job.ownerTelegramId, {
+    lastRunId: run.runId
+  });
+
+  try {
+    const submitted = await submitMintTransaction({
+      ownerTelegramId: job.ownerTelegramId,
+      walletLabel: job.walletLabel,
+      contractAddress: job.contractAddress,
+      functionSignature: job.functionSignature,
+      quantity: job.quantity,
+      priceEth: job.priceEth,
+      chain: job.chain
+    });
+    updateMintRunForOwner(run.runId, job.ownerTelegramId, {
+      status: "submitted",
+      txHash: submitted.txHash
+    });
+    const submittedJob = updateMintJobForOwner(job.jobId, job.ownerTelegramId, {
+      status: "submitted",
+      txHash: submitted.txHash,
+      safeErrorReason: ""
+    });
+
+    await auditMintAction({
+      ownerTelegramId: submittedJob.ownerTelegramId,
+      action: "mint_job_submitted",
+      targetId: submittedJob.targetId,
+      jobId: submittedJob.jobId,
+      runId: run.runId,
+      walletLabel: submittedJob.walletLabel,
+      walletAddress: submitted.walletAddress,
+      chain: submittedJob.chain,
+      contractAddress: submittedJob.contractAddress,
+      functionSignature: submittedJob.functionSignature,
+      quantity: submittedJob.quantity,
+      priceEth: submittedJob.priceEth,
+      mintType: submittedJob.mintType,
+      txHash: submitted.txHash,
+      status: submittedJob.status
+    });
+    await sendMintJobAlert(
+      submittedJob,
+      `✅ Scheduled mint transaction sent.
+
+Job ID: ${submittedJob.jobId}
+Run ID: ${run.runId}
+Tx:
+${submitted.txHash}`
+    );
+
+    const confirmation = await waitForMintConfirmation(job.chain, submitted.txHash);
+
+    if (confirmation.status === "confirmed") {
+      updateMintRunForOwner(run.runId, job.ownerTelegramId, {
+        status: "confirmed",
+        confirmedAt: new Date().toISOString()
+      });
+      const confirmedJob = updateMintJobForOwner(job.jobId, job.ownerTelegramId, {
+        status: "confirmed",
+        txHash: submitted.txHash
+      });
+      await auditMintAction({
+        ownerTelegramId: confirmedJob.ownerTelegramId,
+        action: "mint_job_confirmed",
+        targetId: confirmedJob.targetId,
+        jobId: confirmedJob.jobId,
+        runId: run.runId,
+        walletLabel: confirmedJob.walletLabel,
+        walletAddress: submitted.walletAddress,
+        chain: confirmedJob.chain,
+        contractAddress: confirmedJob.contractAddress,
+        functionSignature: confirmedJob.functionSignature,
+        quantity: confirmedJob.quantity,
+        priceEth: confirmedJob.priceEth,
+        mintType: confirmedJob.mintType,
+        txHash: submitted.txHash,
+        status: confirmedJob.status
+      });
+      await sendMintJobAlert(
+        confirmedJob,
+        `✅ Scheduled mint confirmed.
+
+Job ID: ${confirmedJob.jobId}
+Run ID: ${run.runId}
+Tx:
+${submitted.txHash}`
+      );
+      return;
+    }
+
+    if (confirmation.status === "timeout") {
+      updateMintRunForOwner(run.runId, job.ownerTelegramId, {
+        status: "submitted",
+        errorReason: "confirmation_timeout"
+      });
+      updateMintJobForOwner(job.jobId, job.ownerTelegramId, {
+        status: "submitted",
+        txHash: submitted.txHash,
+        safeErrorReason: "confirmation_timeout"
+      });
+      await sendMintJobAlert(
+        submittedJob,
+        `⚠️ Scheduled mint was sent, but confirmation timed out.
+
+Job ID: ${submittedJob.jobId}
+Run ID: ${run.runId}
+Tx:
+${submitted.txHash}`
+      );
+      return;
+    }
+
+    updateMintRunForOwner(run.runId, job.ownerTelegramId, {
+      status: "failed",
+      errorReason: "transaction_failed",
+      confirmedAt: new Date().toISOString()
+    });
+    await markMintJobTerminal({
+      job,
+      status: "failed",
+      auditAction: "mint_job_failed",
+      reason: "transaction_failed"
+    });
+  } catch (error) {
+    const reason = getSafeErrorMessage(error);
+    logSafeError("Scheduled mint submit failed", error);
+    updateMintRunForOwner(run.runId, job.ownerTelegramId, {
+      status: "failed",
+      errorReason: reason
+    });
+    await markMintJobTerminal({
+      job,
+      status: "failed",
+      auditAction: "mint_job_failed",
+      reason
+    });
+  }
+}
+
+async function processMintJob(job: MintJob) {
+  const nowMs = Date.now();
+
+  if (job.endTimeISO) {
+    const endMs = Date.parse(job.endTimeISO);
+
+    if (Number.isFinite(endMs) && endMs <= nowMs) {
+      await markMintJobTerminal({
+        job,
+        status: "expired",
+        auditAction: "mint_job_expired",
+        reason: "job_end_time_passed"
+      });
+      return;
+    }
+  }
+
+  if (job.status === "scheduled") {
+    job = updateMintJobForOwner(job.jobId, job.ownerTelegramId, {
+      status: "watching"
+    });
+  }
+
+  const readiness = await runMintJobReadinessCheck(job, { countAttempt: true });
+  const updated = getMintJobForOwner(job.jobId, job.ownerTelegramId);
+
+  await auditMintAction({
+    ownerTelegramId: updated.ownerTelegramId,
+    action: "mint_job_checked",
+    targetId: updated.targetId,
+    jobId: updated.jobId,
+    walletLabel: updated.walletLabel,
+    walletAddress: updated.walletAddress,
+    chain: updated.chain,
+    contractAddress: updated.contractAddress,
+    functionSignature: updated.functionSignature,
+    quantity: updated.quantity,
+    priceEth: updated.priceEth,
+    mintType: updated.mintType,
+    status: readiness.status,
+    reason: readiness.reason
+  });
+
+  if (readiness.ready && readiness.preview) {
+    if (updated.mode === "watch") {
+      const readyJob = updateMintJobStatus(
+        updated.jobId,
+        updated.ownerTelegramId,
+        "ready"
+      );
+      await auditMintAction({
+        ownerTelegramId: readyJob.ownerTelegramId,
+        action: "mint_job_ready",
+        targetId: readyJob.targetId,
+        jobId: readyJob.jobId,
+        walletLabel: readyJob.walletLabel,
+        walletAddress: readyJob.walletAddress,
+        chain: readyJob.chain,
+        contractAddress: readyJob.contractAddress,
+        functionSignature: readyJob.functionSignature,
+        quantity: readyJob.quantity,
+        priceEth: readyJob.priceEth,
+        mintType: readyJob.mintType,
+        status: readyJob.status
+      });
+      await sendMintJobAlert(
+        readyJob,
+        `Mint target is ready. Use /runmintjob ${readyJob.jobId} to mint now.
+
+Job ID: ${readyJob.jobId}
+Target: ${readyJob.targetName}
+Wallet: ${readyJob.walletLabel}`
+      );
+      return;
+    }
+
+    await executeAutoMintJob(updated, readiness.preview);
+    return;
+  }
+
+  if (readiness.status === "blocked" || updated.attempts > updated.maxRetries) {
+    await markMintJobTerminal({
+      job: updated,
+      status: readiness.status === "blocked" ? "blocked" : "failed",
+      auditAction:
+        readiness.status === "blocked" ? "mint_job_blocked" : "mint_job_failed",
+      reason: readiness.reason || "retry_limit_exhausted"
+    });
+  }
+}
+
+async function runMintSchedulerTick() {
+  if (mintSchedulerTickRunning) {
+    return;
+  }
+
+  mintSchedulerTickRunning = true;
+
+  try {
+    const jobs = listResumableMintJobs();
+
+    for (const job of jobs) {
+      if (!shouldCheckMintJob(job)) {
+        continue;
+      }
+
+      try {
+        await processMintJob(job);
+      } catch (error) {
+        logSafeError("Mint scheduler job failed", error);
+      }
+    }
+  } catch (error) {
+    logSafeError("Mint scheduler tick failed", error);
+  } finally {
+    mintSchedulerTickRunning = false;
+  }
+}
+
+function startMintScheduler() {
+  try {
+    if (mintSchedulerTimer) {
+      return;
+    }
+
+    const pollMs = getMintSchedulerPollMs();
+    const jobs = listResumableMintJobs();
+
+    for (const job of jobs) {
+      void auditMintAction({
+        ownerTelegramId: job.ownerTelegramId,
+        action: "mint_job_resumed",
+        targetId: job.targetId,
+        jobId: job.jobId,
+        walletLabel: job.walletLabel,
+        walletAddress: job.walletAddress,
+        chain: job.chain,
+        contractAddress: job.contractAddress,
+        functionSignature: job.functionSignature,
+        quantity: job.quantity,
+        priceEth: job.priceEth,
+        mintType: job.mintType,
+        status: job.status
+      });
+    }
+
+    void auditMintAction({
+      ownerTelegramId: null,
+      action: "mint_scheduler_started",
+      status: "enabled",
+      reason: `poll_ms:${pollMs}`
+    });
+
+    mintSchedulerTimer = setInterval(() => {
+      void runMintSchedulerTick();
+    }, pollMs);
+    void runMintSchedulerTick();
+  } catch (error) {
+    logSafeError("Mint scheduler startup failed; continuing bot startup", error);
+  }
 }
 
 function getOfferExpirationText(offer: any): string {
@@ -3670,6 +4689,552 @@ bot.command("refreshtarget", async (ctx) => {
   }
 });
 
+bot.command("setminttype", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const targetId = parts[1]?.trim();
+  const rawMintType = parts[2]?.trim();
+
+  if (!targetId || !rawMintType) {
+    await ctx.reply("Use:\n/setminttype targetId manual|team|holder|gtd|fcfs|public");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const mintType = normalizeMintJobMintType(rawMintType);
+    const defaults = getMintTypeDefaults(mintType);
+    const target = updateMintTargetMintSettingsForOwner(
+      targetId,
+      ownerTelegramId,
+      {
+        mintType,
+        maxRetries: defaults.maxRetries,
+        retryDelayMs: defaults.retryDelayMs
+      }
+    );
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_target_updated",
+      targetId: target.targetId,
+      chain: target.chain,
+      contractAddress: target.contractAddress,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      mintType,
+      status: target.status,
+      reason: "mint_type_updated"
+    });
+
+    await ctx.reply(
+      `✅ Mint type updated.
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+Mint Type: ${mintType}
+Max Retries: ${defaults.maxRetries}
+Retry Delay: ${defaults.retryDelayMs}ms${
+        formatMintTypeWarning(mintType) ? `\n\n${formatMintTypeWarning(mintType)}` : ""
+      }`
+    );
+  } catch (error) {
+    logSafeError("Could not set mint type", error);
+    await ctx.reply(`❌ Could not set mint type.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("schedulemint", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const targetId = parts[1]?.trim();
+  const walletLabel = parts[2]?.trim();
+  const rawStartTime = parts[3]?.trim();
+  const rawMode = parts[4]?.trim();
+
+  if (!targetId || !walletLabel || !rawStartTime) {
+    await ctx.reply("Use:\n/schedulemint targetId wallet1 2026-07-04T18:00:00Z [watch|auto]");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const target = getMintTargetForOwner(targetId, ownerTelegramId);
+    const missing = getMintTargetMissingFields(target);
+
+    if (missing.length > 0 || !target.functionSignature || target.priceEth === undefined) {
+      await ctx.reply(
+        `This target is incomplete. Missing contract address, function signature, price, or chain.\n\nMissing: ${missing.join(", ") || "unknown"}`
+      );
+      return;
+    }
+
+    const mode = normalizeMintJobMode(rawMode);
+    const startTimeISO = validateScheduleStartTime(rawStartTime);
+    const job = await createMintJobForTarget({
+      ownerTelegramId,
+      target,
+      walletLabel,
+      startTimeISO,
+      mode
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_job_created",
+      targetId: job.targetId,
+      jobId: job.jobId,
+      walletLabel: job.walletLabel,
+      walletAddress: job.walletAddress,
+      chain: job.chain,
+      contractAddress: job.contractAddress,
+      functionSignature: job.functionSignature,
+      quantity: job.quantity,
+      priceEth: job.priceEth,
+      mintType: job.mintType,
+      status: job.status
+    });
+
+    await ctx.reply(
+      `✅ Mint job scheduled.
+
+${formatMintJob(job)}
+
+Minting Lock: ${getMintLockStatusText(job.chain)}
+Scheduled Lock: ${getScheduledMintLockStatusText(job.chain, job.mode)}${
+        job.chain === "mainnet" && job.mode === "auto"
+          ? "\n\nAuto mainnet minting requires both ALLOW_MAINNET_MINTING=true and ALLOW_SCHEDULED_MAINNET_MINTING=true."
+          : ""
+      }${
+        formatMintTypeWarning(job.mintType) ? `\n\n${formatMintTypeWarning(job.mintType)}` : ""
+      }`
+    );
+  } catch (error) {
+    logSafeError("Could not schedule mint", error);
+    await ctx.reply(`❌ Could not schedule mint.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("schedulemintphase", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const targetId = parts[1]?.trim();
+  const walletLabel = parts[2]?.trim();
+  const rawPhaseType = parts[3]?.trim();
+  const rawMode = parts[4]?.trim();
+
+  if (!targetId || !walletLabel || !rawPhaseType) {
+    await ctx.reply("Use:\n/schedulemintphase targetId wallet1 public [watch|auto]");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const target = getMintTargetForOwner(targetId, ownerTelegramId);
+    const missing = getMintTargetMissingFields(target);
+
+    if (missing.length > 0 || !target.functionSignature || target.priceEth === undefined) {
+      await ctx.reply(
+        `This target is incomplete. Missing contract address, function signature, price, or chain.\n\nMissing: ${missing.join(", ") || "unknown"}`
+      );
+      return;
+    }
+
+    const mintType = normalizePhaseMintType(rawPhaseType);
+    const stage = findMintScheduleStageForType(target, mintType);
+
+    if (!stage) {
+      await ctx.reply(
+        "No matching detected mint phase was found on this target. Use /schedulemint with a manual ISO time."
+      );
+      return;
+    }
+
+    const startTimeISO = getStageStartTimeISO(stage);
+    const mode = normalizeMintJobMode(rawMode);
+    const job = await createMintJobForTarget({
+      ownerTelegramId,
+      target,
+      walletLabel,
+      startTimeISO,
+      mode,
+      mintType
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_job_created",
+      targetId: job.targetId,
+      jobId: job.jobId,
+      walletLabel: job.walletLabel,
+      walletAddress: job.walletAddress,
+      chain: job.chain,
+      contractAddress: job.contractAddress,
+      functionSignature: job.functionSignature,
+      quantity: job.quantity,
+      priceEth: job.priceEth,
+      mintType: job.mintType,
+      status: job.status,
+      reason: `phase:${stage.stageName || mintType}`
+    });
+
+    await ctx.reply(
+      `✅ Mint phase job scheduled.
+
+Matched Phase: ${stage.stageName || mintType}
+${formatMintJob(job)}
+
+Minting Lock: ${getMintLockStatusText(job.chain)}
+Scheduled Lock: ${getScheduledMintLockStatusText(job.chain, job.mode)}${
+        formatMintTypeWarning(job.mintType) ? `\n\n${formatMintTypeWarning(job.mintType)}` : ""
+      }`
+    );
+  } catch (error) {
+    logSafeError("Could not schedule mint phase", error);
+    await ctx.reply(`❌ Could not schedule mint phase.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("mintwatchstatus", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const jobs = listActiveMintJobsForOwner(ownerTelegramId);
+    await ctx.reply(`Mint Watch Status\n\n${formatMintJobList(jobs)}`);
+  } catch (error) {
+    logSafeError("Could not show mint watch status", error);
+    await ctx.reply(`❌ Could not show mint watch status.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("mintjob", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const jobId = parseCommandParts(ctx.message.text)[1]?.trim();
+
+  if (!jobId) {
+    await ctx.reply("Use:\n/mintjob jobId");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const job = getMintJobForOwner(jobId, ownerTelegramId);
+    await ctx.reply(formatMintJob(job));
+  } catch (error) {
+    logSafeError("Could not show mint job", error);
+    await ctx.reply(`❌ Could not show mint job.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("cancelmintjob", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const jobId = parseCommandParts(ctx.message.text)[1]?.trim();
+
+  if (!jobId) {
+    await ctx.reply("Use:\n/cancelmintjob jobId");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const job = getMintJobForOwner(jobId, ownerTelegramId);
+
+    if (["cancelled", "confirmed", "failed", "expired", "blocked"].includes(job.status)) {
+      await ctx.reply(`Mint job is already ${job.status}.`);
+      return;
+    }
+
+    const session = createMintJobCancelConfirmation({
+      ownerTelegramId,
+      jobId: job.jobId,
+      targetName: job.targetName
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_job_cancel_requested",
+      targetId: job.targetId,
+      jobId: job.jobId,
+      walletLabel: job.walletLabel,
+      walletAddress: job.walletAddress,
+      chain: job.chain,
+      contractAddress: job.contractAddress,
+      functionSignature: job.functionSignature,
+      quantity: job.quantity,
+      priceEth: job.priceEth,
+      mintType: job.mintType,
+      status: job.status
+    });
+
+    await ctx.reply(
+      `Cancel mint job?
+
+Job ID: ${job.jobId}
+Target: ${job.targetName}
+
+This confirmation expires in 10 minutes.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Confirm Cancel", `mj:cancel_confirm:${session.sessionId}`)],
+        [Markup.button.callback("Keep Job", `mj:cancel_cancel:${session.sessionId}`)]
+      ])
+    );
+  } catch (error) {
+    logSafeError("Could not request mint job cancellation", error);
+    await ctx.reply(`❌ Could not request mint job cancellation.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^mj:cancel_confirm:([0-9a-f-]+)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const sessionId = ctx.match[1];
+
+  if (!sessionId) {
+    await ctx.reply("This mint job cancellation has expired. Run /cancelmintjob again.");
+    return;
+  }
+
+  const validated = await validateMintJobCancelConfirmation(ctx, sessionId);
+
+  if (!validated) {
+    return;
+  }
+
+  const { session } = validated;
+
+  try {
+    const job = updateMintJobStatus(
+      session.jobId,
+      session.ownerTelegramId,
+      "cancelled",
+      "cancelled_by_user"
+    );
+    session.status = "used";
+    await auditMintAction({
+      ownerTelegramId: job.ownerTelegramId,
+      action: "mint_job_cancelled",
+      targetId: job.targetId,
+      jobId: job.jobId,
+      walletLabel: job.walletLabel,
+      walletAddress: job.walletAddress,
+      chain: job.chain,
+      contractAddress: job.contractAddress,
+      functionSignature: job.functionSignature,
+      quantity: job.quantity,
+      priceEth: job.priceEth,
+      mintType: job.mintType,
+      status: job.status,
+      reason: "cancelled_by_user"
+    });
+    await ctx.reply(`✅ Mint job cancelled.\n\n${formatMintJob(job)}`);
+  } catch (error) {
+    logSafeError("Could not cancel mint job", error);
+    await ctx.reply(`❌ Could not cancel mint job.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^mj:cancel_cancel:([0-9a-f-]+)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const sessionId = ctx.match[1];
+
+  if (!sessionId) {
+    await ctx.reply("This mint job cancellation has expired. Run /cancelmintjob again.");
+    return;
+  }
+
+  const validated = await validateMintJobCancelConfirmation(ctx, sessionId);
+
+  if (!validated) {
+    return;
+  }
+
+  validated.session.status = "cancelled";
+  await ctx.reply(`Mint job kept: ${validated.session.jobId}`);
+});
+
+bot.command("runmintcheck", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const jobId = parseCommandParts(ctx.message.text)[1]?.trim();
+
+  if (!jobId) {
+    await ctx.reply("Use:\n/runmintcheck jobId");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const job = getMintJobForOwner(jobId, ownerTelegramId);
+    const readiness = await runMintJobReadinessCheck(job, { countAttempt: false });
+    const updated = getMintJobForOwner(job.jobId, ownerTelegramId);
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_job_checked",
+      targetId: updated.targetId,
+      jobId: updated.jobId,
+      walletLabel: updated.walletLabel,
+      walletAddress: updated.walletAddress,
+      chain: updated.chain,
+      contractAddress: updated.contractAddress,
+      functionSignature: updated.functionSignature,
+      quantity: updated.quantity,
+      priceEth: updated.priceEth,
+      mintType: updated.mintType,
+      status: readiness.status,
+      reason: readiness.reason
+    });
+
+    await ctx.reply(
+      `Mint Job Check
+
+Job ID: ${updated.jobId}
+Target: ${updated.targetName}
+Status: ${readiness.status}
+Ready: ${readiness.ready ? "yes" : "no"}
+Gas Estimate: ${readiness.preview?.gasEstimate || "Not available"}
+Reason: ${readiness.reason || "No blocking reason detected."}
+
+No transaction was sent.`
+    );
+  } catch (error) {
+    logSafeError("Could not run mint job check", error);
+    await ctx.reply(`❌ Could not run mint job check.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("runmintjob", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const jobId = parseCommandParts(ctx.message.text)[1]?.trim();
+
+  if (!jobId) {
+    await ctx.reply("Use:\n/runmintjob jobId");
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const job = getMintJobForOwner(jobId, ownerTelegramId);
+
+    if (job.status === "cancelled" || job.status === "confirmed") {
+      await ctx.reply(`Mint job is ${job.status} and cannot be run.`);
+      return;
+    }
+
+    const preview = await previewMint({
+      ownerTelegramId,
+      walletLabel: job.walletLabel,
+      contractAddress: job.contractAddress,
+      functionSignature: job.functionSignature,
+      quantity: job.quantity,
+      priceEth: job.priceEth,
+      chain: job.chain
+    });
+    const run = createRunFromPreview(
+      ownerTelegramId,
+      preview,
+      "pending",
+      job.targetId,
+      job.jobId
+    );
+    updateMintJobForOwner(job.jobId, ownerTelegramId, {
+      lastRunId: run.runId
+    });
+    const session = createMintConfirmationSession({
+      ownerTelegramId,
+      walletLabel: preview.walletLabel,
+      walletAddress: preview.walletAddress,
+      chain: preview.chain,
+      contractAddress: preview.contractAddress,
+      functionSignature: preview.functionSignature,
+      quantity: preview.quantity,
+      priceEth: preview.priceEth,
+      runId: run.runId,
+      targetId: job.targetId,
+      jobId: job.jobId
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "mint_confirmation_created",
+      targetId: job.targetId,
+      jobId: job.jobId,
+      runId: run.runId,
+      walletLabel: preview.walletLabel,
+      walletAddress: preview.walletAddress,
+      chain: preview.chain,
+      contractAddress: preview.contractAddress,
+      functionSignature: preview.functionSignature,
+      quantity: preview.quantity,
+      priceEth: preview.priceEth,
+      mintType: job.mintType,
+      status: session.status
+    });
+
+    await ctx.reply(
+      `${formatMintPreviewMessage(preview, {
+        title: `Final Scheduled Mint Confirmation: ${job.targetName}`,
+        targetId: job.targetId,
+        runId: run.runId
+      })}
+
+Job ID: ${job.jobId}
+Mode: manual confirmation
+
+This confirmation expires in 10 minutes.
+
+No transaction will be sent until you press Confirm Mint.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Confirm Mint", `mint:confirm:${session.sessionId}`)],
+        [Markup.button.callback("Cancel", `mint:cancel:${session.sessionId}`)]
+      ])
+    );
+  } catch (error) {
+    logSafeError("Could not run mint job", error);
+    await ctx.reply(`❌ Could not run mint job.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("schedulerstatus", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const rpcStatus = getMintRpcStatus();
+    const activeJobs = listActiveMintJobsForOwner(ownerTelegramId);
+
+    await ctx.reply(
+      `Scheduler Status
+
+Scheduler enabled: ${mintSchedulerTimer ? "yes" : "no"}
+MINT_SCHEDULER_POLL_MS: ${getMintSchedulerPollMs()}
+ALLOW_MAINNET_MINTING: ${isMainnetMintingEnabled() ? "true" : "false"}
+ALLOW_SCHEDULED_MAINNET_MINTING: ${isScheduledMainnetMintingEnabled() ? "true" : "false"}
+Active jobs for you: ${activeJobs.length}
+ETH_MAINNET_RPC_URL configured: ${rpcStatus.mainnetRpcConfigured ? "yes" : "no"}
+SEPOLIA_RPC_URL or ETH_SEPOLIA_RPC_URL configured: ${rpcStatus.sepoliaRpcConfigured ? "yes" : "no"}
+
+Scheduled Ethereum mainnet auto-minting requires both ALLOW_MAINNET_MINTING=true and ALLOW_SCHEDULED_MAINNET_MINTING=true.`
+    );
+  } catch (error) {
+    logSafeError("Could not show scheduler status", error);
+    await ctx.reply(`❌ Could not show scheduler status.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
 bot.command("mainmintpreview", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
@@ -3802,12 +5367,20 @@ bot.action(/^mint:confirm:([0-9a-f-]+)$/, async (ctx) => {
         status: "blocked",
         errorReason: "mainnet_minting_disabled"
       });
+      if (session.jobId) {
+        updateMintJobForOwner(session.jobId, session.ownerTelegramId, {
+          status: "blocked",
+          lastRunId: session.runId,
+          safeErrorReason: "mainnet_minting_disabled"
+        });
+      }
       await auditMintAction({
         ownerTelegramId: session.ownerTelegramId,
         action: "mint_blocked",
         walletLabel: session.walletLabel,
         walletAddress: session.walletAddress,
         targetId: session.targetId,
+        jobId: session.jobId,
         runId: session.runId,
         chain: session.chain,
         contractAddress: session.contractAddress,
@@ -3827,12 +5400,20 @@ bot.action(/^mint:confirm:([0-9a-f-]+)$/, async (ctx) => {
         status: "blocked",
         errorReason: "gas_estimation_failed"
       });
+      if (session.jobId) {
+        updateMintJobForOwner(session.jobId, session.ownerTelegramId, {
+          status: "blocked",
+          lastRunId: session.runId,
+          safeErrorReason: preview.gasEstimateError || "gas_estimation_failed"
+        });
+      }
       await auditMintAction({
         ownerTelegramId: session.ownerTelegramId,
         action: "mint_blocked",
         walletLabel: session.walletLabel,
         walletAddress: session.walletAddress,
         targetId: session.targetId,
+        jobId: session.jobId,
         runId: session.runId,
         chain: session.chain,
         contractAddress: session.contractAddress,
@@ -3865,6 +5446,13 @@ bot.action(/^mint:confirm:([0-9a-f-]+)$/, async (ctx) => {
       status: "submitted",
       txHash: submitted.txHash
     });
+    if (session.jobId) {
+      updateMintJobForOwner(session.jobId, session.ownerTelegramId, {
+        status: "submitted",
+        lastRunId: session.runId,
+        txHash: submitted.txHash
+      });
+    }
 
     await auditMintAction({
       ownerTelegramId: session.ownerTelegramId,
@@ -3872,6 +5460,7 @@ bot.action(/^mint:confirm:([0-9a-f-]+)$/, async (ctx) => {
       walletLabel: session.walletLabel,
       walletAddress: submitted.walletAddress,
       targetId: session.targetId,
+      jobId: session.jobId,
       runId: session.runId,
       chain: session.chain,
       contractAddress: session.contractAddress,
@@ -3901,12 +5490,20 @@ ${submitted.txHash}`
           status: "confirmed",
           confirmedAt: new Date().toISOString()
         });
+        if (session.jobId) {
+          updateMintJobForOwner(session.jobId, session.ownerTelegramId, {
+            status: "confirmed",
+            lastRunId: session.runId,
+            txHash: submitted.txHash
+          });
+        }
         await auditMintAction({
           ownerTelegramId: session.ownerTelegramId,
           action: "mint_confirmed",
           walletLabel: session.walletLabel,
           walletAddress: submitted.walletAddress,
           targetId: session.targetId,
+          jobId: session.jobId,
           runId: session.runId,
           chain: session.chain,
           contractAddress: session.contractAddress,
@@ -3931,6 +5528,14 @@ ${submitted.txHash}`
           status: "submitted",
           errorReason: "confirmation_timeout"
         });
+        if (session.jobId) {
+          updateMintJobForOwner(session.jobId, session.ownerTelegramId, {
+            status: "submitted",
+            lastRunId: session.runId,
+            txHash: submitted.txHash,
+            safeErrorReason: "confirmation_timeout"
+          });
+        }
         await ctx.reply(
           `⚠️ Mint transaction was sent, but confirmation timed out.
 
@@ -3946,12 +5551,21 @@ ${submitted.txHash}`
         errorReason: "transaction_failed",
         confirmedAt: new Date().toISOString()
       });
+      if (session.jobId) {
+        updateMintJobForOwner(session.jobId, session.ownerTelegramId, {
+          status: "failed",
+          lastRunId: session.runId,
+          txHash: submitted.txHash,
+          safeErrorReason: "transaction_failed"
+        });
+      }
       await auditMintAction({
         ownerTelegramId: session.ownerTelegramId,
         action: "mint_failed",
         walletLabel: session.walletLabel,
         walletAddress: submitted.walletAddress,
         targetId: session.targetId,
+        jobId: session.jobId,
         runId: session.runId,
         chain: session.chain,
         contractAddress: session.contractAddress,
@@ -3975,6 +5589,14 @@ ${submitted.txHash}`
         status: "submitted",
         errorReason: getSafeErrorMessage(confirmationError)
       });
+      if (session.jobId) {
+        updateMintJobForOwner(session.jobId, session.ownerTelegramId, {
+          status: "submitted",
+          lastRunId: session.runId,
+          txHash: submitted.txHash,
+          safeErrorReason: getSafeErrorMessage(confirmationError)
+        });
+      }
       await ctx.reply(
         `⚠️ Mint transaction was sent, but confirmation could not be verified yet.
 
@@ -3993,12 +5615,20 @@ ${getSafeErrorMessage(confirmationError)}`
       status: "failed",
       errorReason: getSafeErrorMessage(error)
     });
+    if (session.jobId) {
+      updateMintJobForOwner(session.jobId, session.ownerTelegramId, {
+        status: "failed",
+        lastRunId: session.runId,
+        safeErrorReason: getSafeErrorMessage(error)
+      });
+    }
     await auditMintAction({
       ownerTelegramId: session.ownerTelegramId,
       action: "mint_failed",
       walletLabel: session.walletLabel,
       walletAddress: session.walletAddress,
       targetId: session.targetId,
+      jobId: session.jobId,
       runId: session.runId,
       chain: session.chain,
       contractAddress: session.contractAddress,
@@ -4036,12 +5666,20 @@ bot.action(/^mint:cancel:([0-9a-f-]+)$/, async (ctx) => {
     status: "cancelled",
     errorReason: "cancelled_by_user"
   });
+  if (session.jobId) {
+    updateMintJobForOwner(session.jobId, session.ownerTelegramId, {
+      status: "cancelled",
+      lastRunId: session.runId,
+      safeErrorReason: "cancelled_by_user"
+    });
+  }
   await auditMintAction({
     ownerTelegramId: session.ownerTelegramId,
     action: "mint_blocked",
     walletLabel: session.walletLabel,
     walletAddress: session.walletAddress,
     targetId: session.targetId,
+    jobId: session.jobId,
     runId: session.runId,
     chain: session.chain,
     contractAddress: session.contractAddress,
@@ -7758,6 +9396,7 @@ async function startBot() {
 
   console.log("Bot is running...");
   console.log("Admin lock + NFT mint module loaded.");
+  startMintScheduler();
 
   if (!shouldRegisterTelegramCommands()) {
     console.log(
