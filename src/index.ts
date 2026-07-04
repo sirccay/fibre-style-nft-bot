@@ -15,6 +15,10 @@ import {
   archiveWalletForOwner
 } from "./vault.js";
 import { getTelegramUserId, requireAdmin } from "./auth.js";
+import {
+  formatOpenSeaResolverUserMessage,
+  resolveOpenSeaContractForMintFlow
+} from "./openSeaContractResolver.js";
 import { extractOpenSeaSlug, getOpenSeaCollectionStats, getOpenSeaBestOffer, getOpenSeaBestListing, getOpenSeaNft, getOpenSeaNftsByAccount } from "./opensea.js";
 import { checkErc721Ownership, createOpenSeaListing, getMainnetProvider, acceptOpenSeaBestOffer } from "./openseaTrading.js";
 import { appendSessionAuditLog, appendWalletAuditLog } from "./audit.js";
@@ -6593,13 +6597,1119 @@ Concurrency Cap: ${getMultiMintConcurrency()}`
   }
 });
 
+
+
+type MintFlowTargetDraftStep =
+  | "name"
+  | "contractAddress"
+  | "functionSignature"
+  | "quantity"
+  | "priceEth"
+  | "chain";
+
+type MintFlowTargetDraftData = {
+  name?: string;
+  contractAddress?: string;
+  functionSignature?: SupportedMintFunctionSignature;
+  quantity?: number;
+  priceEth?: string;
+  chain?: MintChain;
+  sourceUrl?: string;
+  collectionSlug?: string;
+};
+
+type MintFlowTargetDraftSession = {
+  sessionId: string;
+  ownerTelegramId: string;
+  step: MintFlowTargetDraftStep;
+  data: MintFlowTargetDraftData;
+  createdAt: string;
+  expiresAt: string;
+  status: "active" | "used" | "cancelled" | "expired";
+};
+
+const MINT_FLOW_TARGET_DRAFT_TTL_MS = 15 * 60 * 1000;
+const mintFlowTargetDraftSessions = new Map<string, MintFlowTargetDraftSession>();
+const activeMintFlowTargetDraftByOwner = new Map<string, string>();
+
+const MINT_FLOW_FUNCTION_PRESETS = {
+  mint: "mint(uint256)",
+  publicMint: "publicMint(uint256)",
+  mintPublic: "mintPublic(uint256)",
+  mintTo: "mintTo(address,uint256)",
+  publicMintTo: "publicMint(address,uint256)"
+} as const;
+
+const MINT_FLOW_PRICE_PRESETS = {
+  free: "0",
+  p001: "0.01",
+  p003: "0.03",
+  p005: "0.05"
+} as const;
+
+function createMintFlowTargetDraftSessionId() {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const sessionId = randomUUID().replace(/-/g, "").slice(0, 8);
+
+    if (!mintFlowTargetDraftSessions.has(sessionId)) {
+      return sessionId;
+    }
+  }
+
+  return randomUUID().replace(/-/g, "").slice(0, 12);
+}
+
+function isMintFlowTargetDraftExpired(session: MintFlowTargetDraftSession) {
+  const expiresAtMs = Date.parse(session.expiresAt);
+  return !Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now();
+}
+
+function cleanupMintFlowTargetDraftSessions() {
+  for (const [sessionId, session] of mintFlowTargetDraftSessions.entries()) {
+    if (session.status === "active" && isMintFlowTargetDraftExpired(session)) {
+      session.status = "expired";
+    }
+
+    const expiresAtMs = Date.parse(session.expiresAt);
+    const cleanupAfterMs = Number.isFinite(expiresAtMs)
+      ? expiresAtMs + MINT_FLOW_TARGET_DRAFT_TTL_MS
+      : Date.now();
+
+    if (cleanupAfterMs <= Date.now()) {
+      mintFlowTargetDraftSessions.delete(sessionId);
+
+      if (activeMintFlowTargetDraftByOwner.get(session.ownerTelegramId) === sessionId) {
+        activeMintFlowTargetDraftByOwner.delete(session.ownerTelegramId);
+      }
+    }
+  }
+}
+
+function createMintFlowTargetDraftSession(ownerTelegramId: string) {
+  cleanupMintFlowTargetDraftSessions();
+
+  const existingId = activeMintFlowTargetDraftByOwner.get(ownerTelegramId);
+
+  if (existingId) {
+    const existing = mintFlowTargetDraftSessions.get(existingId);
+
+    if (existing && existing.status === "active" && !isMintFlowTargetDraftExpired(existing)) {
+      return existing;
+    }
+  }
+
+  const createdAt = new Date();
+  const session: MintFlowTargetDraftSession = {
+    sessionId: createMintFlowTargetDraftSessionId(),
+    ownerTelegramId,
+    step: "name",
+    data: {},
+    createdAt: createdAt.toISOString(),
+    expiresAt: new Date(
+      createdAt.getTime() + MINT_FLOW_TARGET_DRAFT_TTL_MS
+    ).toISOString(),
+    status: "active"
+  };
+
+  mintFlowTargetDraftSessions.set(session.sessionId, session);
+  activeMintFlowTargetDraftByOwner.set(ownerTelegramId, session.sessionId);
+  return session;
+}
+
+function getActiveMintFlowTargetDraftSession(ownerTelegramId: string) {
+  cleanupMintFlowTargetDraftSessions();
+
+  const sessionId = activeMintFlowTargetDraftByOwner.get(ownerTelegramId);
+
+  if (!sessionId) {
+    return null;
+  }
+
+  const session = mintFlowTargetDraftSessions.get(sessionId);
+
+  if (!session || session.status !== "active" || isMintFlowTargetDraftExpired(session)) {
+    activeMintFlowTargetDraftByOwner.delete(ownerTelegramId);
+
+    if (session) {
+      session.status = "expired";
+    }
+
+    return null;
+  }
+
+  return session;
+}
+
+async function getMintFlowTargetDraftSession(ctx: Context, sessionId: string) {
+  cleanupMintFlowTargetDraftSessions();
+
+  const actorTelegramId = getTelegramUserId(ctx);
+
+  if (!actorTelegramId) {
+    await ctx.reply("❌ Could not verify your Telegram account for this action.");
+    return null;
+  }
+
+  const session = mintFlowTargetDraftSessions.get(sessionId);
+
+  if (!session) {
+    await ctx.reply("This target creation flow has expired. Run /mintflow again.");
+    return null;
+  }
+
+  if (session.ownerTelegramId !== actorTelegramId) {
+    await ctx.reply("You cannot use this target creation flow.");
+    return null;
+  }
+
+  if (session.status !== "active" || isMintFlowTargetDraftExpired(session)) {
+    session.status = "expired";
+    await ctx.reply("This target creation flow has expired. Run /mintflow again.");
+    return null;
+  }
+
+  return session;
+}
+
+function getNextMintFlowTargetDraftStep(
+  session: MintFlowTargetDraftSession
+): MintFlowTargetDraftStep | null {
+  if (!session.data.name) return "name";
+  if (!session.data.contractAddress) return "contractAddress";
+  if (!session.data.functionSignature) return "functionSignature";
+  if (!session.data.quantity) return "quantity";
+  if (!session.data.priceEth) return "priceEth";
+  if (!session.data.chain) return "chain";
+  return null;
+}
+
+function formatMintFlowTargetDraftProgress(session: MintFlowTargetDraftSession) {
+  return [
+    `Name: ${session.data.name || "Not set"}`,
+    `Contract: ${session.data.contractAddress ? formatShortAddress(session.data.contractAddress) : "Not set"}`,
+    `Function: ${session.data.functionSignature || "Not set"}`,
+    `Quantity: ${session.data.quantity || "Not set"}`,
+    `Price: ${session.data.priceEth === undefined ? "Not set" : `${session.data.priceEth} ETH`}`,
+    `Chain: ${session.data.chain || "Not set"}`
+  ].join("\n");
+}
+
+async function sendMintFlowTargetDraftPrompt(
+  ctx: Context,
+  session: MintFlowTargetDraftSession
+) {
+  const step = getNextMintFlowTargetDraftStep(session);
+
+  if (!step) {
+    await finalizeMintFlowTargetDraft(ctx, session);
+    return;
+  }
+
+  session.step = step;
+
+  if (step === "name") {
+    await ctx.reply(
+      `➕ Create New Mint Target
+
+Step 1/6: send the target name.
+
+Use 2-40 characters. Letters, numbers, hyphen, and underscore only.
+
+Example:
+azukiMint`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Cancel", `mft:cancel:${session.sessionId}`)]
+      ])
+    );
+    return;
+  }
+
+  if (step === "contractAddress") {
+    await ctx.reply(
+      `Step 2/6: send the contract address or mint page link.
+
+Progress:
+${formatMintFlowTargetDraftProgress(session)}
+
+Examples:
+0x1234...
+https://opensea.io/collection/collection-name
+
+The bot will try to auto-detect contract, chain, function, and price from supported links.
+
+Do not send private keys or seed phrases.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Cancel", `mft:cancel:${session.sessionId}`)]
+      ])
+    );
+    return;
+  }
+
+  if (step === "functionSignature") {
+    await ctx.reply(
+      `Step 3/6: choose the mint function.
+
+Progress:
+${formatMintFlowTargetDraftProgress(session)}
+
+Most common:
+- publicMint(uint256)
+- mint(uint256)
+
+You can also type a supported function manually.`,
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback("publicMint(uint256)", `mft:f:${session.sessionId}:publicMint`),
+          Markup.button.callback("mint(uint256)", `mft:f:${session.sessionId}:mint`)
+        ],
+        [
+          Markup.button.callback("mintPublic(uint256)", `mft:f:${session.sessionId}:mintPublic`)
+        ],
+        [
+          Markup.button.callback("mintTo(address,uint256)", `mft:f:${session.sessionId}:mintTo`)
+        ],
+        [
+          Markup.button.callback("publicMint(address,uint256)", `mft:f:${session.sessionId}:publicMintTo`)
+        ],
+        [Markup.button.callback("Cancel", `mft:cancel:${session.sessionId}`)]
+      ])
+    );
+    return;
+  }
+
+  if (step === "quantity") {
+    await ctx.reply(
+      `Step 4/6: choose quantity.
+
+Progress:
+${formatMintFlowTargetDraftProgress(session)}
+
+You can tap a button or type a whole number.`,
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback("1", `mft:q:${session.sessionId}:1`),
+          Markup.button.callback("2", `mft:q:${session.sessionId}:2`),
+          Markup.button.callback("3", `mft:q:${session.sessionId}:3`)
+        ],
+        [Markup.button.callback("Cancel", `mft:cancel:${session.sessionId}`)]
+      ])
+    );
+    return;
+  }
+
+  if (step === "priceEth") {
+    await ctx.reply(
+      `Step 5/6: choose mint price per NFT.
+
+Progress:
+${formatMintFlowTargetDraftProgress(session)}
+
+You can tap a button or type the ETH price.`,
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback("Free / 0 ETH", `mft:p:${session.sessionId}:free`),
+          Markup.button.callback("0.01 ETH", `mft:p:${session.sessionId}:p001`)
+        ],
+        [
+          Markup.button.callback("0.03 ETH", `mft:p:${session.sessionId}:p003`),
+          Markup.button.callback("0.05 ETH", `mft:p:${session.sessionId}:p005`)
+        ],
+        [Markup.button.callback("Cancel", `mft:cancel:${session.sessionId}`)]
+      ])
+    );
+    return;
+  }
+
+  await ctx.reply(
+    `Step 6/6: choose chain.
+
+Progress:
+${formatMintFlowTargetDraftProgress(session)}
+
+For testing, use Sepolia.
+For live minting, use Mainnet. Mainnet sends still stay protected by your existing safety lock.`,
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback("Sepolia", `mft:c:${session.sessionId}:sepolia`),
+        Markup.button.callback("Mainnet", `mft:c:${session.sessionId}:mainnet`)
+      ],
+      [Markup.button.callback("Cancel", `mft:cancel:${session.sessionId}`)]
+    ])
+  );
+}
+
+async function finalizeMintFlowTargetDraft(
+  ctx: Context,
+  session: MintFlowTargetDraftSession
+) {
+  const {
+    name,
+    contractAddress,
+    functionSignature,
+    quantity,
+    priceEth,
+    chain,
+    sourceUrl,
+    collectionSlug
+  } = session.data;
+
+  if (!name || !contractAddress || !functionSignature || !quantity || priceEth === undefined || !chain) {
+    await sendMintFlowTargetDraftPrompt(ctx, session);
+    return;
+  }
+
+  const target = createMintTarget({
+    ownerTelegramId: session.ownerTelegramId,
+    name,
+    contractAddress,
+    functionSignature,
+    quantity,
+    priceEth,
+    chain,
+    ...(sourceUrl ? { sourceUrl } : {}),
+    ...(collectionSlug ? { collectionSlug } : {})
+  });
+
+  session.status = "used";
+  activeMintFlowTargetDraftByOwner.delete(session.ownerTelegramId);
+
+  await auditMintAction({
+    ownerTelegramId: session.ownerTelegramId,
+    action: "guided_mint_target_created",
+    targetId: target.targetId,
+    chain: target.chain,
+    contractAddress: target.contractAddress,
+    functionSignature: target.functionSignature,
+    quantity: target.quantity,
+    priceEth: target.priceEth,
+    status: target.status
+  });
+
+  await ctx.reply(
+    `✅ Mint target created.
+
+${formatMintTarget(target)}
+
+Next:
+Choose what you want to do with this target.`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("🚀 Continue Quick Mint", `mfw:t:q:${target.targetId}`)],
+      [Markup.button.callback("✅ Check Readiness", `mfw:t:r:${target.targetId}`)],
+      [Markup.button.callback("⬅️ Back to Mint Flow", "mf:menu")]
+    ])
+  );
+}
+
+async function applyMintFlowTargetDraftText(
+  ctx: Context,
+  session: MintFlowTargetDraftSession,
+  input: string
+) {
+  try {
+    if (session.step === "name") {
+      session.data.name = sanitizeMintTargetName(input);
+    } else if (session.step === "contractAddress") {
+      if (ethers.isAddress(input)) {
+        session.data.contractAddress = ethers.getAddress(input);
+      } else {
+        const linkInput = getDirectMintLinkInput(input);
+
+        if (!linkInput) {
+          throw new Error("Invalid contract address or unsupported mint link.");
+        }
+
+        await ctx.reply("🔎 Detecting mint details from link...");
+
+        const resolverResult = await resolveOpenSeaContractForMintFlow(linkInput);
+
+        if (resolverResult.status !== "resolved") {
+          await auditMintAction({
+            ownerTelegramId: session.ownerTelegramId,
+            action: "guided_mint_target_link_detected",
+            collectionSlug: "slug" in resolverResult ? resolverResult.slug : undefined,
+            status: resolverResult.status,
+            reason: "message" in resolverResult ? resolverResult.message : resolverResult.status
+          });
+
+          await ctx.reply(formatOpenSeaResolverUserMessage(resolverResult));
+          return;
+        }
+
+        const candidate = resolverResult.candidate;
+
+        if (!candidate.supportedMintChain) {
+          await ctx.reply(
+            `OpenSea resolved a contract, but the chain is not supported by this bot yet.
+
+Resolved:
+${candidate.chainName}: ${formatShortAddress(candidate.address)}
+
+Paste an Ethereum mainnet or Sepolia contract address to continue.`
+          );
+          return;
+        }
+
+        session.data.contractAddress = ethers.getAddress(candidate.address);
+        session.data.chain = candidate.supportedMintChain;
+        session.data.collectionSlug = resolverResult.slug;
+        session.data.sourceUrl = linkInput;
+
+        await ctx.reply(
+          `✅ OpenSea contract resolved.
+
+Slug: ${resolverResult.slug}
+Chain: ${session.data.chain}
+Contract: ${formatShortAddress(session.data.contractAddress)}`
+        );
+
+        try {
+          const detection = await detectMint(linkInput);
+          const foundCandidates = getFoundFunctionCandidates(detection.mint.candidateFunctions);
+
+          if (foundCandidates.length === 1) {
+            session.data.functionSignature = normalizeMintFunctionSignature(
+              foundCandidates[0]!.signature
+            );
+          }
+
+          if (detection.mint.priceEth) {
+            session.data.priceEth = validateMintPriceEth(detection.mint.priceEth);
+          }
+
+          await auditMintAction({
+            ownerTelegramId: session.ownerTelegramId,
+            action: "guided_mint_target_link_detected",
+            chain: session.data.chain,
+            contractAddress: session.data.contractAddress,
+            collectionSlug: resolverResult.slug,
+            candidateFunctions: foundCandidates.map((foundCandidate) => foundCandidate.signature),
+            phaseStatus: detection.mint.phaseStatus,
+            phaseTypeEstimate: detection.mint.phaseTypeEstimate,
+            phaseTypeConfidence: detection.mint.phaseTypeConfidence,
+            status: "detected",
+            reason: `opensea_resolver:${candidate.source}`
+          });
+        } catch (detectionError) {
+          logSafeError("OpenSea mint metadata detection failed after contract resolution", detectionError);
+
+          await auditMintAction({
+            ownerTelegramId: session.ownerTelegramId,
+            action: "guided_mint_target_link_detected",
+            chain: session.data.chain,
+            contractAddress: session.data.contractAddress,
+            collectionSlug: resolverResult.slug,
+            status: "contract_detected_metadata_failed",
+            reason: getSafeErrorMessage(detectionError)
+          });
+        }
+      }
+    } else if (session.step === "functionSignature") {
+      session.data.functionSignature = normalizeMintFunctionSignature(input);
+    } else if (session.step === "quantity") {
+      session.data.quantity = validateMintQuantity(input);
+    } else if (session.step === "priceEth") {
+      session.data.priceEth = validateMintPriceEth(input);
+    } else if (session.step === "chain") {
+      session.data.chain = normalizeMintChain(input);
+    }
+
+    await sendMintFlowTargetDraftPrompt(ctx, session);
+  } catch (error) {
+    await ctx.reply(
+      `❌ Invalid value.
+
+Reason:
+${getSafeErrorMessage(error)}
+
+Please try again.`
+    );
+    await sendMintFlowTargetDraftPrompt(ctx, session);
+  }
+}
+
+async function handleMintFlowTargetDraftText(ctx: Context) {
+  const ownerTelegramId = getTelegramUserId(ctx);
+
+  if (!ownerTelegramId) {
+    return false;
+  }
+
+  const session = getActiveMintFlowTargetDraftSession(ownerTelegramId);
+
+  if (!session) {
+    return false;
+  }
+
+  if (!(await requireAdmin(ctx))) {
+    return true;
+  }
+
+  const rawText = (ctx as any).message?.text;
+
+  if (typeof rawText !== "string") {
+    return true;
+  }
+
+  const input = rawText.trim();
+
+  if (!input || input.startsWith("/")) {
+    return false;
+  }
+
+  await applyMintFlowTargetDraftText(ctx, session, input);
+  return true;
+}
+
+
+type MintFlowWizardAction = "ready" | "quick";
+
+type MintFlowWizardSession = {
+  sessionId: string;
+  ownerTelegramId: string;
+  action: MintFlowWizardAction;
+  targetId: string;
+  walletLabels: string[];
+  gasStrategy?: GasStrategy;
+  createdAt: string;
+  expiresAt: string;
+  status: "active" | "used" | "cancelled" | "expired";
+};
+
+const MINT_FLOW_WIZARD_TTL_MS = 10 * 60 * 1000;
+const mintFlowWizardSessions = new Map<string, MintFlowWizardSession>();
+
+function createMintFlowWizardSessionId() {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const sessionId = randomUUID().replace(/-/g, "").slice(0, 8);
+
+    if (!mintFlowWizardSessions.has(sessionId)) {
+      return sessionId;
+    }
+  }
+
+  return randomUUID().replace(/-/g, "").slice(0, 12);
+}
+
+function isMintFlowWizardExpired(session: MintFlowWizardSession) {
+  const expiresAtMs = Date.parse(session.expiresAt);
+  return !Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now();
+}
+
+function cleanupMintFlowWizardSessions() {
+  for (const [sessionId, session] of mintFlowWizardSessions.entries()) {
+    if (session.status === "active" && isMintFlowWizardExpired(session)) {
+      session.status = "expired";
+    }
+
+    const expiresAtMs = Date.parse(session.expiresAt);
+    const cleanupAfterMs = Number.isFinite(expiresAtMs)
+      ? expiresAtMs + MINT_FLOW_WIZARD_TTL_MS
+      : Date.now();
+
+    if (cleanupAfterMs <= Date.now()) {
+      mintFlowWizardSessions.delete(sessionId);
+    }
+  }
+}
+
+function createMintFlowWizardSession(params: {
+  ownerTelegramId: string;
+  action: MintFlowWizardAction;
+  targetId: string;
+}) {
+  cleanupMintFlowWizardSessions();
+
+  const createdAt = new Date();
+  const session: MintFlowWizardSession = {
+    sessionId: createMintFlowWizardSessionId(),
+    ownerTelegramId: params.ownerTelegramId,
+    action: params.action,
+    targetId: params.targetId,
+    walletLabels: [],
+    createdAt: createdAt.toISOString(),
+    expiresAt: new Date(createdAt.getTime() + MINT_FLOW_WIZARD_TTL_MS).toISOString(),
+    status: "active"
+  };
+
+  mintFlowWizardSessions.set(session.sessionId, session);
+  return session;
+}
+
+async function getMintFlowWizardSession(ctx: Context, sessionId: string) {
+  cleanupMintFlowWizardSessions();
+
+  const actorTelegramId = getTelegramUserId(ctx);
+
+  if (!actorTelegramId) {
+    await ctx.reply("❌ Could not verify your Telegram account for this action.");
+    return null;
+  }
+
+  const session = mintFlowWizardSessions.get(sessionId);
+
+  if (!session) {
+    await ctx.reply("This mint flow has expired. Run /mintflow again.");
+    return null;
+  }
+
+  if (session.ownerTelegramId !== actorTelegramId) {
+    await ctx.reply("You cannot use this mint flow.");
+    return null;
+  }
+
+  if (session.status !== "active" || isMintFlowWizardExpired(session)) {
+    session.status = "expired";
+    await ctx.reply("This mint flow has expired. Run /mintflow again.");
+    return null;
+  }
+
+  return session;
+}
+
+function getMintFlowActionCode(action: MintFlowWizardAction) {
+  return action === "quick" ? "q" : "r";
+}
+
+function getMintFlowActionFromCode(rawAction: string): MintFlowWizardAction {
+  return rawAction === "q" ? "quick" : "ready";
+}
+
+function getMintFlowActionLabel(action: MintFlowWizardAction) {
+  return action === "quick" ? "Quick Mint" : "Check Readiness";
+}
+
+function chunkMintFlowRows<T>(items: T[], size: number): T[][] {
+  const rows: T[][] = [];
+
+  for (let index = 0; index < items.length; index += size) {
+    rows.push(items.slice(index, index + size));
+  }
+
+  return rows;
+}
+
+function getMintFlowPresetGasStrategy(
+  mode: "target" | "auto" | "standard" | "fast",
+  target: MintTarget
+) {
+  if (mode === "target") {
+    return getTargetGasStrategy(target);
+  }
+
+  return parseGasStrategyInput(["", "", mode], 2);
+}
+
+async function sendMintFlowTargetSelection(ctx: Context, action: MintFlowWizardAction) {
+  const ownerTelegramId = getRequiredTelegramUserId(ctx);
+  const targets = listMintTargetsForOwner(ownerTelegramId);
+
+  if (targets.length === 0) {
+    await ctx.reply("No active mint targets found. Add one with /addminttarget.");
+    return;
+  }
+
+  await ctx.reply(
+    `${getMintFlowActionLabel(action)}
+
+Step 1/4: choose a saved mint target.`,
+    Markup.inlineKeyboard([
+      ...targets.map((target) => [
+        Markup.button.callback(
+          `${target.name} (${target.chain})`,
+          `mfw:t:${getMintFlowActionCode(action)}:${target.targetId}`
+        )
+      ]),
+      [Markup.button.callback("➕ Create New Target", "mf:create_target")],
+      [Markup.button.callback("⬅️ Back to Menu", "mf:menu")]
+    ])
+  );
+}
+
+async function sendMintFlowWalletSelection(ctx: Context, session: MintFlowWizardSession) {
+  const wallets = await listWalletsForOwner(session.ownerTelegramId);
+  const activeWallets = wallets.filter((wallet) => wallet.status !== "archived");
+  const target = getMintTargetForOwner(session.targetId, session.ownerTelegramId);
+
+  if (activeWallets.length === 0) {
+    await ctx.reply("No active wallets found. Add one with /addwallet.");
+    return;
+  }
+
+  const walletButtons = activeWallets.map((wallet) =>
+    Markup.button.callback(
+      `${session.walletLabels.includes(wallet.label) ? "✅ " : ""}${wallet.label}`,
+      `mfw:w:${session.sessionId}:${wallet.label}`
+    )
+  );
+
+  await ctx.reply(
+    `${getMintFlowActionLabel(session.action)}
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+
+Step 2/4: choose wallet(s).
+
+Selected: ${session.walletLabels.length > 0 ? session.walletLabels.join(", ") : "none"}
+
+Tap wallet buttons to select/unselect.`,
+    Markup.inlineKeyboard([
+      ...chunkMintFlowRows(walletButtons, 2),
+      [Markup.button.callback("Continue → Gas", `mfw:wg:${session.sessionId}`)],
+      [Markup.button.callback("Cancel", `mfw:cancel:${session.sessionId}`)]
+    ])
+  );
+}
+
+async function sendMintFlowGasSelection(ctx: Context, session: MintFlowWizardSession) {
+  const target = getMintTargetForOwner(session.targetId, session.ownerTelegramId);
+  const targetGasStrategy = getTargetGasStrategy(target);
+
+  await ctx.reply(
+    `${getMintFlowActionLabel(session.action)}
+
+Target: ${target.name}
+Wallets: ${session.walletLabels.join(", ")}
+
+Step 3/4: choose gas strategy.
+
+Target default: ${formatGasStrategy(targetGasStrategy)}
+
+Custom gas is still supported through:
+/quickmint targetId wallet1 custom maxFeeGwei priorityFeeGwei`,
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback("Target Default", `mfw:g:${session.sessionId}:target`),
+        Markup.button.callback("Auto", `mfw:g:${session.sessionId}:auto`)
+      ],
+      [
+        Markup.button.callback("Standard", `mfw:g:${session.sessionId}:standard`),
+        Markup.button.callback("Fast", `mfw:g:${session.sessionId}:fast`)
+      ],
+      [
+        Markup.button.callback("⬅️ Wallets", `mfw:backw:${session.sessionId}`),
+        Markup.button.callback("Cancel", `mfw:cancel:${session.sessionId}`)
+      ]
+    ])
+  );
+}
+
+async function sendMintFlowReadyResult(ctx: Context, session: MintFlowWizardSession) {
+  if (!session.gasStrategy) {
+    await sendMintFlowGasSelection(ctx, session);
+    return;
+  }
+
+  const target = requireCompleteMintTarget(
+    getMintTargetForOwner(session.targetId, session.ownerTelegramId)
+  );
+
+  if (session.walletLabels.length === 1) {
+    const walletLabel = session.walletLabels[0]!;
+    const preview = await previewGasForTargetWallet({
+      ownerTelegramId: session.ownerTelegramId,
+      target,
+      walletLabel,
+      gasStrategy: session.gasStrategy
+    });
+    const failures = getPreviewReadinessFailures(preview);
+
+    await ctx.reply(
+      `Mint Readiness
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+Wallet Count: 1
+Gas Strategy: ${formatGasStrategy(session.gasStrategy)}
+
+Wallet: ${preview.walletLabel}
+Address: ${formatShortAddress(preview.walletAddress)}
+
+${formatGasFields(preview)}
+
+Recommendation:
+${formatMintReadinessRecommendation([preview], failures)}
+
+No transaction was sent.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("🚀 Create Confirmation", `mfw:create:${session.sessionId}`)],
+        [Markup.button.callback("Change Gas", `mfw:gasback:${session.sessionId}`)],
+        [Markup.button.callback("Cancel", `mfw:cancel:${session.sessionId}`)]
+      ])
+    );
+    return;
+  }
+
+  const wallets = await getOwnedActiveWalletSummaries(
+    session.ownerTelegramId,
+    session.walletLabels
+  );
+  const preflight = await getMultiMintPreflight({
+    ownerTelegramId: session.ownerTelegramId,
+    target,
+    walletLabels: session.walletLabels,
+    gasStrategy: session.gasStrategy
+  });
+
+  await ctx.reply(
+    `Mint Readiness
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+Wallet Count: ${wallets.length}
+Wallets: ${wallets.map((wallet) => wallet.label).join(", ")}
+Gas Strategy: ${formatGasStrategy(session.gasStrategy)}
+
+${formatMultiGasPreview(preflight.previews, preflight.failures)}
+
+Recommendation:
+${formatMintReadinessRecommendation(preflight.previews, preflight.failures)}`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("🚀 Create Confirmation", `mfw:create:${session.sessionId}`)],
+      [Markup.button.callback("Change Gas", `mfw:gasback:${session.sessionId}`)],
+      [Markup.button.callback("Cancel", `mfw:cancel:${session.sessionId}`)]
+    ])
+  );
+}
+
+async function sendMintFlowReview(ctx: Context, session: MintFlowWizardSession) {
+  if (session.action === "ready") {
+    await sendMintFlowReadyResult(ctx, session);
+    return;
+  }
+
+  if (!session.gasStrategy) {
+    await sendMintFlowGasSelection(ctx, session);
+    return;
+  }
+
+  const target = requireCompleteMintTarget(
+    getMintTargetForOwner(session.targetId, session.ownerTelegramId)
+  );
+
+  if (session.walletLabels.length === 1) {
+    const walletLabel = session.walletLabels[0]!;
+    const preview = await previewGasForTargetWallet({
+      ownerTelegramId: session.ownerTelegramId,
+      target,
+      walletLabel,
+      gasStrategy: session.gasStrategy
+    });
+    const failures = getPreviewReadinessFailures(preview);
+
+    await ctx.reply(
+      `Quick Mint Review
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+Wallet: ${preview.walletLabel}
+Gas Strategy: ${formatGasStrategy(session.gasStrategy)}
+
+${formatGasFields(preview)}
+
+Recommendation:
+${formatMintReadinessRecommendation([preview], failures)}
+
+Step 4/4: create final confirmation.
+
+No transaction will be sent until you press Confirm Mint on the next screen.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Create Confirmation", `mfw:create:${session.sessionId}`)],
+        [Markup.button.callback("Change Gas", `mfw:gasback:${session.sessionId}`)],
+        [Markup.button.callback("Cancel", `mfw:cancel:${session.sessionId}`)]
+      ])
+    );
+    return;
+  }
+
+  const wallets = await getOwnedActiveWalletSummaries(
+    session.ownerTelegramId,
+    session.walletLabels
+  );
+  const preflight = await getMultiMintPreflight({
+    ownerTelegramId: session.ownerTelegramId,
+    target,
+    walletLabels: session.walletLabels,
+    gasStrategy: session.gasStrategy
+  });
+
+  await ctx.reply(
+    `Quick Multi-Mint Review
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+Wallets (${wallets.length}): ${wallets.map((wallet) => wallet.label).join(", ")}
+Gas Strategy: ${formatGasStrategy(session.gasStrategy)}
+
+${formatMultiGasPreview(preflight.previews, preflight.failures)}
+
+Recommendation:
+${formatMintReadinessRecommendation(preflight.previews, preflight.failures)}
+
+Step 4/4: create final confirmation.
+
+No transaction will be sent until you press Confirm Multi Mint on the next screen.`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("Create Multi-Mint Confirmation", `mfw:create:${session.sessionId}`)],
+      [Markup.button.callback("Change Gas", `mfw:gasback:${session.sessionId}`)],
+      [Markup.button.callback("Cancel", `mfw:cancel:${session.sessionId}`)]
+    ])
+  );
+}
+
+async function createMintFlowFinalConfirmation(ctx: Context, session: MintFlowWizardSession) {
+  if (!session.gasStrategy) {
+    await sendMintFlowGasSelection(ctx, session);
+    return;
+  }
+
+  const target = requireCompleteMintTarget(
+    getMintTargetForOwner(session.targetId, session.ownerTelegramId)
+  );
+
+  if (session.walletLabels.length === 1) {
+    const walletLabel = session.walletLabels[0]!;
+    const preview = await previewGasForTargetWallet({
+      ownerTelegramId: session.ownerTelegramId,
+      target,
+      walletLabel,
+      gasStrategy: session.gasStrategy
+    });
+    const run = createRunFromPreview(
+      session.ownerTelegramId,
+      preview,
+      "pending",
+      target.targetId
+    );
+    const mintSession = createMintConfirmationSession({
+      ownerTelegramId: session.ownerTelegramId,
+      walletLabel: preview.walletLabel,
+      walletAddress: preview.walletAddress,
+      chain: preview.chain,
+      contractAddress: preview.contractAddress,
+      functionSignature: preview.functionSignature,
+      quantity: preview.quantity,
+      priceEth: preview.priceEth,
+      runId: run.runId,
+      targetId: target.targetId,
+      gasStrategy: session.gasStrategy
+    });
+
+    session.status = "used";
+
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "guided_mint_confirmation_created",
+      walletLabel: preview.walletLabel,
+      walletAddress: preview.walletAddress,
+      targetId: target.targetId,
+      runId: run.runId,
+      chain: preview.chain,
+      contractAddress: preview.contractAddress,
+      functionSignature: preview.functionSignature,
+      quantity: preview.quantity,
+      priceEth: preview.priceEth,
+      gasStrategyMode: session.gasStrategy.mode,
+      status: mintSession.status
+    });
+
+    await ctx.reply(
+      `${formatMintPreviewMessage(preview, {
+        title: `Guided Mint Confirmation: ${target.name}`,
+        targetId: target.targetId,
+        runId: run.runId
+      })}
+
+This confirmation expires in 10 minutes.
+
+No transaction will be sent until you press Confirm Mint.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Confirm Mint", `mint:confirm:${mintSession.sessionId}`)],
+        [Markup.button.callback("Cancel", `mint:cancel:${mintSession.sessionId}`)]
+      ])
+    );
+    return;
+  }
+
+  const wallets = await getOwnedActiveWalletSummaries(
+    session.ownerTelegramId,
+    session.walletLabels
+  );
+  const preflight = await getMultiMintPreflight({
+    ownerTelegramId: session.ownerTelegramId,
+    target,
+    walletLabels: session.walletLabels,
+    gasStrategy: session.gasStrategy
+  });
+  const multiSession = createMultiMintConfirmationSession({
+    ownerTelegramId: session.ownerTelegramId,
+    targetId: target.targetId,
+    targetName: target.name,
+    chain: target.chain,
+    contractAddress: target.contractAddress,
+    functionSignature: target.functionSignature,
+    quantity: target.quantity,
+    priceEth: target.priceEth,
+    walletLabels: wallets.map((wallet) => wallet.label),
+    walletAddresses: wallets.map((wallet) => wallet.address),
+    gasStrategy: session.gasStrategy
+  });
+
+  session.status = "used";
+
+  await auditMintAction({
+    ownerTelegramId: session.ownerTelegramId,
+    action: "guided_multi_mint_confirmation_created",
+    targetId: target.targetId,
+    chain: target.chain,
+    contractAddress: target.contractAddress,
+    functionSignature: target.functionSignature,
+    quantity: target.quantity,
+    priceEth: target.priceEth,
+    gasStrategyMode: session.gasStrategy.mode,
+    status: multiSession.status,
+    reason: `wallets:${wallets.length}`
+  });
+
+  await ctx.reply(
+    `Guided Multi-Mint Confirmation
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+Chain: ${target.chain}
+Contract: ${formatShortAddress(target.contractAddress)}
+Function: ${target.functionSignature}
+Quantity Per Wallet: ${target.quantity}
+Price Per Wallet: ${target.priceEth} ETH
+Gas Strategy: ${formatGasStrategy(session.gasStrategy)}
+Wallets (${wallets.length}): ${wallets.map((wallet) => wallet.label).join(", ")}
+Concurrency Cap: ${getMultiMintConcurrency()}
+Delay Between Submissions: ${getMultiMintDelayMs()}ms
+Minting Lock: ${getMintLockStatusText(target.chain)}
+
+Preflight:
+${formatMultiGasPreview(preflight.previews, preflight.failures)}
+
+Recommendation:
+${formatMintReadinessRecommendation(preflight.previews, preflight.failures)}
+
+This confirmation expires in 10 minutes.
+
+No transaction will be sent until you press Confirm Multi Mint.`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("Confirm Multi Mint", `mm:confirm:${multiSession.sessionId}`)],
+      [Markup.button.callback("Cancel", `mm:cancel:${multiSession.sessionId}`)]
+    ])
+  );
+}
+
 function getMintFlowMenuText() {
   return `🚀 Guided Mint Flow
 
 Choose what you want to do next.
 
 Recommended flow:
-1. Show Targets
+1. Create Target or Show Targets
 2. Show Wallets
 3. Check Readiness
 4. Quick Mint
@@ -6613,6 +7723,7 @@ Safety:
 
 function getMintFlowKeyboard() {
   return Markup.inlineKeyboard([
+    [Markup.button.callback("➕ Create New Target", "mf:create_target")],
     [
       Markup.button.callback("✅ Check Readiness", "mf:ready"),
       Markup.button.callback("🚀 Quick Mint", "mf:quick")
@@ -6650,38 +7761,14 @@ bot.action("mf:ready", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
   await ctx.answerCbQuery();
-  await ctx.reply(
-    `✅ Check Mint Readiness
-
-Use:
-/mintready targetId wallet1[,wallet2,...] [gasStrategy]
-
-Examples:
-/mintready 8fce62cc-d032-4e53-9ec2-87aec5be7258 wallet1 fast
-/mintready 8fce62cc-d032-4e53-9ec2-87aec5be7258 wallet1,wallet2 fast
-
-This checks gas, USD budget, wallet funding, and readiness.
-No transaction is sent.`
-  );
+  await sendMintFlowTargetSelection(ctx, "ready");
 });
 
 bot.action("mf:quick", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
   await ctx.answerCbQuery();
-  await ctx.reply(
-    `🚀 Quick Mint
-
-Use:
-/quickmint targetId wallet1[,wallet2,...] [gasStrategy]
-
-Examples:
-/quickmint 8fce62cc-d032-4e53-9ec2-87aec5be7258 wallet1 fast
-/quickmint 8fce62cc-d032-4e53-9ec2-87aec5be7258 wallet1,wallet2 fast
-
-This creates a final confirmation screen with gas + USD budget.
-No transaction is sent until you press Confirm.`
-  );
+  await sendMintFlowTargetSelection(ctx, "quick");
 });
 
 bot.action("mf:gas", async (ctx) => {
@@ -6770,6 +7857,264 @@ bot.action("mf:targets", async (ctx) => {
     await ctx.reply(`❌ Could not show mint targets.\n\nReason:\n${getSafeErrorMessage(error)}`);
   }
 });
+
+bot.action("mf:create_target", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const ownerTelegramId = getRequiredTelegramUserId(ctx);
+  const session = createMintFlowTargetDraftSession(ownerTelegramId);
+
+  await sendMintFlowTargetDraftPrompt(ctx, session);
+});
+
+bot.action(/^mft:f:([0-9a-f]{8,12}):([A-Za-z0-9_]+)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const session = await getMintFlowTargetDraftSession(ctx, ctx.match[1] || "");
+
+  if (!session) {
+    return;
+  }
+
+  const code = ctx.match[2] as keyof typeof MINT_FLOW_FUNCTION_PRESETS;
+  const signature = MINT_FLOW_FUNCTION_PRESETS[code];
+
+  if (!signature) {
+    await ctx.reply("Unsupported function preset. Please type the function manually.");
+    return;
+  }
+
+  session.data.functionSignature = normalizeMintFunctionSignature(signature);
+  await sendMintFlowTargetDraftPrompt(ctx, session);
+});
+
+bot.action(/^mft:q:([0-9a-f]{8,12}):(\d+)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const session = await getMintFlowTargetDraftSession(ctx, ctx.match[1] || "");
+
+  if (!session) {
+    return;
+  }
+
+  session.data.quantity = validateMintQuantity(ctx.match[2] || "1");
+  await sendMintFlowTargetDraftPrompt(ctx, session);
+});
+
+bot.action(/^mft:p:([0-9a-f]{8,12}):(free|p001|p003|p005)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const session = await getMintFlowTargetDraftSession(ctx, ctx.match[1] || "");
+
+  if (!session) {
+    return;
+  }
+
+  const code = ctx.match[2] as keyof typeof MINT_FLOW_PRICE_PRESETS;
+  session.data.priceEth = validateMintPriceEth(MINT_FLOW_PRICE_PRESETS[code]);
+  await sendMintFlowTargetDraftPrompt(ctx, session);
+});
+
+bot.action(/^mft:c:([0-9a-f]{8,12}):(sepolia|mainnet)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const session = await getMintFlowTargetDraftSession(ctx, ctx.match[1] || "");
+
+  if (!session) {
+    return;
+  }
+
+  session.data.chain = normalizeMintChain(ctx.match[2]);
+  await sendMintFlowTargetDraftPrompt(ctx, session);
+});
+
+bot.action(/^mft:cancel:([0-9a-f]{8,12})$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const session = await getMintFlowTargetDraftSession(ctx, ctx.match[1] || "");
+
+  if (!session) {
+    return;
+  }
+
+  session.status = "cancelled";
+  activeMintFlowTargetDraftByOwner.delete(session.ownerTelegramId);
+  await ctx.reply("Cancelled target creation. Run /mintflow to start again.");
+});
+
+
+bot.action(/^mfw:t:([qr]):([0-9a-f-]+)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const action = getMintFlowActionFromCode(ctx.match[1] || "r");
+    const targetId = ctx.match[2];
+
+    if (!targetId) {
+      await ctx.reply("Mint target not found. Run /minttargets and choose a Target ID.");
+      return;
+    }
+
+    const target = getMintTargetForOwner(targetId, ownerTelegramId);
+    const session = createMintFlowWizardSession({
+      ownerTelegramId,
+      action,
+      targetId: target.targetId
+    });
+
+    await sendMintFlowWalletSelection(ctx, session);
+  } catch (error) {
+    logSafeError("Mint flow target selection failed", error);
+    await ctx.reply(`❌ Could not select mint target.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^mfw:w:([0-9a-f]{8,12}):([A-Za-z0-9_-]{2,32})$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const session = await getMintFlowWizardSession(ctx, ctx.match[1] || "");
+
+  if (!session) {
+    return;
+  }
+
+  const walletLabel = ctx.match[2];
+
+  if (!walletLabel) {
+    await ctx.reply("Wallet label missing. Run /mintflow again.");
+    return;
+  }
+
+  if (session.walletLabels.includes(walletLabel)) {
+    session.walletLabels = session.walletLabels.filter((label) => label !== walletLabel);
+  } else {
+    session.walletLabels.push(walletLabel);
+  }
+
+  await sendMintFlowWalletSelection(ctx, session);
+});
+
+bot.action(/^mfw:wg:([0-9a-f]{8,12})$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const session = await getMintFlowWizardSession(ctx, ctx.match[1] || "");
+
+  if (!session) {
+    return;
+  }
+
+  if (session.walletLabels.length === 0) {
+    await ctx.reply("Choose at least one wallet first.");
+    return;
+  }
+
+  await sendMintFlowGasSelection(ctx, session);
+});
+
+bot.action(/^mfw:backw:([0-9a-f]{8,12})$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const session = await getMintFlowWizardSession(ctx, ctx.match[1] || "");
+
+  if (!session) {
+    return;
+  }
+
+  await sendMintFlowWalletSelection(ctx, session);
+});
+
+bot.action(/^mfw:g:([0-9a-f]{8,12}):(target|auto|standard|fast)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  try {
+    const session = await getMintFlowWizardSession(ctx, ctx.match[1] || "");
+
+    if (!session) {
+      return;
+    }
+
+    const mode = (ctx.match[2] || "target") as "target" | "auto" | "standard" | "fast";
+    const target = getMintTargetForOwner(session.targetId, session.ownerTelegramId);
+    session.gasStrategy = getMintFlowPresetGasStrategy(mode, target);
+
+    await sendMintFlowReview(ctx, session);
+  } catch (error) {
+    logSafeError("Mint flow gas selection failed", error);
+    await ctx.reply(`❌ Could not select gas strategy.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^mfw:gasback:([0-9a-f]{8,12})$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const session = await getMintFlowWizardSession(ctx, ctx.match[1] || "");
+
+  if (!session) {
+    return;
+  }
+
+  await sendMintFlowGasSelection(ctx, session);
+});
+
+bot.action(/^mfw:create:([0-9a-f]{8,12})$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  try {
+    const session = await getMintFlowWizardSession(ctx, ctx.match[1] || "");
+
+    if (!session) {
+      return;
+    }
+
+    await createMintFlowFinalConfirmation(ctx, session);
+  } catch (error) {
+    logSafeError("Mint flow final confirmation failed", error);
+    await ctx.reply(`❌ Could not create final confirmation.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^mfw:cancel:([0-9a-f]{8,12})$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const session = await getMintFlowWizardSession(ctx, ctx.match[1] || "");
+
+  if (!session) {
+    return;
+  }
+
+  session.status = "cancelled";
+  await ctx.reply("Cancelled guided mint flow. Run /mintflow to start again.");
+});
+
 
 bot.command("mintready", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
@@ -12279,6 +13624,10 @@ bot.action(/^pf:open:(.+)$/, async (ctx) => {
 
 bot.on("text", async (ctx) => {
   if (ctx.chat?.type !== "private") {
+    return;
+  }
+
+  if (await handleMintFlowTargetDraftText(ctx)) {
     return;
   }
 
