@@ -190,6 +190,7 @@ const BOT_COMMANDS = [
   { command: "multimintjob", description: "Show multi-mint job" },
   { command: "cancelmultimintjob", description: "Cancel multi-mint job" },
   { command: "multimintstatus", description: "Show multi-mint status" },
+  { command: "hardeningstatus", description: "Show bot hardening status" },
   { command: "help", description: "Show commands" }
 ];
 
@@ -891,6 +892,50 @@ function getMultiMintDelayMs() {
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+
+function isTelegramCallbackAckError(error: unknown) {
+  const message = getSafeErrorMessage(error).toLowerCase();
+
+  return (
+    message.includes("query is too old") ||
+    message.includes("query id is invalid") ||
+    message.includes("callback query") ||
+    message.includes("message is not modified")
+  );
+}
+
+async function safeAnswerCbQuery(ctx: Context, text?: string) {
+  try {
+    const answerCbQuery = (ctx as any).answerCbQuery;
+
+    if (typeof answerCbQuery !== "function") {
+      return;
+    }
+
+    if (text === undefined) {
+      await answerCbQuery.call(ctx);
+    } else {
+      await answerCbQuery.call(ctx, text);
+    }
+  } catch (error) {
+    if (isTelegramCallbackAckError(error)) {
+      logSafeError("Ignored stale Telegram callback acknowledgement", error);
+      return;
+    }
+
+    logSafeError("Could not acknowledge Telegram callback", error);
+  }
+}
+
+async function safeReply(ctx: Context, message: string) {
+  try {
+    await ctx.reply(message);
+  } catch (error) {
+    logSafeError("Could not send Telegram reply", error);
+  }
+}
+
 
 function sanitizeMintTargetName(name: string): string {
   const normalized = name.trim();
@@ -5832,7 +5877,7 @@ Choose an option below:`,
 bot.action("subscribe", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
   await ctx.reply(
     `🔒 Subscribe to unlock Mint Bot
 
@@ -5848,7 +5893,7 @@ Payment system comes later. For now, we’ll use manual access codes.`
 bot.action("code", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
   await ctx.reply("Send your access code like this:\n\n/code YOUR-CODE-HERE");
 });
 
@@ -8869,28 +8914,28 @@ bot.command("mintflow", async (ctx) => {
 bot.action("mf:menu", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
   await sendMintFlowMenu(ctx);
 });
 
 bot.action("mf:ready", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
   await sendMintFlowTargetSelection(ctx, "ready");
 });
 
 bot.action("mf:quick", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
   await sendMintFlowTargetSelection(ctx, "quick");
 });
 
 bot.action("mf:gas", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
   await ctx.reply(
     `⛽ Gas Preview
 
@@ -8908,7 +8953,7 @@ No transaction is sent.`
 bot.action("mf:schedule", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
   await ctx.reply(
     `📅 Schedule Multi-Mint
 
@@ -8928,7 +8973,7 @@ Scheduled multi-mint still requires final confirmation unless you explicitly use
 bot.action("mf:wallets", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   try {
     await sendWalletsList(ctx);
@@ -8941,7 +8986,7 @@ bot.action("mf:wallets", async (ctx) => {
 bot.action("mf:targets", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   try {
     const ownerTelegramId = getRequiredTelegramUserId(ctx);
@@ -8977,7 +9022,7 @@ bot.action("mf:targets", async (ctx) => {
 bot.action("mf:create_target", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   try {
     await startOpenSeaQuickMintFlow(ctx);
@@ -8991,7 +9036,7 @@ bot.action("mf:create_target", async (ctx) => {
 bot.action(/^osqm:q:([0-9a-f]{8,12}):(\d+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const session = await getOpenSeaQuickMintSession(ctx, ctx.match[1] || "");
 
@@ -9034,7 +9079,7 @@ bot.action(/^osqm:q:([0-9a-f]{8,12}):(\d+)$/, async (ctx) => {
 bot.action(/^osqm:w:([0-9a-f]{8,12}):([^:]{1,32})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const session = await getOpenSeaQuickMintSession(ctx, ctx.match[1] || "");
 
@@ -9056,13 +9101,13 @@ bot.action(/^osqm:w:([0-9a-f]{8,12}):([^:]{1,32})$/, async (ctx) => {
 bot.action(/^osqm:noop:([0-9a-f]{8,12})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery("No mint action available.");
+  await safeAnswerCbQuery(ctx, "No mint action available.");
 });
 
 bot.action(/^osqm:multi:([0-9a-f]{8,12})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const session = await getOpenSeaQuickMintSession(ctx, ctx.match[1] || "");
 
@@ -9101,7 +9146,7 @@ Tap multiple wallets, then press Continue → Gas.`
 bot.action(/^osqm:cancel:([0-9a-f]{8,12})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const session = await getOpenSeaQuickMintSession(ctx, ctx.match[1] || "");
 
@@ -9119,7 +9164,7 @@ bot.action(/^osqm:cancel:([0-9a-f]{8,12})$/, async (ctx) => {
 bot.action(/^mft:scan:([0-9a-f]{8,12})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const session = await getMintFlowTargetDraftSession(ctx, ctx.match[1] || "");
 
@@ -9133,7 +9178,7 @@ bot.action(/^mft:scan:([0-9a-f]{8,12})$/, async (ctx) => {
 bot.action(/^mft:scanw:([0-9a-f]{8,12}):([^:]{1,32})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const session = await getMintFlowTargetDraftSession(ctx, ctx.match[1] || "");
 
@@ -9149,7 +9194,7 @@ bot.action(/^mft:scanw:([0-9a-f]{8,12}):([^:]{1,32})$/, async (ctx) => {
 bot.action(/^mft:f:([0-9a-f]{8,12}):([A-Za-z0-9_]+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const session = await getMintFlowTargetDraftSession(ctx, ctx.match[1] || "");
 
@@ -9172,7 +9217,7 @@ bot.action(/^mft:f:([0-9a-f]{8,12}):([A-Za-z0-9_]+)$/, async (ctx) => {
 bot.action(/^mft:q:([0-9a-f]{8,12}):(\d+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const session = await getMintFlowTargetDraftSession(ctx, ctx.match[1] || "");
 
@@ -9187,7 +9232,7 @@ bot.action(/^mft:q:([0-9a-f]{8,12}):(\d+)$/, async (ctx) => {
 bot.action(/^mft:p:([0-9a-f]{8,12}):(free|p001|p003|p005)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const session = await getMintFlowTargetDraftSession(ctx, ctx.match[1] || "");
 
@@ -9203,7 +9248,7 @@ bot.action(/^mft:p:([0-9a-f]{8,12}):(free|p001|p003|p005)$/, async (ctx) => {
 bot.action(/^mft:c:([0-9a-f]{8,12}):(sepolia|mainnet)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const session = await getMintFlowTargetDraftSession(ctx, ctx.match[1] || "");
 
@@ -9218,7 +9263,7 @@ bot.action(/^mft:c:([0-9a-f]{8,12}):(sepolia|mainnet)$/, async (ctx) => {
 bot.action(/^mft:cancel:([0-9a-f]{8,12})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const session = await getMintFlowTargetDraftSession(ctx, ctx.match[1] || "");
 
@@ -9235,7 +9280,7 @@ bot.action(/^mft:cancel:([0-9a-f]{8,12})$/, async (ctx) => {
 bot.action(/^mfw:t:([qr]):([0-9a-f-]+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   try {
     const ownerTelegramId = getRequiredTelegramUserId(ctx);
@@ -9264,7 +9309,7 @@ bot.action(/^mfw:t:([qr]):([0-9a-f-]+)$/, async (ctx) => {
 bot.action(/^mfw:w:([0-9a-f]{8,12}):([A-Za-z0-9_-]{2,32})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const session = await getMintFlowWizardSession(ctx, ctx.match[1] || "");
 
@@ -9291,7 +9336,7 @@ bot.action(/^mfw:w:([0-9a-f]{8,12}):([A-Za-z0-9_-]{2,32})$/, async (ctx) => {
 bot.action(/^mfw:wg:([0-9a-f]{8,12})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const session = await getMintFlowWizardSession(ctx, ctx.match[1] || "");
 
@@ -9310,7 +9355,7 @@ bot.action(/^mfw:wg:([0-9a-f]{8,12})$/, async (ctx) => {
 bot.action(/^mfw:backw:([0-9a-f]{8,12})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const session = await getMintFlowWizardSession(ctx, ctx.match[1] || "");
 
@@ -9324,7 +9369,7 @@ bot.action(/^mfw:backw:([0-9a-f]{8,12})$/, async (ctx) => {
 bot.action(/^mfw:g:([0-9a-f]{8,12}):(target|auto|standard|fast)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   try {
     const session = await getMintFlowWizardSession(ctx, ctx.match[1] || "");
@@ -9347,7 +9392,7 @@ bot.action(/^mfw:g:([0-9a-f]{8,12}):(target|auto|standard|fast)$/, async (ctx) =
 bot.action(/^mfw:gasback:([0-9a-f]{8,12})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const session = await getMintFlowWizardSession(ctx, ctx.match[1] || "");
 
@@ -9361,7 +9406,7 @@ bot.action(/^mfw:gasback:([0-9a-f]{8,12})$/, async (ctx) => {
 bot.action(/^mfw:create:([0-9a-f]{8,12})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   try {
     const session = await getMintFlowWizardSession(ctx, ctx.match[1] || "");
@@ -9380,7 +9425,7 @@ bot.action(/^mfw:create:([0-9a-f]{8,12})$/, async (ctx) => {
 bot.action(/^mfw:cancel:([0-9a-f]{8,12})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const session = await getMintFlowWizardSession(ctx, ctx.match[1] || "");
 
@@ -9769,7 +9814,7 @@ No transaction will be sent until you press Confirm Multi Mint.`,
 bot.action(/^mm:confirm:([0-9a-f-]+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const sessionId = ctx.match[1];
 
@@ -9851,7 +9896,7 @@ ${formatMultiMintExecutionSummary(result.results)}`
 bot.action(/^mm:cancel:([0-9a-f-]+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const sessionId = ctx.match[1];
 
@@ -10175,7 +10220,7 @@ This confirmation expires in 10 minutes.`,
 bot.action(/^mj:cancel_confirm:([0-9a-f-]+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const sessionId = ctx.match[1];
 
@@ -10226,7 +10271,7 @@ bot.action(/^mj:cancel_confirm:([0-9a-f-]+)$/, async (ctx) => {
 bot.action(/^mj:cancel_cancel:([0-9a-f-]+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const sessionId = ctx.match[1];
 
@@ -10659,7 +10704,7 @@ This confirmation expires in 10 minutes.`,
 bot.action(/^mmj:cancel_confirm:([0-9a-f-]+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const sessionId = ctx.match[1];
 
@@ -10710,7 +10755,7 @@ bot.action(/^mmj:cancel_confirm:([0-9a-f-]+)$/, async (ctx) => {
 bot.action(/^mmj:cancel_cancel:([0-9a-f-]+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const sessionId = ctx.match[1];
 
@@ -10860,7 +10905,7 @@ No transaction will be sent until you press Confirm Mint.`,
 bot.action(/^mint:confirm:([0-9a-f-]+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const sessionId = ctx.match[1];
 
@@ -11178,7 +11223,7 @@ ${getSafeErrorMessage(confirmationError)}`
 bot.action(/^mint:cancel:([0-9a-f-]+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const sessionId = ctx.match[1];
 
@@ -11398,7 +11443,7 @@ This confirmation expires in 10 minutes.`,
 bot.action(/^mt:delete_confirm:([0-9a-f-]+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const sessionId = ctx.match[1];
 
@@ -11442,7 +11487,7 @@ bot.action(/^mt:delete_confirm:([0-9a-f-]+)$/, async (ctx) => {
 bot.action(/^mt:delete_cancel:([0-9a-f-]+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const sessionId = ctx.match[1];
 
@@ -11693,7 +11738,7 @@ for (const command of ["addwallet", "importwallet", "import_wallet"]) {
 bot.action("wallet_status", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   try {
     await sendWalletsList(ctx);
@@ -11741,7 +11786,7 @@ Use:
 bot.action(/^wm:view:([A-Za-z0-9_-]{2,32})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   try {
     const walletLabel = ctx.match[1];
@@ -11801,7 +11846,7 @@ ${getSafeErrorMessage(error)}`
 bot.action(/^wm:balance:([A-Za-z0-9_-]{2,32})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   try {
     const walletLabel = ctx.match[1];
@@ -11821,7 +11866,7 @@ bot.action(/^wm:balance:([A-Za-z0-9_-]{2,32})$/, async (ctx) => {
 bot.action(/^wm:nfts:([A-Za-z0-9_-]{2,32})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
   const walletLabel = ctx.match[1];
 
   if (!walletLabel) {
@@ -11835,7 +11880,7 @@ bot.action(/^wm:nfts:([A-Za-z0-9_-]{2,32})$/, async (ctx) => {
 bot.action(/^wm:portfolio:([A-Za-z0-9_-]{2,32})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
   const walletLabel = ctx.match[1];
 
   if (!walletLabel) {
@@ -11970,7 +12015,7 @@ This confirmation expires in 10 minutes.`,
 bot.action(/^wm:delete_confirm:([0-9a-f-]+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const sessionId = ctx.match[1];
 
@@ -12016,7 +12061,7 @@ Status: ${formatWalletStatus(archived.status)}`
 bot.action(/^wm:delete_cancel:([0-9a-f-]+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const sessionId = ctx.match[1];
 
@@ -12046,7 +12091,7 @@ bot.action(/^wm:delete_cancel:([0-9a-f-]+)$/, async (ctx) => {
 bot.action("test_mint", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
   await ctx.reply(
     `🚀 Test Mint
 
@@ -12235,7 +12280,7 @@ ${errorMessage}`
 bot.action("my_nfts", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
   await ctx.reply(
     `🖼 My NFTs
 
@@ -12319,7 +12364,7 @@ ${error?.message || "Unknown error"}`
 bot.action("approval_help", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
   await ctx.reply(
     `✅ Approval Module
 
@@ -12633,7 +12678,7 @@ ${error?.shortMessage || error?.reason || error?.message || "Unknown error"}`
 bot.action("opensea_help", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
   await ctx.reply(
     `🌊 OpenSea Module
 
@@ -13636,7 +13681,7 @@ ${getSafeErrorMessage(error)}`
 bot.action(/^pm:view:(.+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const id = (ctx as any).match[1];
   const validated = await validatePostMintActionSession(ctx, id, "view-nft");
@@ -13684,7 +13729,7 @@ ${getSafeErrorMessage(error)}`
 bot.action(/^pm:floor:(.+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const id = (ctx as any).match[1];
   const validated = await validatePostMintActionSession(ctx, id, "market-snapshot");
@@ -13749,7 +13794,7 @@ ${getSafeErrorMessage(error)}`
 bot.action(/^pm:offer:(.+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const id = (ctx as any).match[1];
   const validated = await validatePostMintActionSession(ctx, id, "top-offer");
@@ -13843,7 +13888,7 @@ ${getSafeErrorMessage(error)}`
 bot.action(/^pm:listfloor:(.+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const id = (ctx as any).match[1];
   const validated = await validatePostMintActionSession(
@@ -13937,7 +13982,7 @@ ${getSafeErrorMessage(error)}`
 bot.action(/^pm:custom:(.+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const id = (ctx as any).match[1];
   const validated = await validatePostMintActionSession(
@@ -13972,7 +14017,7 @@ The bot will check ownership and then show a final confirmation button before li
 bot.action(/^pm:hold:(.+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const id = (ctx as any).match[1];
   const validated = await validatePostMintActionSession(ctx, id, "hold");
@@ -14004,7 +14049,7 @@ No listing or offer action taken.`
 bot.action(/^pm:floorconfirmpreview:(.+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const id = (ctx as any).match[1];
   const validated = await validatePostMintActionSession(
@@ -14093,7 +14138,7 @@ ${getSafeErrorMessage(error)}`
 bot.action(/^pm:floorlistfinal:(.+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const id = (ctx as any).match[1];
   const validated = await validatePostMintActionSession(
@@ -14238,7 +14283,7 @@ ${getTradingLockStatusText()}`
 bot.action(/^pm:cancel:(.+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const id = (ctx as any).match[1];
   const validated = await validatePostMintActionSession(ctx, id, "cancel");
@@ -14383,7 +14428,7 @@ ${getSafeErrorMessage(error)}`
 bot.action(/^pm:customlistfinal:(.+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const sessionId = (ctx as any).match[1];
   const validated = await validatePostMintActionSession(
@@ -14528,7 +14573,7 @@ ${getTradingLockStatusText()}`
 bot.action(/^pm:acceptofferpreview:(.+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const id = (ctx as any).match[1];
   const validated = await validatePostMintActionSession(
@@ -14638,7 +14683,7 @@ ${getSafeErrorMessage(error)}`
 bot.action(/^pm:acceptofferfinal:(.+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const id = (ctx as any).match[1];
   const validated = await validatePostMintActionSession(
@@ -14760,7 +14805,7 @@ ${getTradingLockStatusText()}`
 bot.action("os_portfolio_help", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   await ctx.reply(
     `📦 OpenSea Portfolio Scanner
@@ -14883,7 +14928,7 @@ ${getSafeErrorMessage(error)}`
 bot.action(/^pf:open:(.+)$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
-  await ctx.answerCbQuery();
+  await safeAnswerCbQuery(ctx);
 
   const id = (ctx as any).match[1];
   const validated = await validatePostMintActionSession(
@@ -14898,6 +14943,75 @@ bot.action(/^pf:open:(.+)$/, async (ctx) => {
 
   await sendPostMintActionMenu(ctx, validated.action);
 });
+
+
+bot.command("hardeningstatus", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  cleanupMintConfirmations();
+  cleanupMultiMintConfirmations();
+  cleanupOpenSeaQuickMintSessions();
+
+  const mintSessions = [...mintConfirmations.values()];
+  const multiMintSessions = [...multiMintConfirmations.values()];
+  const openSeaSessions = [...openSeaQuickMintSessions.values()];
+  const wizardSessions = [...mintFlowWizardSessions.values()];
+
+  const countByStatus = (items: Array<{ status: string }>, status: string) =>
+    items.filter((item) => item.status === status).length;
+
+  await ctx.reply(
+    `Bot Hardening Status
+
+Safe callback acknowledgements: enabled
+Global error trap: enabled
+Unknown button handler: enabled
+
+Single Mint Confirmations:
+- Total: ${mintSessions.length}
+- Active: ${countByStatus(mintSessions, "active")}
+- Used: ${countByStatus(mintSessions, "used")}
+- Expired: ${countByStatus(mintSessions, "expired")}
+- Cancelled: ${countByStatus(mintSessions, "cancelled")}
+
+Multi-Mint Confirmations:
+- Total: ${multiMintSessions.length}
+- Active: ${countByStatus(multiMintSessions, "active")}
+- Used: ${countByStatus(multiMintSessions, "used")}
+- Expired: ${countByStatus(multiMintSessions, "expired")}
+- Cancelled: ${countByStatus(multiMintSessions, "cancelled")}
+
+OpenSea Quick Mint Sessions:
+- Total: ${openSeaSessions.length}
+- Active: ${countByStatus(openSeaSessions, "active")}
+- Used: ${countByStatus(openSeaSessions, "used")}
+- Expired: ${countByStatus(openSeaSessions, "expired")}
+- Cancelled: ${countByStatus(openSeaSessions, "cancelled")}
+
+Mint Flow Wizard Sessions:
+- Total: ${wizardSessions.length}
+- Active: ${countByStatus(wizardSessions, "active")}
+
+Mainnet Mint Lock:
+${getMintLockStatusText("mainnet")}
+
+Trading Lock:
+${getTradingLockStatusText()}`
+  );
+});
+
+
+
+bot.on("callback_query", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await safeAnswerCbQuery(ctx, "This button is no longer active.");
+  await safeReply(
+    ctx,
+    "This button is no longer active. Open a fresh menu with /mintflow or paste the OpenSea link again."
+  );
+});
+
 
 bot.on("text", async (ctx) => {
   if (ctx.chat?.type !== "private") {
@@ -14932,6 +15046,22 @@ bot.on("text", async (ctx) => {
     await ctx.reply(`❌ Could not parse mint link.\n\nReason:\n${getSafeErrorMessage(error)}`);
   }
 });
+
+
+bot.catch(async (error, ctx) => {
+  logSafeError("Unhandled bot update error", error);
+
+  await safeReply(
+    ctx,
+    `⚠️ Phantom recovered from a handler error.
+
+Nothing was sent on-chain from this recovery message.
+
+Reason:
+${getSafeErrorMessage(error)}`
+  );
+});
+
 
 async function startBot() {
   if (shouldRegisterTelegramCommands()) {
