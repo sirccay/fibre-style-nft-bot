@@ -2687,6 +2687,102 @@ function getPreviewReadinessFailures(preview: MintPreviewResult) {
   return failures;
 }
 
+
+type MultiWalletEligibilitySummary = {
+  readyLabels: string[];
+  blocked: Array<{ walletLabel: string; reason: string }>;
+};
+
+function isMintPreviewReady(preview: MintPreviewResult) {
+  return (
+    !preview.gasEstimateFailed &&
+    preview.fundedEnough !== false &&
+    Boolean(preview.gasEstimate)
+  );
+}
+
+function getMintPreviewBlockedReason(preview: MintPreviewResult) {
+  if (preview.fundedEnough === false) {
+    return "underfunded: wallet balance is too low for mint cost plus gas";
+  }
+
+  if (preview.gasEstimateFailed) {
+    return preview.gasEstimateError || "gas estimation failed";
+  }
+
+  if (!preview.gasEstimate) {
+    return "gas estimate not available";
+  }
+
+  return "not ready";
+}
+
+function getMultiWalletEligibilitySummary(preflight: {
+  previews: MintPreviewResult[];
+  failures: Array<{ walletLabel: string; reason: string }>;
+}): MultiWalletEligibilitySummary {
+  const ready = new Set<string>();
+  const blocked = new Map<string, string>();
+
+  for (const preview of preflight.previews) {
+    if (isMintPreviewReady(preview)) {
+      ready.add(preview.walletLabel);
+      blocked.delete(preview.walletLabel);
+    } else {
+      blocked.set(preview.walletLabel, getMintPreviewBlockedReason(preview));
+    }
+  }
+
+  for (const failure of preflight.failures) {
+    if (!ready.has(failure.walletLabel) && !blocked.has(failure.walletLabel)) {
+      blocked.set(failure.walletLabel, failure.reason);
+    }
+  }
+
+  return {
+    readyLabels: [...ready],
+    blocked: [...blocked.entries()].map(([walletLabel, reason]) => ({
+      walletLabel,
+      reason
+    }))
+  };
+}
+
+function formatMultiWalletEligibilityReport(summary: MultiWalletEligibilitySummary) {
+  const readyText =
+    summary.readyLabels.length > 0 ? summary.readyLabels.join(", ") : "none";
+  const blockedText =
+    summary.blocked.length > 0
+      ? summary.blocked.map((item) => item.walletLabel).join(", ")
+      : "none";
+
+  const lines = [
+    "Multi-Wallet Eligibility Report",
+    "",
+    `Ready wallets (${summary.readyLabels.length}): ${readyText}`,
+    `Blocked wallets (${summary.blocked.length}): ${blockedText}`
+  ];
+
+  if (summary.blocked.length > 0) {
+    lines.push(
+      "",
+      "Blocked details:",
+      ...summary.blocked.map((item) => `- ${item.walletLabel}: ${item.reason}`)
+    );
+  }
+
+  if (summary.readyLabels.length > 0 && summary.blocked.length > 0) {
+    lines.push("", "Only ready wallets will be included in the final multi-mint confirmation.");
+  }
+
+  if (summary.readyLabels.length === 0) {
+    lines.push("", "No confirmation will be created until at least one wallet is ready.");
+  }
+
+  return lines.join("\n");
+}
+
+
 function formatMintReadinessRecommendation(
   previews: MintPreviewResult[],
   failures: Array<{ walletLabel: string; reason: string }>
@@ -7768,6 +7864,7 @@ No transaction was sent.`,
     walletLabels: session.walletLabels,
     gasStrategy: session.gasStrategy
   });
+  const eligibility = getMultiWalletEligibilitySummary(preflight);
 
   await ctx.reply(
     `Mint Readiness
@@ -7780,10 +7877,14 @@ Gas Strategy: ${formatGasStrategy(session.gasStrategy)}
 
 ${formatMultiGasPreview(preflight.previews, preflight.failures)}
 
+${formatMultiWalletEligibilityReport(eligibility)}
+
 Recommendation:
 ${formatMintReadinessRecommendation(preflight.previews, preflight.failures)}`,
     Markup.inlineKeyboard([
-      [Markup.button.callback("🚀 Create Confirmation", `mfw:create:${session.sessionId}`)],
+      ...(eligibility.readyLabels.length > 0
+        ? [[Markup.button.callback("🚀 Create Confirmation for Ready Wallets", `mfw:create:${session.sessionId}`)]]
+        : []),
       [Markup.button.callback("Change Gas", `mfw:gasback:${session.sessionId}`)],
       [Markup.button.callback("Cancel", `mfw:cancel:${session.sessionId}`)]
     ])
@@ -7850,25 +7951,32 @@ No transaction will be sent until you press Confirm Mint on the next screen.`,
     walletLabels: session.walletLabels,
     gasStrategy: session.gasStrategy
   });
+  const eligibility = getMultiWalletEligibilitySummary(preflight);
 
   await ctx.reply(
     `Quick Multi-Mint Review
 
 Target: ${target.name}
 Target ID: ${target.targetId}
-Wallets (${wallets.length}): ${wallets.map((wallet) => wallet.label).join(", ")}
+Selected Wallets (${wallets.length}): ${wallets.map((wallet) => wallet.label).join(", ")}
 Gas Strategy: ${formatGasStrategy(session.gasStrategy)}
 
 ${formatMultiGasPreview(preflight.previews, preflight.failures)}
+
+${formatMultiWalletEligibilityReport(eligibility)}
 
 Recommendation:
 ${formatMintReadinessRecommendation(preflight.previews, preflight.failures)}
 
 Step 4/4: create final confirmation.
 
-No transaction will be sent until you press Confirm Multi Mint on the next screen.`,
+${eligibility.readyLabels.length > 0
+  ? "Only ready wallets will be included in the final confirmation."
+  : "No wallet is ready yet, so confirmation is blocked."}`,
     Markup.inlineKeyboard([
-      [Markup.button.callback("Create Multi-Mint Confirmation", `mfw:create:${session.sessionId}`)],
+      ...(eligibility.readyLabels.length > 0
+        ? [[Markup.button.callback("Create Multi-Mint Confirmation for Ready Wallets", `mfw:create:${session.sessionId}`)]]
+        : []),
       [Markup.button.callback("Change Gas", `mfw:gasback:${session.sessionId}`)],
       [Markup.button.callback("Cancel", `mfw:cancel:${session.sessionId}`)]
     ])
@@ -7949,7 +8057,7 @@ No transaction will be sent until you press Confirm Mint.`,
     return;
   }
 
-  const wallets = await getOwnedActiveWalletSummaries(
+  const selectedWallets = await getOwnedActiveWalletSummaries(
     session.ownerTelegramId,
     session.walletLabels
   );
@@ -7959,6 +8067,35 @@ No transaction will be sent until you press Confirm Mint.`,
     walletLabels: session.walletLabels,
     gasStrategy: session.gasStrategy
   });
+  const eligibility = getMultiWalletEligibilitySummary(preflight);
+
+  if (eligibility.readyLabels.length === 0) {
+    await ctx.reply(
+      `Multi-Mint Confirmation Blocked
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+Selected Wallets (${selectedWallets.length}): ${selectedWallets.map((wallet) => wallet.label).join(", ")}
+Gas Strategy: ${formatGasStrategy(session.gasStrategy)}
+
+${formatMultiGasPreview(preflight.previews, preflight.failures)}
+
+${formatMultiWalletEligibilityReport(eligibility)}
+
+No transaction can be prepared because no selected wallet is ready.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Change Gas", `mfw:gasback:${session.sessionId}`)],
+        [Markup.button.callback("⬅️ Wallets", `mfw:backw:${session.sessionId}`)],
+        [Markup.button.callback("Cancel", `mfw:cancel:${session.sessionId}`)]
+      ])
+    );
+    return;
+  }
+
+  const readyWallets = await getOwnedActiveWalletSummaries(
+    session.ownerTelegramId,
+    eligibility.readyLabels
+  );
   const multiSession = createMultiMintConfirmationSession({
     ownerTelegramId: session.ownerTelegramId,
     targetId: target.targetId,
@@ -7968,8 +8105,8 @@ No transaction will be sent until you press Confirm Mint.`,
     functionSignature: target.functionSignature,
     quantity: target.quantity,
     priceEth: target.priceEth,
-    walletLabels: wallets.map((wallet) => wallet.label),
-    walletAddresses: wallets.map((wallet) => wallet.address),
+    walletLabels: readyWallets.map((wallet) => wallet.label),
+    walletAddresses: readyWallets.map((wallet) => wallet.address),
     gasStrategy: session.gasStrategy
   });
 
@@ -7986,7 +8123,7 @@ No transaction will be sent until you press Confirm Mint.`,
     priceEth: target.priceEth,
     gasStrategyMode: session.gasStrategy.mode,
     status: multiSession.status,
-    reason: `wallets:${wallets.length}`
+    reason: `ready:${readyWallets.length};blocked:${eligibility.blocked.length}`
   });
 
   await ctx.reply(
@@ -8000,7 +8137,15 @@ Function: ${target.functionSignature}
 Quantity Per Wallet: ${target.quantity}
 Price Per Wallet: ${target.priceEth} ETH
 Gas Strategy: ${formatGasStrategy(session.gasStrategy)}
-Wallets (${wallets.length}): ${wallets.map((wallet) => wallet.label).join(", ")}
+
+Selected Wallets (${selectedWallets.length}): ${selectedWallets.map((wallet) => wallet.label).join(", ")}
+Included Ready Wallets (${readyWallets.length}): ${readyWallets.map((wallet) => wallet.label).join(", ")}
+Excluded Blocked Wallets (${eligibility.blocked.length}): ${
+      eligibility.blocked.length > 0
+        ? eligibility.blocked.map((item) => item.walletLabel).join(", ")
+        : "none"
+    }
+
 Concurrency Cap: ${getMultiMintConcurrency()}
 Delay Between Submissions: ${getMultiMintDelayMs()}ms
 Minting Lock: ${getMintLockStatusText(target.chain)}
@@ -8008,8 +8153,7 @@ Minting Lock: ${getMintLockStatusText(target.chain)}
 Preflight:
 ${formatMultiGasPreview(preflight.previews, preflight.failures)}
 
-Recommendation:
-${formatMintReadinessRecommendation(preflight.previews, preflight.failures)}
+${formatMultiWalletEligibilityReport(eligibility)}
 
 This confirmation expires in 10 minutes.
 
