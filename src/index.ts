@@ -6765,7 +6765,8 @@ const MINT_FLOW_FUNCTION_PRESETS = {
   publicMint: "publicMint(uint256)",
   mintPublic: "mintPublic(uint256)",
   mintTo: "mintTo(address,uint256)",
-  publicMintTo: "publicMint(address,uint256)"
+  publicMintTo: "publicMint(address,uint256)",
+  seaDropMintPublic: "mintPublic(address,address,address,uint256)"
 } as const;
 
 const MINT_FLOW_PRICE_PRESETS = {
@@ -7075,7 +7076,8 @@ async function sendMintFlowFunctionScanWalletSelection(
   await ctx.reply(
     `Choose the wallet to simulate with.
 
-For GTD/whitelist, pick the wallet that is actually whitelisted.
+For public mints, pick a funded wallet.
+For GTD/whitelist, pick the wallet that is actually eligible.
 
 No transaction will be sent.`,
     Markup.inlineKeyboard([
@@ -7152,6 +7154,11 @@ ${formatMintFlowTargetDraftProgress(session)}
 Most common:
 - publicMint(uint256)
 - mint(uint256)
+
+OpenSea SeaDrop:
+- mintPublic(address,address,address,uint256)
+
+For OpenSea public mints, use Auto-Scan Route with Wallet or choose OpenSea SeaDrop if the route was already detected.
 
 You can also type a supported function manually.`,
       Markup.inlineKeyboard([
