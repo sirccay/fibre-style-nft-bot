@@ -7175,7 +7175,10 @@ You can also type a supported function manually.`,
         [
           Markup.button.callback("publicMint(address,uint256)", `mft:f:${session.sessionId}:publicMintTo`)
         ],
-        [Markup.button.callback("🤖 Scan With Whitelisted Wallet", `mft:scan:${session.sessionId}`)],
+        [
+          Markup.button.callback("OpenSea SeaDrop", `mft:f:${session.sessionId}:seaDropMintPublic`)
+        ],
+        [Markup.button.callback("🤖 Auto-Scan Route with Wallet", `mft:scan:${session.sessionId}`)],
         [Markup.button.callback("Cancel", `mft:cancel:${session.sessionId}`)]
       ])
     );
@@ -7406,6 +7409,16 @@ Contract: ${formatShortAddress(session.data.contractAddress)}`
             status: "contract_detected_metadata_failed",
             reason: getSafeErrorMessage(detectionError)
           });
+        }
+
+        if (linkInput.includes("opensea.io") && session.data.chain === "mainnet") {
+          session.data.functionSignature = normalizeMintFunctionSignature(
+            "mintPublic(address,address,address,uint256)"
+          );
+
+          await ctx.reply(
+            "✅ OpenSea SeaDrop route auto-selected. You do not need to choose a mint function manually."
+          );
         }
       }
     } else if (session.step === "functionSignature") {
