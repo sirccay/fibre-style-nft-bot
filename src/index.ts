@@ -8021,6 +8021,508 @@ No transaction will be sent until you press Confirm Multi Mint.`,
   );
 }
 
+
+type OpenSeaQuickMintStatus = "active" | "used" | "cancelled" | "expired";
+type OpenSeaQuickMintStep = "link" | "quantity" | "wallet";
+
+type OpenSeaQuickMintSession = {
+  sessionId: string;
+  ownerTelegramId: string;
+  step: OpenSeaQuickMintStep;
+  sourceUrl?: string;
+  targetId?: string;
+  createdAt: string;
+  expiresAt: string;
+  status: OpenSeaQuickMintStatus;
+};
+
+const OPENSEA_QUICK_MINT_TTL_MS = 15 * 60 * 1000;
+const openSeaQuickMintSessions = new Map<string, OpenSeaQuickMintSession>();
+const activeOpenSeaQuickMintByOwner = new Map<string, string>();
+
+function createOpenSeaQuickMintSessionId() {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const sessionId = randomUUID().replace(/-/g, "").slice(0, 8);
+
+    if (!openSeaQuickMintSessions.has(sessionId)) {
+      return sessionId;
+    }
+  }
+
+  return randomUUID().replace(/-/g, "").slice(0, 12);
+}
+
+function isOpenSeaQuickMintExpired(session: OpenSeaQuickMintSession) {
+  const expiresAtMs = Date.parse(session.expiresAt);
+  return !Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now();
+}
+
+function cleanupOpenSeaQuickMintSessions() {
+  for (const [sessionId, session] of openSeaQuickMintSessions.entries()) {
+    if (session.status === "active" && isOpenSeaQuickMintExpired(session)) {
+      session.status = "expired";
+    }
+
+    const expiresAtMs = Date.parse(session.expiresAt);
+    const cleanupAfterMs = Number.isFinite(expiresAtMs)
+      ? expiresAtMs + OPENSEA_QUICK_MINT_TTL_MS
+      : Date.now();
+
+    if (cleanupAfterMs <= Date.now()) {
+      openSeaQuickMintSessions.delete(sessionId);
+
+      if (activeOpenSeaQuickMintByOwner.get(session.ownerTelegramId) === sessionId) {
+        activeOpenSeaQuickMintByOwner.delete(session.ownerTelegramId);
+      }
+    }
+  }
+}
+
+function createOpenSeaQuickMintSession(ownerTelegramId: string) {
+  cleanupOpenSeaQuickMintSessions();
+
+  const existingId = activeOpenSeaQuickMintByOwner.get(ownerTelegramId);
+  const existing = existingId ? openSeaQuickMintSessions.get(existingId) : null;
+
+  if (existing && existing.status === "active") {
+    existing.status = "cancelled";
+  }
+
+  if (existingId) {
+    activeOpenSeaQuickMintByOwner.delete(ownerTelegramId);
+  }
+
+  const createdAt = new Date();
+  const session: OpenSeaQuickMintSession = {
+    sessionId: createOpenSeaQuickMintSessionId(),
+    ownerTelegramId,
+    step: "link",
+    createdAt: createdAt.toISOString(),
+    expiresAt: new Date(createdAt.getTime() + OPENSEA_QUICK_MINT_TTL_MS).toISOString(),
+    status: "active"
+  };
+
+  openSeaQuickMintSessions.set(session.sessionId, session);
+  activeOpenSeaQuickMintByOwner.set(ownerTelegramId, session.sessionId);
+  return session;
+}
+
+function getActiveOpenSeaQuickMintSession(ownerTelegramId: string) {
+  cleanupOpenSeaQuickMintSessions();
+
+  const sessionId = activeOpenSeaQuickMintByOwner.get(ownerTelegramId);
+
+  if (!sessionId) {
+    return null;
+  }
+
+  const session = openSeaQuickMintSessions.get(sessionId);
+
+  if (!session || session.status !== "active" || isOpenSeaQuickMintExpired(session)) {
+    activeOpenSeaQuickMintByOwner.delete(ownerTelegramId);
+
+    if (session) {
+      session.status = "expired";
+    }
+
+    return null;
+  }
+
+  return session;
+}
+
+async function getOpenSeaQuickMintSession(ctx: Context, sessionId: string) {
+  cleanupOpenSeaQuickMintSessions();
+
+  const actorTelegramId = getTelegramUserId(ctx);
+
+  if (!actorTelegramId) {
+    await ctx.reply("❌ Could not verify your Telegram account for this action.");
+    return null;
+  }
+
+  const session = openSeaQuickMintSessions.get(sessionId);
+
+  if (!session) {
+    await ctx.reply("This OpenSea mint flow expired. Paste the OpenSea link again.");
+    return null;
+  }
+
+  if (session.ownerTelegramId !== actorTelegramId) {
+    await ctx.reply("You cannot use this OpenSea mint flow.");
+    return null;
+  }
+
+  if (session.status !== "active" || isOpenSeaQuickMintExpired(session)) {
+    session.status = "expired";
+    await ctx.reply("This OpenSea mint flow expired. Paste the OpenSea link again.");
+    return null;
+  }
+
+  return session;
+}
+
+async function sendOpenSeaQuickMintLinkPrompt(ctx: Context, session: OpenSeaQuickMintSession) {
+  session.step = "link";
+
+  await ctx.reply(
+    `🔗 OpenSea Quick Mint
+
+Paste the OpenSea collection mint link.
+
+Example:
+https://opensea.io/collection/project-name
+
+The bot will auto-detect:
+- contract
+- chain
+- price
+- SeaDrop route
+
+No transaction will be sent until final confirmation.`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("Cancel", `osqm:cancel:${session.sessionId}`)]
+    ])
+  );
+}
+
+async function sendOpenSeaQuickMintQuantitySelection(
+  ctx: Context,
+  session: OpenSeaQuickMintSession
+) {
+  if (!session.targetId) {
+    await ctx.reply("This OpenSea mint flow is missing a target. Paste the link again.");
+    return;
+  }
+
+  const target = getMintTargetForOwner(session.targetId, session.ownerTelegramId);
+  session.step = "quantity";
+
+  await ctx.reply(
+    `✅ OpenSea mint target prepared.
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+Chain: ${target.chain}
+Contract: ${formatShortAddress(target.contractAddress)}
+Function: ${target.functionSignature}
+Price Each: ${target.priceEth} ETH
+
+Choose quantity:`,
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback("1", `osqm:q:${session.sessionId}:1`),
+        Markup.button.callback("2", `osqm:q:${session.sessionId}:2`),
+        Markup.button.callback("3", `osqm:q:${session.sessionId}:3`)
+      ],
+      [
+        Markup.button.callback("5", `osqm:q:${session.sessionId}:5`),
+        Markup.button.callback("10", `osqm:q:${session.sessionId}:10`),
+        Markup.button.callback("25", `osqm:q:${session.sessionId}:25`)
+      ],
+      [
+        Markup.button.callback("50", `osqm:q:${session.sessionId}:50`),
+        Markup.button.callback("100", `osqm:q:${session.sessionId}:100`)
+      ],
+      [Markup.button.callback("Cancel", `osqm:cancel:${session.sessionId}`)]
+    ])
+  );
+}
+
+async function sendOpenSeaQuickMintWalletSelection(
+  ctx: Context,
+  session: OpenSeaQuickMintSession
+) {
+  if (!session.targetId) {
+    await ctx.reply("This OpenSea mint flow is missing a target. Paste the link again.");
+    return;
+  }
+
+  const target = getMintTargetForOwner(session.targetId, session.ownerTelegramId);
+  const wallets = (await listWalletsForOwner(session.ownerTelegramId)).filter(
+    (wallet) => wallet.status !== "archived"
+  );
+
+  if (wallets.length === 0) {
+    await ctx.reply("No active wallets found. Add one with /addwallet.");
+    return;
+  }
+
+  session.step = "wallet";
+
+  await ctx.reply(
+    `👛 Choose wallet
+
+Target: ${target.name}
+Quantity: ${target.quantity}
+Price Each: ${target.priceEth} ETH
+Total Mint Cost: ${ethers.formatEther(
+      ethers.parseEther(target.priceEth || "0") * BigInt(target.quantity)
+    )} ETH
+
+Choose one wallet below for fastest flow.\n\nFor multiple wallets, use the multi-wallet selector.`,
+    Markup.inlineKeyboard([
+      ...wallets.map((wallet) => [
+        Markup.button.callback(
+          `${wallet.label} (${formatShortAddress(wallet.address)})`,
+          `osqm:w:${session.sessionId}:${wallet.label}`
+        )
+      ]),
+      [Markup.button.callback("👛 Select Multiple Wallets", `osqm:multi:${session.sessionId}`)],
+      [Markup.button.callback("Cancel", `osqm:cancel:${session.sessionId}`)]
+    ])
+  );
+}
+
+async function prepareOpenSeaQuickMintTargetFromLink(
+  ctx: Context,
+  session: OpenSeaQuickMintSession,
+  input: string
+) {
+  const linkInput = getDirectMintLinkInput(input);
+
+  if (!linkInput || !linkInput.includes("opensea.io")) {
+    await ctx.reply("Please paste a supported OpenSea collection link.");
+    return;
+  }
+
+  await ctx.reply("🔎 Detecting OpenSea mint...");
+
+  const resolverResult = await resolveOpenSeaContractForMintFlow(linkInput);
+
+  if (resolverResult.status !== "resolved") {
+    await ctx.reply(formatOpenSeaResolverUserMessage(resolverResult));
+    return;
+  }
+
+  const candidate = resolverResult.candidate;
+
+  if (!candidate.supportedMintChain) {
+    await ctx.reply(
+      `OpenSea resolved a contract, but this chain is not supported yet.
+
+Resolved:
+${candidate.chainName}: ${formatShortAddress(candidate.address)}`
+    );
+    return;
+  }
+
+  const detection = await detectMint(linkInput);
+  const priceEth = detection.mint.priceEth;
+
+  if (priceEth === undefined) {
+    await ctx.reply(
+      `❌ I detected the OpenSea contract, but could not safely detect the mint price.
+
+Try /mintflow → Create New Target manually, or paste a mint link where OpenSea shows the current price.`
+    );
+    return;
+  }
+
+  const target = createMintTarget({
+    ownerTelegramId: session.ownerTelegramId,
+    name: generateMintTargetName(session.ownerTelegramId, detection, ""),
+    contractAddress: ethers.getAddress(candidate.address),
+    functionSignature: normalizeMintFunctionSignature(
+      "mintPublic(address,address,address,uint256)"
+    ),
+    quantity: 1,
+    priceEth: validateMintPriceEth(priceEth),
+    chain: candidate.supportedMintChain,
+    sourceUrl: linkInput,
+    collectionSlug: resolverResult.slug,
+    detectedMetadata: getDetectionMetadata(detection)
+  });
+
+  session.sourceUrl = linkInput;
+  session.targetId = target.targetId;
+
+  await auditMintAction({
+    ownerTelegramId: session.ownerTelegramId,
+    action: "opensea_quick_mint_target_created",
+    targetId: target.targetId,
+    chain: target.chain,
+    contractAddress: target.contractAddress,
+    functionSignature: target.functionSignature,
+    quantity: target.quantity,
+    priceEth: target.priceEth,
+    collectionSlug: target.collectionSlug,
+    status: target.status,
+    reason: "direct_opensea_quick_mint"
+  });
+
+  await ctx.reply(
+    `✅ OpenSea mint detected.
+
+Collection: ${detection.contract.collectionName || resolverResult.slug}
+Slug: ${resolverResult.slug}
+Chain: ${target.chain}
+Contract: ${formatShortAddress(target.contractAddress)}
+Price Each: ${target.priceEth} ETH
+Route: OpenSea SeaDrop
+
+Target ID: ${target.targetId}`
+  );
+
+  await sendOpenSeaQuickMintQuantitySelection(ctx, session);
+}
+
+async function createOpenSeaQuickMintFinalConfirmation(
+  ctx: Context,
+  session: OpenSeaQuickMintSession,
+  walletLabel: string
+) {
+  if (!session.targetId) {
+    await ctx.reply("This OpenSea mint flow is missing a target. Paste the link again.");
+    return;
+  }
+
+  let target = requireCompleteMintTarget(
+    getMintTargetForOwner(session.targetId, session.ownerTelegramId)
+  );
+
+  await ctx.reply("⛽ Auto-resolving mint route and previewing gas...");
+
+  let routeNote = "Route: using saved OpenSea SeaDrop route.";
+
+  try {
+    const routeResult = await resolveMintRoutesForTarget({
+      ownerTelegramId: session.ownerTelegramId,
+      target,
+      walletLabel
+    });
+    const best = pickBestSupportedRoute(routeResult.candidates);
+
+    if (best) {
+      target = requireCompleteMintTarget(
+        updateMintTargetForOwner(target.targetId, session.ownerTelegramId, {
+          contractAddress: best.mintContractAddress,
+          chain: target.chain,
+          functionSignature: normalizeMintFunctionSignature(best.functionSignature),
+          quantity: target.quantity,
+          priceEth: best.pricePerTokenEth || target.priceEth
+        })
+      );
+      routeNote = `Route: verified ${best.functionSignature}.`;
+    } else {
+      routeNote =
+        "Route: SeaDrop selected, but resolver could not verify a best route. Gas preview below is the source of truth.";
+    }
+  } catch (error) {
+    routeNote = `Route: SeaDrop selected. Resolver note: ${getSafeErrorMessage(error)}`;
+  }
+
+  const gasStrategy = getTargetGasStrategy(target);
+  const preview = await previewGasForTargetWallet({
+    ownerTelegramId: session.ownerTelegramId,
+    target,
+    walletLabel,
+    gasStrategy
+  });
+  const run = createRunFromPreview(
+    session.ownerTelegramId,
+    preview,
+    "pending",
+    target.targetId
+  );
+  const mintSession = createMintConfirmationSession({
+    ownerTelegramId: session.ownerTelegramId,
+    walletLabel: preview.walletLabel,
+    walletAddress: preview.walletAddress,
+    chain: preview.chain,
+    contractAddress: preview.contractAddress,
+    functionSignature: preview.functionSignature,
+    quantity: preview.quantity,
+    priceEth: preview.priceEth,
+    runId: run.runId,
+    targetId: target.targetId,
+    gasStrategy
+  });
+
+  session.status = "used";
+  activeOpenSeaQuickMintByOwner.delete(session.ownerTelegramId);
+
+  await auditMintAction({
+    ownerTelegramId: session.ownerTelegramId,
+    action: "opensea_quick_mint_confirmation_created",
+    walletLabel: preview.walletLabel,
+    walletAddress: preview.walletAddress,
+    targetId: target.targetId,
+    runId: run.runId,
+    chain: preview.chain,
+    contractAddress: preview.contractAddress,
+    functionSignature: preview.functionSignature,
+    quantity: preview.quantity,
+    priceEth: preview.priceEth,
+    gasStrategyMode: gasStrategy.mode,
+    status: mintSession.status
+  });
+
+  await ctx.reply(
+    `${formatMintPreviewMessage(preview, {
+      title: `OpenSea Quick Mint Confirmation: ${target.name}`,
+      targetId: target.targetId,
+      runId: run.runId
+    })}
+
+${routeNote}
+
+This confirmation expires in 10 minutes.
+
+No transaction will be sent until you press Confirm Mint.`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("Confirm Mint", `mint:confirm:${mintSession.sessionId}`)],
+      [Markup.button.callback("Cancel", `mint:cancel:${mintSession.sessionId}`)]
+    ])
+  );
+}
+
+async function startOpenSeaQuickMintFlow(ctx: Context) {
+  const ownerTelegramId = getRequiredTelegramUserId(ctx);
+  const session = createOpenSeaQuickMintSession(ownerTelegramId);
+  await sendOpenSeaQuickMintLinkPrompt(ctx, session);
+}
+
+async function startOpenSeaQuickMintFromLink(ctx: Context, input: string) {
+  const ownerTelegramId = getRequiredTelegramUserId(ctx);
+  const session = createOpenSeaQuickMintSession(ownerTelegramId);
+  await prepareOpenSeaQuickMintTargetFromLink(ctx, session, input);
+}
+
+async function handleOpenSeaQuickMintText(ctx: Context) {
+  const ownerTelegramId = getTelegramUserId(ctx);
+
+  if (!ownerTelegramId) {
+    return false;
+  }
+
+  const session = getActiveOpenSeaQuickMintSession(ownerTelegramId);
+
+  if (!session || session.step !== "link") {
+    return false;
+  }
+
+  if (!(await requireAdmin(ctx))) {
+    return true;
+  }
+
+  const rawText = (ctx as any).message?.text;
+
+  if (typeof rawText !== "string" || rawText.trim().startsWith("/")) {
+    return false;
+  }
+
+  try {
+    await prepareOpenSeaQuickMintTargetFromLink(ctx, session, rawText.trim());
+  } catch (error) {
+    logSafeError("OpenSea quick mint link handling failed", error);
+    await ctx.reply(`❌ Could not prepare OpenSea quick mint.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+
+  return true;
+}
+
+
 function getMintFlowMenuText() {
   return `🚀 Guided Mint Flow
 
@@ -8181,11 +8683,135 @@ bot.action("mf:create_target", async (ctx) => {
 
   await ctx.answerCbQuery();
 
-  const ownerTelegramId = getRequiredTelegramUserId(ctx);
-  const session = createMintFlowTargetDraftSession(ownerTelegramId);
-
-  await sendMintFlowTargetDraftPrompt(ctx, session);
+  try {
+    await startOpenSeaQuickMintFlow(ctx);
+  } catch (error) {
+    logSafeError("Could not start OpenSea quick mint flow", error);
+    await ctx.reply(`❌ Could not start OpenSea quick mint flow.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
 });
+
+
+bot.action(/^osqm:q:([0-9a-f]{8,12}):(\d+)$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const session = await getOpenSeaQuickMintSession(ctx, ctx.match[1] || "");
+
+  if (!session || !session.targetId) {
+    return;
+  }
+
+  try {
+    const quantity = validateMintQuantity(ctx.match[2] || "1");
+    const currentTarget = requireCompleteMintTarget(
+      getMintTargetForOwner(session.targetId, session.ownerTelegramId)
+    );
+    const target = updateMintTargetForOwner(session.targetId, session.ownerTelegramId, {
+      contractAddress: currentTarget.contractAddress,
+      chain: currentTarget.chain,
+      functionSignature: currentTarget.functionSignature,
+      quantity,
+      priceEth: currentTarget.priceEth
+    });
+
+    await auditMintAction({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "opensea_quick_mint_quantity_selected",
+      targetId: target.targetId,
+      chain: target.chain,
+      contractAddress: target.contractAddress,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      status: target.status
+    });
+
+    await sendOpenSeaQuickMintWalletSelection(ctx, session);
+  } catch (error) {
+    logSafeError("Could not select OpenSea quick mint quantity", error);
+    await ctx.reply(`❌ Could not select quantity.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^osqm:w:([0-9a-f]{8,12}):([^:]{1,32})$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const session = await getOpenSeaQuickMintSession(ctx, ctx.match[1] || "");
+
+  if (!session) {
+    return;
+  }
+
+  try {
+    const walletLabel = normalizeWalletLabel(ctx.match[2] || "");
+    await createOpenSeaQuickMintFinalConfirmation(ctx, session, walletLabel);
+  } catch (error) {
+    logSafeError("Could not create OpenSea quick mint confirmation", error);
+    await ctx.reply(`❌ Could not create OpenSea quick mint confirmation.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+
+bot.action(/^osqm:multi:([0-9a-f]{8,12})$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const session = await getOpenSeaQuickMintSession(ctx, ctx.match[1] || "");
+
+  if (!session || !session.targetId) {
+    await ctx.reply("This OpenSea mint flow expired. Paste the OpenSea link again.");
+    return;
+  }
+
+  try {
+    const target = getMintTargetForOwner(session.targetId, session.ownerTelegramId);
+    const wizard = createMintFlowWizardSession({
+      ownerTelegramId: session.ownerTelegramId,
+      action: "quick",
+      targetId: target.targetId
+    });
+
+    session.status = "used";
+    activeOpenSeaQuickMintByOwner.delete(session.ownerTelegramId);
+
+    await ctx.reply(
+      `✅ Multi-wallet mode enabled.
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+
+Tap multiple wallets, then press Continue → Gas.`
+    );
+
+    await sendMintFlowWalletSelection(ctx, wizard);
+  } catch (error) {
+    logSafeError("Could not start OpenSea multi-wallet mint flow", error);
+    await ctx.reply(`❌ Could not start multi-wallet flow.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.action(/^osqm:cancel:([0-9a-f]{8,12})$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery();
+
+  const session = await getOpenSeaQuickMintSession(ctx, ctx.match[1] || "");
+
+  if (!session) {
+    return;
+  }
+
+  session.status = "cancelled";
+  activeOpenSeaQuickMintByOwner.delete(session.ownerTelegramId);
+
+  await ctx.reply("OpenSea quick mint flow cancelled.");
+});
+
 
 bot.action(/^mft:scan:([0-9a-f]{8,12})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
@@ -13975,6 +14601,10 @@ bot.on("text", async (ctx) => {
     return;
   }
 
+  if (await handleOpenSeaQuickMintText(ctx)) {
+    return;
+  }
+
   if (await handleMintFlowTargetDraftText(ctx)) {
     return;
   }
@@ -13988,6 +14618,11 @@ bot.on("text", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
   try {
+    if (input.includes("opensea.io")) {
+      await startOpenSeaQuickMintFromLink(ctx, input);
+      return;
+    }
+
     await replyWithMintDetection(ctx, input, "direct_link_auto_parser");
   } catch (error) {
     logSafeError("Could not auto-parse mint link", error);
