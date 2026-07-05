@@ -119,8 +119,17 @@ const SUPPORTED_STORED_MINT_SIGNATURES: SupportedMintFunctionSignature[] = [
   "mint(uint256)",
   "publicMint(uint256)",
   "mintPublic(uint256)",
+  "mintPublicSale(uint256)",
+  "claim(uint256)",
+  "purchase(uint256)",
+  "mintPublic(address,address,address,uint256)",
   "mintTo(address,uint256)",
-  "publicMint(address,uint256)"
+  "mint(address,uint256)",
+  "publicMint(address,uint256)",
+  "mintPublic(address,uint256)",
+  "mintPublicSale(address,uint256)",
+  "claim(address,uint256)",
+  "purchase(address,uint256)"
 ];
 
 function isMintTargetStatus(value: unknown): value is MintTargetStatus {

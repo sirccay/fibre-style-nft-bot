@@ -16,8 +16,17 @@ export type SupportedMintFunctionSignature =
   | "mint(uint256)"
   | "publicMint(uint256)"
   | "mintPublic(uint256)"
+  | "mintPublicSale(uint256)"
+  | "claim(uint256)"
+  | "purchase(uint256)"
+  | "mintPublic(address,address,address,uint256)"
   | "mintTo(address,uint256)"
-  | "publicMint(address,uint256)";
+  | "mint(address,uint256)"
+  | "publicMint(address,uint256)"
+  | "mintPublic(address,uint256)"
+  | "mintPublicSale(address,uint256)"
+  | "claim(address,uint256)"
+  | "purchase(address,uint256)";
 
 export type MintPreviewResult = {
   walletLabel: string;
@@ -88,8 +97,17 @@ export const SUPPORTED_MINT_FUNCTION_SIGNATURES: SupportedMintFunctionSignature[
   "mint(uint256)",
   "publicMint(uint256)",
   "mintPublic(uint256)",
+  "mintPublicSale(uint256)",
+  "claim(uint256)",
+  "purchase(uint256)",
+  "mintPublic(address,address,address,uint256)",
   "mintTo(address,uint256)",
-  "publicMint(address,uint256)"
+  "mint(address,uint256)",
+  "publicMint(address,uint256)",
+  "mintPublic(address,uint256)",
+  "mintPublicSale(address,uint256)",
+  "claim(address,uint256)",
+  "purchase(address,uint256)"
 ];
 
 export const MAINNET_MINTING_DISABLED_MESSAGE =
@@ -244,11 +262,40 @@ export function buildMintTransaction(
   }
 
   const contractAddress = ethers.getAddress(params.contractAddress);
+  const priceWei = ethers.parseEther(params.priceEth);
+  const totalCostWei = priceWei * BigInt(params.quantity);
+
+  if (params.functionSignature === "mintPublic(address,address,address,uint256)") {
+    const seaDropController = ethers.getAddress(
+      process.env.OPENSEA_SEADROP_CONTROLLER ||
+        "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5"
+    );
+    const feeRecipient = ethers.getAddress(
+      process.env.OPENSEA_SEADROP_FEE_RECIPIENT ||
+        "0x0000a26b00c1F0DF003000390027140000fAa719"
+    );
+    const minterIfNotPayer = ethers.ZeroAddress;
+
+    const contractInterface = new ethers.Interface([
+      "function mintPublic(address nftContract,address feeRecipient,address minterIfNotPayer,uint256 quantity) payable"
+    ]);
+
+    return {
+      to: seaDropController,
+      data: contractInterface.encodeFunctionData("mintPublic", [
+        contractAddress,
+        feeRecipient,
+        minterIfNotPayer,
+        BigInt(params.quantity)
+      ]),
+      value: totalCostWei,
+      totalCostEth: ethers.formatEther(totalCostWei)
+    };
+  }
+
   const contractInterface = new ethers.Interface([
     `function ${params.functionSignature} payable`
   ]);
-  const priceWei = ethers.parseEther(params.priceEth);
-  const totalCostWei = priceWei * BigInt(params.quantity);
   const args = params.functionSignature.includes("address,uint256")
     ? [params.walletAddress, BigInt(params.quantity)]
     : [BigInt(params.quantity)];
@@ -296,6 +343,31 @@ export async function previewMint(params: MintActionParams): Promise<MintPreview
     priceEth: params.priceEth,
     walletAddress: wallet.address
   });
+
+  const walletBalanceWei = await provider.getBalance(wallet.address);
+  const walletBalanceEth = ethers.formatEther(walletBalanceWei);
+  const gasBufferWei = params.chain === "mainnet" ? ethers.parseEther("0.0005") : 0n;
+  const minimumNeededWei = tx.value + gasBufferWei;
+
+  if (walletBalanceWei < minimumNeededWei) {
+    return {
+      walletLabel: walletSummary.label,
+      walletAddress: wallet.address,
+      chain: params.chain,
+      contractAddress: tx.to,
+      functionSignature: params.functionSignature,
+      quantity: params.quantity,
+      priceEth: params.priceEth,
+      totalCostWei: tx.value,
+      totalCostEth: tx.totalCostEth,
+      gasEstimate: null,
+      gasEstimateFailed: true,
+      gasEstimateError: `low balance: wallet has ${walletBalanceEth} ETH, mint cost is ${tx.totalCostEth} ETH, recommended minimum with gas buffer is ${ethers.formatEther(minimumNeededWei)} ETH`,
+      walletBalanceWei,
+      walletBalanceEth,
+      fundedEnough: false
+    };
+  }
 
   let gasEstimate: string | null = null;
   let gasEstimateError: string | undefined;
