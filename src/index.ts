@@ -7928,7 +7928,7 @@ async function createMintFlowFinalConfirmation(ctx: Context, session: MintFlowWi
       quantity: preview.quantity,
       priceEth: preview.priceEth,
       gasStrategyMode: session.gasStrategy.mode,
-      status: mintSession.status
+      status: mintSession?.status || "blocked"
     });
 
     await ctx.reply(
@@ -8274,6 +8274,136 @@ Choose one wallet below for fastest flow.\n\nFor multiple wallets, use the multi
   );
 }
 
+
+function classifyOpenSeaPhaseFromDetection(detection: any) {
+  const openSeaMint = detection?.mint?.openSeaMint;
+  const phaseStatus = String(detection?.mint?.phaseStatus || "unknown");
+  const phaseType = String(detection?.mint?.phaseTypeEstimate || "unknown");
+  const phaseEvidence = String(detection?.mint?.phaseTypeEvidence || "");
+  const statusText = String(openSeaMint?.mintStatusText || "");
+  const stageName = String(openSeaMint?.currentStageName || "");
+
+  const joined = `${phaseStatus} ${phaseType} ${phaseEvidence} ${statusText} ${stageName}`.toLowerCase();
+
+  if (/ended|closed|sold out|soldout|finished|complete/.test(joined)) {
+    return {
+      label: "Ended / unavailable",
+      canAutoAttempt: false,
+      warning: "Mint appears ended, sold out, or unavailable. The bot should not attempt minting unless gas preview proves otherwise."
+    };
+  }
+
+  if (/not live|upcoming|soon|scheduled|starts|start time|premint/.test(joined)) {
+    return {
+      label: "Not live yet",
+      canAutoAttempt: false,
+      warning: "Mint may not be live yet. Use watch/schedule instead of trying to mint immediately."
+    };
+  }
+
+  if (/gtd|guaranteed/.test(joined)) {
+    return {
+      label: "GTD / guaranteed allowlist",
+      canAutoAttempt: true,
+      warning: "GTD usually requires the selected wallet to be officially eligible. Gas preview is required before confirmation."
+    };
+  }
+
+  if (/allowlist|whitelist|wl|presale|pre-sale|team|holder|private/.test(joined)) {
+    return {
+      label: "Allowlist / holder / private phase",
+      canAutoAttempt: true,
+      warning: "This phase may require official proof/signature data. The bot will not generate or bypass proofs."
+    };
+  }
+
+  if (/fcfs|first come|first-come/.test(joined)) {
+    return {
+      label: "FCFS",
+      canAutoAttempt: true,
+      warning: "FCFS can still require wallet eligibility or supply availability. Gas preview is required."
+    };
+  }
+
+  if (/public|minting|live|open/.test(joined)) {
+    return {
+      label: "Public / live",
+      canAutoAttempt: true,
+      warning: "Public route detected. Gas preview is still required before final confirmation."
+    };
+  }
+
+  return {
+    label: phaseType === "unknown" ? "Unknown / needs gas check" : phaseType,
+    canAutoAttempt: true,
+    warning: "Phase could not be confirmed from metadata. Gas preview is the source of truth."
+  };
+}
+
+function formatOpenSeaQuickMintPhaseBlock(detection: any) {
+  const openSeaMint = detection?.mint?.openSeaMint;
+  const phase = classifyOpenSeaPhaseFromDetection(detection);
+  const lines = [
+    "Phase:",
+    `- Detected: ${phase.label}`,
+    `- Status: ${detection?.mint?.phaseStatus || "unknown"}`,
+    `- Type: ${detection?.mint?.phaseTypeEstimate || "unknown"} (${detection?.mint?.phaseTypeConfidence || "unknown"})`
+  ];
+
+  if (openSeaMint?.currentStageName) {
+    lines.push(`- Current Stage: ${openSeaMint.currentStageName}`);
+  }
+
+  if (openSeaMint?.mintStatusText) {
+    lines.push(`- OpenSea Status: ${openSeaMint.mintStatusText}`);
+  }
+
+  if (openSeaMint?.currentStagePriceText) {
+    lines.push(`- Stage Price: ${openSeaMint.currentStagePriceText}`);
+  }
+
+  lines.push(`- Note: ${phase.warning}`);
+
+  return lines.join("\n");
+}
+
+function formatWalletEligibilityFromPreview(preview: any) {
+  if (preview.fundedEnough === false) {
+    return [
+      "Wallet Eligibility:",
+      "- Status: underfunded",
+      "- Meaning: route may be valid, but wallet does not have enough ETH for mint cost + gas.",
+      "- Action: top up wallet or choose another wallet."
+    ].join("\n");
+  }
+
+  if (preview.gasEstimateFailed) {
+    return [
+      "Wallet Eligibility:",
+      "- Status: not confirmed",
+      `- Reason: ${preview.gasEstimateError || "gas estimation failed"}`,
+      "- Meaning: wallet may be ineligible, mint may not be live, phase may require proof/signature, route may be wrong, or supply may be unavailable.",
+      "- Action: do not mint until route/gas succeeds."
+    ].join("\n");
+  }
+
+  if (preview.gasEstimate) {
+    return [
+      "Wallet Eligibility:",
+      "- Status: likely eligible for selected route",
+      "- Evidence: gas estimation succeeded for this wallet, quantity, price, and route.",
+      "- Note: this is still not a guarantee of final transaction success, but it is the strongest safe pre-check."
+    ].join("\n");
+  }
+
+  return [
+    "Wallet Eligibility:",
+    "- Status: unknown",
+    "- Action: run gas preview again before minting."
+  ].join("\n");
+}
+
+
 async function prepareOpenSeaQuickMintTargetFromLink(
   ctx: Context,
   session: OpenSeaQuickMintSession,
@@ -8361,6 +8491,8 @@ Contract: ${formatShortAddress(target.contractAddress)}
 Price Each: ${target.priceEth} ETH
 Route: OpenSea SeaDrop
 
+${formatOpenSeaQuickMintPhaseBlock(detection)}
+
 Target ID: ${target.targetId}`
   );
 
@@ -8425,22 +8557,36 @@ async function createOpenSeaQuickMintFinalConfirmation(
     "pending",
     target.targetId
   );
-  const mintSession = createMintConfirmationSession({
-    ownerTelegramId: session.ownerTelegramId,
-    walletLabel: preview.walletLabel,
-    walletAddress: preview.walletAddress,
-    chain: preview.chain,
-    contractAddress: preview.contractAddress,
-    functionSignature: preview.functionSignature,
-    quantity: preview.quantity,
-    priceEth: preview.priceEth,
-    runId: run.runId,
-    targetId: target.targetId,
-    gasStrategy
-  });
+  const isBlockedByFunding = preview.fundedEnough === false;
+  const isBlockedByGas = preview.gasEstimateFailed && !isBlockedByFunding;
+  const isBlocked = isBlockedByFunding || isBlockedByGas;
+
+  const mintSession = isBlocked
+    ? null
+    : createMintConfirmationSession({
+        ownerTelegramId: session.ownerTelegramId,
+        walletLabel: preview.walletLabel,
+        walletAddress: preview.walletAddress,
+        chain: preview.chain,
+        contractAddress: preview.contractAddress,
+        functionSignature: preview.functionSignature,
+        quantity: preview.quantity,
+        priceEth: preview.priceEth,
+        runId: run.runId,
+        targetId: target.targetId,
+        gasStrategy
+      });
 
   session.status = "used";
   activeOpenSeaQuickMintByOwner.delete(session.ownerTelegramId);
+
+  if (isBlockedByFunding) {
+    routeNote =
+      "Route: SeaDrop route selected. Full verification is blocked because this wallet is underfunded.";
+  } else if (isBlockedByGas) {
+    routeNote =
+      "Route: SeaDrop route selected, but gas estimation failed. Do not mint until gas preview succeeds.";
+  }
 
   await auditMintAction({
     ownerTelegramId: session.ownerTelegramId,
@@ -8455,7 +8601,7 @@ async function createOpenSeaQuickMintFinalConfirmation(
     quantity: preview.quantity,
     priceEth: preview.priceEth,
     gasStrategyMode: gasStrategy.mode,
-    status: mintSession.status
+    status: mintSession?.status || "blocked"
   });
 
   await ctx.reply(
@@ -8465,15 +8611,21 @@ async function createOpenSeaQuickMintFinalConfirmation(
       runId: run.runId
     })}
 
+${formatWalletEligibilityFromPreview(preview)}
+
 ${routeNote}
 
-This confirmation expires in 10 minutes.
-
-No transaction will be sent until you press Confirm Mint.`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback("Confirm Mint", `mint:confirm:${mintSession.sessionId}`)],
-      [Markup.button.callback("Cancel", `mint:cancel:${mintSession.sessionId}`)]
-    ])
+${isBlocked
+  ? "This mint is blocked for now. No confirmation button is shown because this wallet is not ready."
+  : "This confirmation expires in 10 minutes.\n\nNo transaction will be sent until you press Confirm Mint."}`,
+    Markup.inlineKeyboard(
+      isBlocked
+        ? [[Markup.button.callback("Close", `osqm:noop:${session.sessionId}`)]]
+        : [
+            [Markup.button.callback("Confirm Mint", `mint:confirm:${mintSession!.sessionId}`)],
+            [Markup.button.callback("Cancel", `mint:cancel:${mintSession!.sessionId}`)]
+          ]
+    )
   );
 }
 
@@ -8755,6 +8907,13 @@ bot.action(/^osqm:w:([0-9a-f]{8,12}):([^:]{1,32})$/, async (ctx) => {
   }
 });
 
+
+
+bot.action(/^osqm:noop:([0-9a-f]{8,12})$/, async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  await ctx.answerCbQuery("No mint action available.");
+});
 
 bot.action(/^osqm:multi:([0-9a-f]{8,12})$/, async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
