@@ -182,6 +182,7 @@ const BOT_COMMANDS = [
   { command: "gaspreview", description: "Preview mint gas" },
   { command: "multigaspreview", description: "Preview gas for wallets" },
   { command: "mintready", description: "Check mint readiness" },
+  { command: "livemintcheck", description: "Final live mint checklist" },
   { command: "quickmint", description: "Guided quick mint" },
   { command: "mintflow", description: "Show guided mint flow" },
   { command: "mintmulti", description: "Mint with multiple wallets" },
@@ -470,6 +471,7 @@ Gas and Multi-Wallet Minting:
 /setgas targetId custom 25 2
 /gaspreview targetId wallet1
 /multigaspreview targetId wallet1,wallet2
+/livemintcheck targetId wallet1[,wallet2] [gasStrategy]
 /mintmulti targetId wallet1,wallet2
 /schedulemintmulti targetId wallet1,wallet2 2026-07-04T18:00:00Z watch
 /runmultimintjob jobId
@@ -2825,6 +2827,241 @@ function formatMultiWalletEligibilityReport(summary: MultiWalletEligibilitySumma
   }
 
   return lines.join("\n");
+}
+
+
+
+type LiveMintChecklistStatus = "pass" | "warn" | "block";
+
+type LiveMintChecklistItem = {
+  status: LiveMintChecklistStatus;
+  title: string;
+  detail: string;
+};
+
+function formatLiveMintChecklistItem(item: LiveMintChecklistItem) {
+  const icon =
+    item.status === "pass" ? "✅" : item.status === "warn" ? "⚠️" : "❌";
+
+  return `${icon} ${item.title}: ${item.detail}`;
+}
+
+function getLiveMintPhaseChecklist(target: MintTarget): LiveMintChecklistItem {
+  const metadata = target.detectedMetadata as any;
+  const openSeaMint = metadata?.openSeaMint;
+
+  const parts = [
+    metadata?.phaseStatus,
+    metadata?.phaseTypeEstimate,
+    metadata?.phaseTypeConfidence ? `confidence:${metadata.phaseTypeConfidence}` : null,
+    openSeaMint?.currentStageName,
+    openSeaMint?.mintStatusText
+  ].filter(Boolean);
+
+  const text = parts.length > 0 ? parts.join(" / ") : "unknown";
+  const joined = text.toLowerCase();
+
+  if (/ended|closed|sold out|soldout|finished|complete/.test(joined)) {
+    return {
+      status: "block",
+      title: "Mint Phase",
+      detail: `${text}. Mint appears ended or unavailable.`
+    };
+  }
+
+  if (/not live|upcoming|soon|scheduled|starts|start time|premint/.test(joined)) {
+    return {
+      status: "block",
+      title: "Mint Phase",
+      detail: `${text}. Mint does not look live yet.`
+    };
+  }
+
+  if (/allowlist|whitelist|wl|gtd|guaranteed|private|holder|team|fcfs/.test(joined)) {
+    return {
+      status: "warn",
+      title: "Mint Phase",
+      detail: `${text}. Phase may require wallet eligibility; gas preview is the source of truth.`
+    };
+  }
+
+  if (/public|minting|live|open/.test(joined)) {
+    return {
+      status: "pass",
+      title: "Mint Phase",
+      detail: `${text}. Looks live/public from saved metadata.`
+    };
+  }
+
+  return {
+    status: "warn",
+    title: "Mint Phase",
+    detail: `${text}. Phase is unclear; gas preview and route check matter most.`
+  };
+}
+
+async function getLiveMintRouteChecklist(params: {
+  ownerTelegramId: string;
+  target: MintTarget;
+  walletLabel: string;
+}): Promise<LiveMintChecklistItem> {
+  try {
+    const routeResult = await resolveMintRoutesForTarget({
+      ownerTelegramId: params.ownerTelegramId,
+      target: params.target,
+      walletLabel: params.walletLabel
+    });
+    const best = pickBestSupportedRoute(routeResult.candidates);
+
+    if (best) {
+      const bestAny = best as any;
+      const source = bestAny.source ? ` via ${bestAny.source}` : "";
+
+      return {
+        status: "pass",
+        title: "Mint Route",
+        detail: `verified ${best.functionSignature}${source}.`
+      };
+    }
+
+    return {
+      status: "warn",
+      title: "Mint Route",
+      detail: "route was not fully verified. Continue only if gas preview succeeds."
+    };
+  } catch (error) {
+    return {
+      status: "warn",
+      title: "Mint Route",
+      detail: `route resolver could not fully verify: ${getSafeErrorMessage(error)}`
+    };
+  }
+}
+
+function getLiveMintGasChecklist(
+  eligibility: MultiWalletEligibilitySummary
+): LiveMintChecklistItem {
+  if (eligibility.readyLabels.length === 0) {
+    return {
+      status: "block",
+      title: "Wallet / Gas",
+      detail: "no selected wallet is ready. Fix funding, eligibility, or gas failure first."
+    };
+  }
+
+  if (eligibility.blocked.length > 0) {
+    return {
+      status: "warn",
+      title: "Wallet / Gas",
+      detail: `${eligibility.readyLabels.length} ready, ${eligibility.blocked.length} blocked. Only ready wallets should continue.`
+    };
+  }
+
+  return {
+    status: "pass",
+    title: "Wallet / Gas",
+    detail: "all selected wallets look ready from gas preview."
+  };
+}
+
+function getLiveMintMainnetLockChecklist(chain: MintChain): LiveMintChecklistItem {
+  if (chain === "sepolia") {
+    return {
+      status: "pass",
+      title: "Minting Lock",
+      detail: "Sepolia test minting is allowed."
+    };
+  }
+
+  if (isMainnetMintingEnabled()) {
+    return {
+      status: "pass",
+      title: "Minting Lock",
+      detail: "ALLOW_MAINNET_MINTING=true. Live mainnet sends are enabled."
+    };
+  }
+
+  return {
+    status: "block",
+    title: "Minting Lock",
+    detail: "ALLOW_MAINNET_MINTING=false. Live mainnet sends are blocked."
+  };
+}
+
+function formatLiveMintWalletGasSummary(preflight: {
+  previews: MintPreviewResult[];
+  failures: Array<{ walletLabel: string; reason: string }>;
+}) {
+  const lines = [];
+
+  for (const preview of preflight.previews) {
+    lines.push(
+      `- ${preview.walletLabel}: funded=${preview.fundedEnough === undefined ? "unknown" : preview.fundedEnough ? "yes" : "no"}, gas=${preview.gasEstimate || "not available"}, total=${formatEthWithUsd(preview.estimatedTotalCostEth)}`
+    );
+  }
+
+  for (const failure of preflight.failures) {
+    if (!preflight.previews.some((preview) => preview.walletLabel === failure.walletLabel)) {
+      lines.push(`- ${failure.walletLabel}: failed=${failure.reason}`);
+    }
+  }
+
+  return lines.length > 0 ? lines.join("\n") : "No wallet preview was created.";
+}
+
+function getLiveMintFinalVerdict(params: {
+  phase: LiveMintChecklistItem;
+  route: LiveMintChecklistItem;
+  gas: LiveMintChecklistItem;
+  lock: LiveMintChecklistItem;
+  eligibility: MultiWalletEligibilitySummary;
+}) {
+  const blockers = [params.phase, params.gas, params.lock].filter(
+    (item) => item.status === "block"
+  );
+  const warnings = [params.phase, params.route, params.gas, params.lock].filter(
+    (item) => item.status === "warn"
+  );
+
+  if (blockers.length > 0) {
+    return {
+      status: "blocked",
+      title: "❌ BLOCKED FOR LIVE SEND",
+      detail: blockers.map((item) => `${item.title}: ${item.detail}`).join("\n")
+    };
+  }
+
+  if (warnings.length > 0) {
+    return {
+      status: "warning",
+      title: "⚠️ READY WITH WARNINGS",
+      detail:
+        "At least one warning remains. You may prepare confirmation only if you understand the warning and ready wallets are selected."
+    };
+  }
+
+  return {
+    status: "ready",
+    title: "✅ READY TO PREPARE",
+    detail:
+      params.eligibility.readyLabels.length > 0
+        ? "Phase, route, wallet funding, gas, and mint lock look ready."
+        : "No ready wallet detected."
+  };
+}
+
+function formatLiveMintCheckUsage() {
+  return [
+    "Use:",
+    "/livemintcheck targetId wallet1[,wallet2,...] [gasStrategy]",
+    "",
+    "Examples:",
+    "/livemintcheck b62a6886-e09f-4e7e-935c-864961ccff71 wallet1",
+    "/livemintcheck b62a6886-e09f-4e7e-935c-864961ccff71 wallet1,wallet2 auto",
+    "/livemintcheck b62a6886-e09f-4e7e-935c-864961ccff71 wallet1 fast",
+    "",
+    "No transaction is sent. This is a final safety checklist only."
+  ].join("\n");
 }
 
 
@@ -9561,6 +9798,131 @@ Next:
     );
   }
 });
+
+
+bot.command("livemintcheck", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const targetId = parts[1]?.trim();
+  const rawWallets = parts[2]?.trim();
+
+  if (!targetId || !rawWallets) {
+    await ctx.reply(formatLiveMintCheckUsage());
+    return;
+  }
+
+  try {
+    const ownerTelegramId = getRequiredTelegramUserId(ctx);
+    const target = requireCompleteMintTarget(
+      getMintTargetForOwner(targetId, ownerTelegramId)
+    );
+    const walletLabels = parseWalletLabelList(rawWallets);
+    const gasStrategy = parseOptionalCommandGasStrategy(
+      parts,
+      3,
+      getTargetGasStrategy(target)
+    );
+
+    await ctx.reply("🧪 Running live mint checklist...\n\nNo transaction will be sent.");
+
+    const preflight = await getMultiMintPreflight({
+      ownerTelegramId,
+      target,
+      walletLabels,
+      gasStrategy
+    });
+    const eligibility = getMultiWalletEligibilitySummary(preflight);
+    const routeWallet = eligibility.readyLabels[0] || walletLabels[0]!;
+    const phaseItem = getLiveMintPhaseChecklist(target);
+    const routeBlockedByFunding =
+      eligibility.readyLabels.length === 0 &&
+      eligibility.blocked.length > 0 &&
+      eligibility.blocked.every((item) => {
+        const reason = item.reason.toLowerCase();
+        return (
+          reason.includes("underfund") ||
+          reason.includes("insufficient") ||
+          reason.includes("balance")
+        );
+      });
+
+    const routeItem: LiveMintChecklistItem = routeBlockedByFunding
+      ? {
+          status: "warn",
+          title: "Mint Route",
+          detail:
+            "route verification needs a funded wallet. Current selected wallet(s) are underfunded, so rerun after top-up to verify the route."
+        }
+      : await getLiveMintRouteChecklist({
+          ownerTelegramId,
+          target,
+          walletLabel: routeWallet
+        });
+
+    const gasItem = getLiveMintGasChecklist(eligibility);
+    const lockItem = getLiveMintMainnetLockChecklist(target.chain);
+    const verdict = getLiveMintFinalVerdict({
+      phase: phaseItem,
+      route: routeItem,
+      gas: gasItem,
+      lock: lockItem,
+      eligibility
+    });
+
+    await auditMintAction({
+      ownerTelegramId,
+      action: "live_mint_check",
+      targetId: target.targetId,
+      chain: target.chain,
+      contractAddress: target.contractAddress,
+      functionSignature: target.functionSignature,
+      quantity: target.quantity,
+      priceEth: target.priceEth,
+      gasStrategyMode: gasStrategy.mode,
+      status: verdict.status,
+      reason: `ready:${eligibility.readyLabels.length};blocked:${eligibility.blocked.length}`
+    });
+
+    await ctx.reply(
+      `🧪 Live Mint Checklist
+
+Target: ${target.name}
+Target ID: ${target.targetId}
+Chain: ${target.chain}
+Contract: ${formatShortAddress(target.contractAddress)}
+Function: ${target.functionSignature}
+Quantity: ${target.quantity}
+Price Each: ${target.priceEth} ETH
+Gas Strategy: ${formatGasStrategy(gasStrategy)}
+
+Checks:
+${formatLiveMintChecklistItem(phaseItem)}
+${formatLiveMintChecklistItem(routeItem)}
+${formatLiveMintChecklistItem(gasItem)}
+${formatLiveMintChecklistItem(lockItem)}
+
+Trading Lock:
+${getTradingLockStatusText()}
+
+Wallet Gas Summary:
+${formatLiveMintWalletGasSummary(preflight)}
+
+${formatMultiWalletEligibilityReport(eligibility)}
+
+Final Verdict:
+${verdict.title}
+
+${verdict.detail}
+
+No transaction was sent.`
+    );
+  } catch (error) {
+    logSafeError("Live mint checklist failed", error);
+    await ctx.reply(`❌ Live mint checklist failed.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
 
 bot.command("quickmint", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
