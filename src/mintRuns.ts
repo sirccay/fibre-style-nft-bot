@@ -77,7 +77,8 @@ const SUPPORTED_STORED_MINT_SIGNATURES: SupportedMintFunctionSignature[] = [
   "publicMint(uint256)",
   "mintPublic(uint256)",
   "mintTo(address,uint256)",
-  "publicMint(address,uint256)"
+  "publicMint(address,uint256)",
+  "mintPublic(address,address,address,uint256)"
 ];
 
 function isMintRunStatus(value: unknown): value is MintRunStatus {
