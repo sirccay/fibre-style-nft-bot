@@ -14,7 +14,7 @@ import {
   renameWalletForOwner,
   archiveWalletForOwner
 } from "./vault.js";
-import { getTelegramUserId, requireAdmin } from "./auth.js";
+import { getTelegramUserId, requireAdmin, requireOwner } from "./auth.js";
 import {
   formatOpenSeaResolverUserMessage,
   resolveOpenSeaContractForMintFlow
@@ -119,6 +119,26 @@ import {
 } from "./mintRouteResolver.js";
 
 import type { MintPhaseDetectionResult } from "./mintPhaseDetector.js";
+import {
+  PAYMENT_CHAINS,
+  SUBSCRIPTION_TIERS,
+  approvePaymentRequest,
+  attachPaymentTxHash,
+  createBetaAccessCode,
+  createPaymentRequest,
+  getAccessControlStatus,
+  getBetaAccessUser,
+  isPrivateBetaEnabled,
+  listBetaAccessCodes,
+  listBetaAccessUsers,
+  listPaymentRequests,
+  redeemBetaAccessCode,
+  rejectPaymentRequest,
+  revokeBetaAccessCode,
+  revokeBetaAccessUser
+} from "./accessControl.js";
+import type { PaymentChainId, PaymentToken, SubscriptionTierId } from "./accessControl.js";
+
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -130,6 +150,18 @@ const bot = new Telegraf(token);
 
 const BOT_COMMANDS = [
   { command: "start", description: "Open bot menu" },
+  { command: "access", description: "Show subscription access" },
+  { command: "redeem", description: "Redeem access code" },
+  { command: "paytx", description: "Submit payment tx hash" },
+  { command: "accessstatus", description: "Owner: access status" },
+  { command: "createaccesscode", description: "Owner: create access code" },
+  { command: "accessusers", description: "Owner: list access users" },
+  { command: "accesscodes", description: "Owner: list access codes" },
+  { command: "paymentrequests", description: "Owner: list payments" },
+  { command: "approvepayment", description: "Owner: approve payment" },
+  { command: "rejectpayment", description: "Owner: reject payment" },
+  { command: "revokeaccess", description: "Owner: revoke user access" },
+  { command: "revokeaccesscode", description: "Owner: revoke code" },
   { command: "addwallet", description: "Import wallet" },
   { command: "importwallet", description: "Import wallet alias" },
   { command: "wallets", description: "Show your wallets" },
@@ -6084,7 +6116,7 @@ ADMIN_TELEGRAM_ID=${userId}`
   );
 });
 
-bot.start(async (ctx) => {
+bot.command("oldstart_disabled", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
   await ctx.reply(
@@ -15307,6 +15339,646 @@ bot.action(/^pf:open:(.+)$/, async (ctx) => {
 });
 
 
+
+
+const ACCESS_CODE_PROMPT_TTL_MS = 5 * 60 * 1000;
+const pendingAccessCodePrompts = new Map<string, number>();
+
+function setPendingAccessCodePrompt(telegramId: string) {
+  pendingAccessCodePrompts.set(telegramId, Date.now() + ACCESS_CODE_PROMPT_TTL_MS);
+}
+
+function clearPendingAccessCodePrompt(telegramId: string) {
+  pendingAccessCodePrompts.delete(telegramId);
+}
+
+function hasPendingAccessCodePrompt(telegramId: string) {
+  const expiresAt = pendingAccessCodePrompts.get(telegramId);
+
+  if (!expiresAt) {
+    return false;
+  }
+
+  if (expiresAt <= Date.now()) {
+    pendingAccessCodePrompts.delete(telegramId);
+    return false;
+  }
+
+  return true;
+}
+
+async function handlePendingAccessCodeText(ctx: Context) {
+  const telegramId = getTelegramUserId(ctx);
+
+  if (!telegramId || !hasPendingAccessCodePrompt(telegramId)) {
+    return false;
+  }
+
+  if (!ctx.message || !("text" in ctx.message)) {
+    return false;
+  }
+
+  const input = ctx.message.text.trim();
+
+  if (!input || input.startsWith("/")) {
+    return false;
+  }
+
+  clearPendingAccessCodePrompt(telegramId);
+
+  const result = redeemBetaAccessCode({
+    code: input,
+    telegramId,
+    ...(ctx.from?.username ? { username: ctx.from.username } : {}),
+    ...(ctx.from?.first_name ? { firstName: ctx.from.first_name } : {})
+  });
+
+  if (!result.ok) {
+    const reasonMap: Record<string, string> = {
+      invalid_code: "Invalid access code.",
+      code_revoked: "This access code has been revoked.",
+      code_expired: "This access code has expired.",
+      code_fully_used: "This access code has already been fully used."
+    };
+
+    await ctx.reply(
+      `❌ Access denied.
+
+Reason: ${reasonMap[result.reason] || result.reason}
+
+Tap “I have a code” again if you want to retry.`
+    );
+    return true;
+  }
+
+  await ctx.reply(
+    `✅ Access granted.
+
+Your Fibre beta access is active until:
+${formatAccessDate(result.expiresAt)}
+
+You can now use Fibre.
+
+Start here:
+/mintflow`
+  );
+
+  return true;
+}
+
+
+function formatAccessDate(value?: string) {
+  return value ? new Date(value).toISOString().slice(0, 10) : "none";
+}
+
+function formatSubscriptionGateMessage() {
+  return `🔒 Subscribe to unlock Fibre Mint Bot
+
+Fibre lets you mint, snipe, sweep, list, and manage NFT positions across supported chains.
+
+Pick a tier:
+• Daily — $2 · 24h access
+• Weekly — $7 · 7 days
+• Monthly — $20 · 30 days
+
+Pay in USDC or USDT on:
+Ethereum, Solana, BSC, Arbitrum, Base
+
+Beta tester?
+Use an access code instead.`;
+}
+
+function getSubscriptionGateKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("💳 Subscribe", "sub:start"),
+      Markup.button.callback("🎟️ I have a code", "sub:code")
+    ]
+  ]);
+}
+
+function formatTierSelectionMessage() {
+  return [
+    "💳 Choose your Fibre access tier",
+    "",
+    ...Object.entries(SUBSCRIPTION_TIERS).map(
+      ([tierId, tier]) =>
+        `• ${tier.label} — $${tier.amountUsd} · ${tier.description}`
+    ),
+    "",
+    "After payment, submit your transaction hash for approval."
+  ].join("\n");
+}
+
+function getTierSelectionKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("Daily — $2", "sub:tier:daily")],
+    [Markup.button.callback("Weekly — $7", "sub:tier:weekly")],
+    [Markup.button.callback("Monthly — $20", "sub:tier:monthly")],
+    [Markup.button.callback("🎟️ I have a code", "sub:code")]
+  ]);
+}
+
+function getChainSelectionKeyboard(tierId: SubscriptionTierId) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("Ethereum", `sub:chain:${tierId}:ethereum`),
+      Markup.button.callback("Solana", `sub:chain:${tierId}:solana`)
+    ],
+    [
+      Markup.button.callback("BSC", `sub:chain:${tierId}:bsc`),
+      Markup.button.callback("Arbitrum", `sub:chain:${tierId}:arbitrum`)
+    ],
+    [Markup.button.callback("Base", `sub:chain:${tierId}:base`)],
+    [Markup.button.callback("Back", "sub:start")]
+  ]);
+}
+
+function getTokenSelectionKeyboard(tierId: SubscriptionTierId, chain: PaymentChainId) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("USDC", `sub:pay:${tierId}:${chain}:USDC`),
+      Markup.button.callback("USDT", `sub:pay:${tierId}:${chain}:USDT`)
+    ],
+    [Markup.button.callback("Back", `sub:tier:${tierId}`)]
+  ]);
+}
+
+function formatPrivateBetaStatusMessage(ctx: Context) {
+  const telegramId = getTelegramUserId(ctx);
+  const user = telegramId ? getBetaAccessUser(telegramId) : null;
+
+  return `🔐 Fibre Access
+
+Private Gate: ${isPrivateBetaEnabled() ? "enabled" : "disabled"}
+Your Telegram ID: ${telegramId || "unknown"}
+Your Access: ${
+    user && user.status === "active"
+      ? `active until ${formatAccessDate(user.expiresAt)}`
+      : "not active"
+  }
+
+To redeem a code:
+/redeem PHANTOM-XXXX-XXXX
+
+To subscribe:
+/start`;
+}
+
+function formatAccessControlStatusMessage() {
+  const status = getAccessControlStatus();
+
+  return `🔐 Access Control Status
+
+PRIVATE_BETA_ENABLED: ${status.privateBetaEnabled ? "true" : "false"}
+
+Users:
+- Active: ${status.activeUsers}
+- Revoked: ${status.revokedUsers}
+
+Codes:
+- Active: ${status.activeCodes}
+- Revoked: ${status.revokedCodes}
+
+Payments:
+- Pending: ${status.pendingPayments}
+- Approved: ${status.approvedPayments}
+- Rejected: ${status.rejectedPayments}`;
+}
+
+function formatBetaUsersMessage() {
+  const users = listBetaAccessUsers();
+
+  if (users.length === 0) return "No access users yet.";
+
+  return [
+    "Access Users",
+    "",
+    ...users.map(
+      (user) =>
+        `- ${user.telegramId}${user.username ? ` (@${user.username})` : ""}: ${user.role}, ${user.status}, expires ${formatAccessDate(user.expiresAt)}`
+    )
+  ].join("\n");
+}
+
+function formatBetaCodesMessage() {
+  const codes = listBetaAccessCodes();
+
+  if (codes.length === 0) return "No access codes created yet.";
+
+  return [
+    "Access Codes",
+    "",
+    ...codes.map(
+      (code) =>
+        `- ${code.label}: uses ${code.usedByTelegramIds.length}/${code.maxUses}, expires ${formatAccessDate(code.expiresAt)}, revoked=${code.revokedAt ? "yes" : "no"}${code.note ? `, note=${code.note}` : ""}`
+    )
+  ].join("\n");
+}
+
+function formatPaymentRequestsMessage() {
+  const payments = listPaymentRequests();
+
+  if (payments.length === 0) return "No payment requests yet.";
+
+  return [
+    "Payment Requests",
+    "",
+    ...payments.slice(-30).reverse().map(
+      (payment) =>
+        `- ${payment.paymentId}: ${payment.status}, ${payment.telegramId}${payment.username ? ` (@${payment.username})` : ""}, ${payment.tierId}, $${payment.amountUsd}, ${payment.token} on ${payment.chain}, tx=${payment.txHash || "none"}`
+    )
+  ].join("\n");
+}
+
+bot.command("start", async (ctx) => {
+  const telegramId = getTelegramUserId(ctx);
+  const user = telegramId ? getBetaAccessUser(telegramId) : null;
+
+  if (telegramId && user?.status === "active") {
+    await ctx.reply(
+      `✅ Fibre access active.
+
+Access expires:
+${formatAccessDate(user.expiresAt)}
+
+Use /mintflow to start minting.`
+    );
+    return;
+  }
+
+  await ctx.reply(formatSubscriptionGateMessage(), getSubscriptionGateKeyboard());
+});
+
+bot.command("access", async (ctx) => {
+  await ctx.reply(formatPrivateBetaStatusMessage(ctx));
+});
+
+bot.action("sub:start", async (ctx) => {
+  await safeAnswerCbQuery(ctx);
+  await ctx.reply(formatTierSelectionMessage(), getTierSelectionKeyboard());
+});
+
+bot.action("sub:code", async (ctx) => {
+  await safeAnswerCbQuery(ctx);
+
+  const telegramId = getTelegramUserId(ctx);
+
+  if (!telegramId) {
+    await ctx.reply("❌ Could not read your Telegram ID.");
+    return;
+  }
+
+  setPendingAccessCodePrompt(telegramId);
+
+  await ctx.reply(
+    `🎟️ I have a code
+
+Paste your access code here and press send.
+
+Example:
+PHANTOM-XXXX-XXXX
+
+This code window expires in 5 minutes.`
+  );
+});
+
+bot.action(/^sub:tier:(daily|weekly|monthly)$/, async (ctx) => {
+  await safeAnswerCbQuery(ctx);
+
+  const tierId = ctx.match[1] as SubscriptionTierId;
+  const tier = SUBSCRIPTION_TIERS[tierId];
+
+  await ctx.reply(
+    `💳 ${tier.label} Plan
+
+Price: $${tier.amountUsd}
+Access: ${tier.description}
+
+Choose payment chain:`,
+    getChainSelectionKeyboard(tierId)
+  );
+});
+
+bot.action(/^sub:chain:(daily|weekly|monthly):(ethereum|solana|bsc|arbitrum|base)$/, async (ctx) => {
+  await safeAnswerCbQuery(ctx);
+
+  const tierId = ctx.match[1] as SubscriptionTierId;
+  const chain = ctx.match[2] as PaymentChainId;
+
+  await ctx.reply(
+    `Choose token for ${SUBSCRIPTION_TIERS[tierId].label} on ${PAYMENT_CHAINS[chain].label}:`,
+    getTokenSelectionKeyboard(tierId, chain)
+  );
+});
+
+bot.action(/^sub:pay:(daily|weekly|monthly):(ethereum|solana|bsc|arbitrum|base):(USDC|USDT)$/, async (ctx) => {
+  await safeAnswerCbQuery(ctx);
+
+  const telegramId = getTelegramUserId(ctx);
+
+  if (!telegramId) {
+    await ctx.reply("❌ Could not read your Telegram ID.");
+    return;
+  }
+
+  const tierId = ctx.match[1] as SubscriptionTierId;
+  const chain = ctx.match[2] as PaymentChainId;
+  const token = ctx.match[3] as PaymentToken;
+
+  try {
+    const payment = createPaymentRequest({
+      telegramId,
+      username: ctx.from?.username,
+      firstName: ctx.from?.first_name,
+      tierId,
+      chain,
+      token
+    });
+
+    await ctx.reply(
+      `💳 Fibre Payment Request
+
+Payment ID:
+${payment.paymentId}
+
+Plan: ${SUBSCRIPTION_TIERS[tierId].label}
+Access: ${payment.accessDays} day(s)
+Amount: $${payment.amountUsd}
+Token: ${payment.token}
+Chain: ${PAYMENT_CHAINS[payment.chain].label}
+
+Send exactly:
+${payment.amountUsd} ${payment.token}
+
+To:
+${payment.paymentAddress}
+
+After payment, submit tx hash:
+
+/paytx ${payment.paymentId} YOUR_TX_HASH
+
+Note:
+Payment verification is manual for this beta build. Your access starts after owner approval.`
+    );
+  } catch (error) {
+    await ctx.reply(`❌ Could not create payment request.\n\nReason:\n${getSafeErrorMessage(error)}`);
+  }
+});
+
+bot.command("redeem", async (ctx) => {
+  const parts = parseCommandParts(ctx.message.text);
+  const code = parts[1]?.trim();
+
+  if (!code) {
+    await ctx.reply("Use:\n/redeem PHANTOM-XXXX-XXXX");
+    return;
+  }
+
+  const telegramId = getTelegramUserId(ctx);
+
+  if (!telegramId) {
+    await ctx.reply("❌ Could not read your Telegram ID.");
+    return;
+  }
+
+  const result = redeemBetaAccessCode({
+    code,
+    telegramId,
+    ...(ctx.from?.username ? { username: ctx.from.username } : {}),
+    ...(ctx.from?.first_name ? { firstName: ctx.from.first_name } : {})
+  });
+
+  if (!result.ok) {
+    const reasonMap: Record<string, string> = {
+      invalid_code: "Invalid access code.",
+      code_revoked: "This access code has been revoked.",
+      code_expired: "This access code has expired.",
+      code_fully_used: "This access code has already been fully used."
+    };
+
+    await ctx.reply(`❌ Access denied.\n\nReason: ${reasonMap[result.reason] || result.reason}`);
+    return;
+  }
+
+  await ctx.reply(
+    `✅ Access granted.
+
+Your Fibre beta access is active until:
+${formatAccessDate(result.expiresAt)}
+
+Run /mintflow to begin.`
+  );
+});
+
+bot.command("paytx", async (ctx) => {
+  const parts = parseCommandParts(ctx.message.text);
+  const paymentId = parts[1]?.trim();
+  const txHash = parts[2]?.trim();
+
+  if (!paymentId || !txHash) {
+    await ctx.reply("Use:\n/paytx paymentId txHash");
+    return;
+  }
+
+  const telegramId = getTelegramUserId(ctx);
+
+  if (!telegramId) {
+    await ctx.reply("❌ Could not read your Telegram ID.");
+    return;
+  }
+
+  const result = attachPaymentTxHash({
+    paymentId,
+    telegramId,
+    txHash
+  });
+
+  if (!result.ok) {
+    await ctx.reply(`❌ Could not attach tx hash.\n\nReason: ${result.reason}`);
+    return;
+  }
+
+  await ctx.reply(
+    `✅ Payment tx submitted.
+
+Payment ID:
+${paymentId}
+
+Tx:
+${txHash}
+
+Owner will approve after verification.`
+  );
+});
+
+bot.command("accessstatus", async (ctx) => {
+  if (!(await requireOwner(ctx))) return;
+  await ctx.reply(formatAccessControlStatusMessage());
+});
+
+bot.command("createaccesscode", async (ctx) => {
+  if (!(await requireOwner(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const maxUsesRaw = parts[1]?.trim();
+  const daysRaw = parts[2]?.trim();
+  const note = parts.slice(3).join(" ").trim() || undefined;
+
+  const maxUses = maxUsesRaw ? Number(maxUsesRaw) : 1;
+  const daysValid = daysRaw ? Number(daysRaw) : 30;
+
+  if (!Number.isFinite(maxUses) || maxUses < 1) {
+    await ctx.reply("Use:\n/createaccesscode 1 30 optional-note");
+    return;
+  }
+
+  if (!Number.isFinite(daysValid) || daysValid < 1) {
+    await ctx.reply("Use:\n/createaccesscode 1 30 optional-note");
+    return;
+  }
+
+  const ownerTelegramId = getRequiredTelegramUserId(ctx);
+  const created = createBetaAccessCode({
+    createdByTelegramId: ownerTelegramId,
+    maxUses,
+    daysValid,
+    note
+  });
+
+  await ctx.reply(
+    `✅ Access code created.
+
+Code:
+${created.code}
+
+Label:
+${created.record.label}
+
+Max Uses: ${created.record.maxUses}
+Expires: ${formatAccessDate(created.record.expiresAt)}
+
+Tester should run:
+/redeem ${created.code}`
+  );
+});
+
+bot.command("accessusers", async (ctx) => {
+  if (!(await requireOwner(ctx))) return;
+  await replyLong(ctx, formatBetaUsersMessage());
+});
+
+bot.command("accesscodes", async (ctx) => {
+  if (!(await requireOwner(ctx))) return;
+  await replyLong(ctx, formatBetaCodesMessage());
+});
+
+bot.command("paymentrequests", async (ctx) => {
+  if (!(await requireOwner(ctx))) return;
+  await replyLong(ctx, formatPaymentRequestsMessage());
+});
+
+bot.command("approvepayment", async (ctx) => {
+  if (!(await requireOwner(ctx))) return;
+
+  const paymentId = parseCommandParts(ctx.message.text)[1]?.trim();
+
+  if (!paymentId) {
+    await ctx.reply("Use:\n/approvepayment paymentId");
+    return;
+  }
+
+  const result = approvePaymentRequest({
+    paymentId,
+    approvedByTelegramId: getRequiredTelegramUserId(ctx)
+  });
+
+  if (!result.ok) {
+    await ctx.reply(`❌ Could not approve payment.\n\nReason: ${result.reason}`);
+    return;
+  }
+
+  await ctx.reply(
+    `✅ Payment approved.
+
+Payment ID:
+${paymentId}
+
+User:
+${result.payment.telegramId}
+
+Access expires:
+${formatAccessDate(result.expiresAt)}`
+  );
+});
+
+bot.command("rejectpayment", async (ctx) => {
+  if (!(await requireOwner(ctx))) return;
+
+  const parts = parseCommandParts(ctx.message.text);
+  const paymentId = parts[1]?.trim();
+  const note = parts.slice(2).join(" ").trim() || undefined;
+
+  if (!paymentId) {
+    await ctx.reply("Use:\n/rejectpayment paymentId optional-note");
+    return;
+  }
+
+  const result = rejectPaymentRequest({
+    paymentId,
+    rejectedByTelegramId: getRequiredTelegramUserId(ctx),
+    note
+  });
+
+  if (!result.ok) {
+    await ctx.reply(`❌ Could not reject payment.\n\nReason: ${result.reason}`);
+    return;
+  }
+
+  await ctx.reply(`✅ Payment rejected: ${paymentId}`);
+});
+
+bot.command("revokeaccess", async (ctx) => {
+  if (!(await requireOwner(ctx))) return;
+
+  const telegramId = parseCommandParts(ctx.message.text)[1]?.trim();
+
+  if (!telegramId) {
+    await ctx.reply("Use:\n/revokeaccess telegramId");
+    return;
+  }
+
+  const user = revokeBetaAccessUser(telegramId);
+
+  if (!user) {
+    await ctx.reply("No access user found with that Telegram ID.");
+    return;
+  }
+
+  await ctx.reply(`✅ Revoked access for ${telegramId}.`);
+});
+
+bot.command("revokeaccesscode", async (ctx) => {
+  if (!(await requireOwner(ctx))) return;
+
+  const label = parseCommandParts(ctx.message.text)[1]?.trim();
+
+  if (!label) {
+    await ctx.reply("Use:\n/revokeaccesscode code_label");
+    return;
+  }
+
+  const code = revokeBetaAccessCode(label);
+
+  if (!code) {
+    await ctx.reply("No access code found with that label.");
+    return;
+  }
+
+  await ctx.reply(`✅ Revoked access code ${label}.`);
+});
+
+
 bot.command("hardeningstatus", async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
 
@@ -15376,6 +16048,11 @@ bot.on("callback_query", async (ctx) => {
 
 
 bot.on("text", async (ctx) => {
+  if (await handlePendingAccessCodeText(ctx)) {
+    return;
+  }
+
+
   if (ctx.chat?.type !== "private") {
     return;
   }
