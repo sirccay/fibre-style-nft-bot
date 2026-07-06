@@ -152,7 +152,6 @@ const BOT_COMMANDS = [
   { command: "start", description: "Open bot menu" },
   { command: "access", description: "Show subscription access" },
   { command: "redeem", description: "Redeem access code" },
-  { command: "paytx", description: "Submit payment tx hash" },
   { command: "accessstatus", description: "Owner: access status" },
   { command: "createaccesscode", description: "Owner: create access code" },
   { command: "accessusers", description: "Owner: list access users" },
@@ -15427,6 +15426,97 @@ Start here:
 }
 
 
+
+const PAYMENT_TX_PROMPT_TTL_MS = 10 * 60 * 1000;
+const pendingPaymentTxPrompts = new Map<string, { paymentId: string; expiresAt: number }>();
+
+function setPendingPaymentTxPrompt(telegramId: string, paymentId: string) {
+  pendingPaymentTxPrompts.set(telegramId, {
+    paymentId,
+    expiresAt: Date.now() + PAYMENT_TX_PROMPT_TTL_MS
+  });
+}
+
+function clearPendingPaymentTxPrompt(telegramId: string) {
+  pendingPaymentTxPrompts.delete(telegramId);
+}
+
+function getPendingPaymentTxPrompt(telegramId: string) {
+  const prompt = pendingPaymentTxPrompts.get(telegramId);
+
+  if (!prompt) {
+    return null;
+  }
+
+  if (prompt.expiresAt <= Date.now()) {
+    pendingPaymentTxPrompts.delete(telegramId);
+    return null;
+  }
+
+  return prompt;
+}
+
+async function handlePendingPaymentTxText(ctx: Context) {
+  const telegramId = getTelegramUserId(ctx);
+
+  if (!telegramId) {
+    return false;
+  }
+
+  const prompt = getPendingPaymentTxPrompt(telegramId);
+
+  if (!prompt) {
+    return false;
+  }
+
+  if (!ctx.message || !("text" in ctx.message)) {
+    return false;
+  }
+
+  const txHash = ctx.message.text.trim();
+
+  if (!txHash || txHash.startsWith("/")) {
+    return false;
+  }
+
+  clearPendingPaymentTxPrompt(telegramId);
+
+  const result = attachPaymentTxHash({
+    paymentId: prompt.paymentId,
+    telegramId,
+    txHash
+  });
+
+  if (!result.ok) {
+    await ctx.reply(
+      `❌ Could not submit payment tx.
+
+Reason:
+${result.reason}
+
+Tap “✅ I have paid” again if you want to retry.`
+    );
+    return true;
+  }
+
+  await ctx.reply(
+    `✅ Payment tx submitted.
+
+Payment ID:
+${prompt.paymentId}
+
+Tx:
+${txHash}
+
+Your payment is now pending owner approval.
+
+You’ll get access after verification.`
+  );
+
+  return true;
+}
+
+
 function formatAccessDate(value?: string) {
   return value ? new Date(value).toISOString().slice(0, 10) : "none";
 }
@@ -15714,17 +15804,47 @@ ${payment.amountUsd} ${payment.token}
 To:
 ${payment.paymentAddress}
 
-After payment, submit tx hash:
-
-/paytx ${payment.paymentId} YOUR_TX_HASH
+After payment, tap “✅ I have paid”, then paste your transaction hash.
 
 Note:
-Payment verification is manual for this beta build. Your access starts after owner approval.`
+Payment verification is manual for this beta build. Your access starts after owner approval.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("✅ I have paid", `sub:paid:${payment.paymentId}`)],
+        [Markup.button.callback("Change plan", "sub:start")]
+      ])
     );
   } catch (error) {
     await ctx.reply(`❌ Could not create payment request.\n\nReason:\n${getSafeErrorMessage(error)}`);
   }
 });
+
+
+bot.action(/^sub:paid:([0-9a-f-]{6,64})$/, async (ctx) => {
+  await safeAnswerCbQuery(ctx);
+
+  const telegramId = getTelegramUserId(ctx);
+
+  if (!telegramId) {
+    await ctx.reply("❌ Could not read your Telegram ID.");
+    return;
+  }
+
+  const paymentId = ctx.match[1] || "";
+
+  setPendingPaymentTxPrompt(telegramId, paymentId);
+
+  await ctx.reply(
+    `✅ Payment confirmation
+
+Payment ID:
+${paymentId}
+
+Paste your transaction hash here and press send.
+
+This tx-hash window expires in 10 minutes.`
+  );
+});
+
 
 bot.command("redeem", async (ctx) => {
   const parts = parseCommandParts(ctx.message.text);
@@ -16048,6 +16168,11 @@ bot.on("callback_query", async (ctx) => {
 
 
 bot.on("text", async (ctx) => {
+  if (await handlePendingPaymentTxText(ctx)) {
+    return;
+  }
+
+
   if (await handlePendingAccessCodeText(ctx)) {
     return;
   }
