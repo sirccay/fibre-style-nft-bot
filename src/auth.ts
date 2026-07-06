@@ -27,14 +27,14 @@ export function isAdmin(ctx: Context): boolean {
   return isOwner(ctx);
 }
 
-export function isAuthorizedBotUser(ctx: Context): boolean {
+export async function isAuthorizedBotUser(ctx: Context): Promise<boolean> {
   if (isOwner(ctx)) return true;
 
   if (!isPrivateBetaEnabled()) return false;
 
   const userId = getTelegramUserId(ctx);
 
-  return Boolean(userId && hasActiveBetaAccess(userId));
+  return Boolean(userId && (await hasActiveBetaAccess(userId)));
 }
 
 export async function requireOwner(ctx: Context): Promise<boolean> {
@@ -59,10 +59,10 @@ export async function requireAdmin(ctx: Context): Promise<boolean> {
     return false;
   }
 
-  if (isAuthorizedBotUser(ctx)) return true;
+  if (await isAuthorizedBotUser(ctx)) return true;
 
   const userId = getTelegramUserId(ctx);
-  const user = userId ? getBetaAccessUser(userId) : null;
+  const user = userId ? await getBetaAccessUser(userId) : null;
 
   if (isPrivateBetaEnabled()) {
     if (user?.status === "revoked") {
