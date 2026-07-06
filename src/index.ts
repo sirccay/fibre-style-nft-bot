@@ -15385,7 +15385,7 @@ async function handlePendingAccessCodeText(ctx: Context) {
 
   clearPendingAccessCodePrompt(telegramId);
 
-  const result = redeemBetaAccessCode({
+  const result = await redeemBetaAccessCode({
     code: input,
     telegramId,
     ...(ctx.from?.username ? { username: ctx.from.username } : {}),
@@ -15481,7 +15481,7 @@ async function handlePendingPaymentTxText(ctx: Context) {
 
   clearPendingPaymentTxPrompt(telegramId);
 
-  const result = attachPaymentTxHash({
+  const result = await attachPaymentTxHash({
     paymentId: prompt.paymentId,
     telegramId,
     txHash
@@ -15594,9 +15594,9 @@ function getTokenSelectionKeyboard(tierId: SubscriptionTierId, chain: PaymentCha
   ]);
 }
 
-function formatPrivateBetaStatusMessage(ctx: Context) {
+async function formatPrivateBetaStatusMessage(ctx: Context) {
   const telegramId = getTelegramUserId(ctx);
-  const user = telegramId ? getBetaAccessUser(telegramId) : null;
+  const user = telegramId ? await getBetaAccessUser(telegramId) : null;
 
   return `🔐 Fibre Access
 
@@ -15615,10 +15615,12 @@ To subscribe:
 /start`;
 }
 
-function formatAccessControlStatusMessage() {
-  const status = getAccessControlStatus();
+async function formatAccessControlStatusMessage() {
+  const status = await getAccessControlStatus();
 
   return `🔐 Access Control Status
+
+Store: ${status.storeMode}
 
 PRIVATE_BETA_ENABLED: ${status.privateBetaEnabled ? "true" : "false"}
 
@@ -15636,8 +15638,8 @@ Payments:
 - Rejected: ${status.rejectedPayments}`;
 }
 
-function formatBetaUsersMessage() {
-  const users = listBetaAccessUsers();
+async function formatBetaUsersMessage() {
+  const users = await listBetaAccessUsers();
 
   if (users.length === 0) return "No access users yet.";
 
@@ -15651,8 +15653,8 @@ function formatBetaUsersMessage() {
   ].join("\n");
 }
 
-function formatBetaCodesMessage() {
-  const codes = listBetaAccessCodes();
+async function formatBetaCodesMessage() {
+  const codes = await listBetaAccessCodes();
 
   if (codes.length === 0) return "No access codes created yet.";
 
@@ -15666,8 +15668,8 @@ function formatBetaCodesMessage() {
   ].join("\n");
 }
 
-function formatPaymentRequestsMessage() {
-  const payments = listPaymentRequests();
+async function formatPaymentRequestsMessage() {
+  const payments = await listPaymentRequests();
 
   if (payments.length === 0) return "No payment requests yet.";
 
@@ -15683,7 +15685,7 @@ function formatPaymentRequestsMessage() {
 
 bot.command("start", async (ctx) => {
   const telegramId = getTelegramUserId(ctx);
-  const user = telegramId ? getBetaAccessUser(telegramId) : null;
+  const user = telegramId ? await getBetaAccessUser(telegramId) : null;
 
   if (telegramId && user?.status === "active") {
     await ctx.reply(
@@ -15701,7 +15703,7 @@ Use /mintflow to start minting.`
 });
 
 bot.command("access", async (ctx) => {
-  await ctx.reply(formatPrivateBetaStatusMessage(ctx));
+  await ctx.reply(await formatPrivateBetaStatusMessage(ctx));
 });
 
 bot.action("sub:start", async (ctx) => {
@@ -15777,7 +15779,7 @@ bot.action(/^sub:pay:(daily|weekly|monthly):(ethereum|solana|bsc|arbitrum|base):
   const token = ctx.match[3] as PaymentToken;
 
   try {
-    const payment = createPaymentRequest({
+    const payment = await createPaymentRequest({
       telegramId,
       username: ctx.from?.username,
       firstName: ctx.from?.first_name,
@@ -15862,7 +15864,7 @@ bot.command("redeem", async (ctx) => {
     return;
   }
 
-  const result = redeemBetaAccessCode({
+  const result = await redeemBetaAccessCode({
     code,
     telegramId,
     ...(ctx.from?.username ? { username: ctx.from.username } : {}),
@@ -15908,7 +15910,7 @@ bot.command("paytx", async (ctx) => {
     return;
   }
 
-  const result = attachPaymentTxHash({
+  const result = await attachPaymentTxHash({
     paymentId,
     telegramId,
     txHash
@@ -15934,7 +15936,7 @@ Owner will approve after verification.`
 
 bot.command("accessstatus", async (ctx) => {
   if (!(await requireOwner(ctx))) return;
-  await ctx.reply(formatAccessControlStatusMessage());
+  await ctx.reply(await formatAccessControlStatusMessage());
 });
 
 bot.command("createaccesscode", async (ctx) => {
@@ -15959,7 +15961,7 @@ bot.command("createaccesscode", async (ctx) => {
   }
 
   const ownerTelegramId = getRequiredTelegramUserId(ctx);
-  const created = createBetaAccessCode({
+  const created = await createBetaAccessCode({
     createdByTelegramId: ownerTelegramId,
     maxUses,
     daysValid,
@@ -15985,17 +15987,17 @@ Tester should run:
 
 bot.command("accessusers", async (ctx) => {
   if (!(await requireOwner(ctx))) return;
-  await replyLong(ctx, formatBetaUsersMessage());
+  await replyLong(ctx, await formatBetaUsersMessage());
 });
 
 bot.command("accesscodes", async (ctx) => {
   if (!(await requireOwner(ctx))) return;
-  await replyLong(ctx, formatBetaCodesMessage());
+  await replyLong(ctx, await formatBetaCodesMessage());
 });
 
 bot.command("paymentrequests", async (ctx) => {
   if (!(await requireOwner(ctx))) return;
-  await replyLong(ctx, formatPaymentRequestsMessage());
+  await replyLong(ctx, await formatPaymentRequestsMessage());
 });
 
 bot.command("approvepayment", async (ctx) => {
@@ -16008,7 +16010,7 @@ bot.command("approvepayment", async (ctx) => {
     return;
   }
 
-  const result = approvePaymentRequest({
+  const result = await approvePaymentRequest({
     paymentId,
     approvedByTelegramId: getRequiredTelegramUserId(ctx)
   });
@@ -16044,7 +16046,7 @@ bot.command("rejectpayment", async (ctx) => {
     return;
   }
 
-  const result = rejectPaymentRequest({
+  const result = await rejectPaymentRequest({
     paymentId,
     rejectedByTelegramId: getRequiredTelegramUserId(ctx),
     note
@@ -16068,7 +16070,7 @@ bot.command("revokeaccess", async (ctx) => {
     return;
   }
 
-  const user = revokeBetaAccessUser(telegramId);
+  const user = await revokeBetaAccessUser(telegramId);
 
   if (!user) {
     await ctx.reply("No access user found with that Telegram ID.");
@@ -16088,7 +16090,7 @@ bot.command("revokeaccesscode", async (ctx) => {
     return;
   }
 
-  const code = revokeBetaAccessCode(label);
+  const code = await revokeBetaAccessCode(label);
 
   if (!code) {
     await ctx.reply("No access code found with that label.");
