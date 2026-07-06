@@ -9,7 +9,9 @@
     "wallet:add": "tsx src/addWallet.ts",
     "wallet:claim": "tsx src/claimWallet.ts",
     "deploy:testnft": "tsx src/deployTestNft.ts",
-    "data:check": "tsx src/checkData.ts"
+    "data:check": "tsx src/checkData.ts",
+    "access:db:init": "tsx src/initAccessDb.ts",
+    "access:db:migrate": "tsx src/migrateAccessJsonToPostgres.ts"
   },
   "keywords": [],
   "author": "",
@@ -22,6 +24,7 @@
     "@opensea/sdk": "^11.1.1",
     "dotenv": "^17.4.2",
     "ethers": "^6.17.0",
+    "pg": "^8.22.0",
     "solc": "^0.8.35",
     "telegraf": "^4.16.3",
     "tsx": "^4.22.4",
@@ -29,6 +32,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/node": "^26.1.0"
+    "@types/node": "^26.1.0",
+    "@types/pg": "^8.20.0"
   }
 }
