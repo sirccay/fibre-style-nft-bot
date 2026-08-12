@@ -405,7 +405,7 @@ function normalizeStoredMintTarget(raw: any): MintTarget | null {
     targetId: raw.targetId,
     ownerTelegramId: raw.ownerTelegramId,
     name: raw.name,
-    chain: raw.chain === "sepolia" ? "sepolia" : "mainnet",
+    chain: raw.chain === "sepolia" ? "sepolia" : raw.chain === "robinhood" ? "robinhood" : "mainnet",
     contractAddress: raw.contractAddress,
     ...(functionSignature ? { functionSignature } : {}),
     quantity,

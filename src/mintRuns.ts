@@ -139,7 +139,7 @@ function normalizeStoredMintRun(raw: any): MintRun | null {
       : {}),
     walletLabel: raw.walletLabel,
     walletAddress: raw.walletAddress,
-    chain: raw.chain === "sepolia" ? "sepolia" : "mainnet",
+    chain: raw.chain === "sepolia" ? "sepolia" : raw.chain === "robinhood" ? "robinhood" : "mainnet",
     contractAddress: raw.contractAddress,
     functionSignature: raw.functionSignature,
     quantity,
