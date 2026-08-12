@@ -260,7 +260,7 @@ function normalizeStoredMultiMintJob(raw: any): MultiMintJob | null {
     ownerTelegramId: raw.ownerTelegramId,
     targetId: raw.targetId,
     targetName: raw.targetName,
-    chain: raw.chain === "sepolia" ? "sepolia" : "mainnet",
+    chain: raw.chain === "sepolia" ? "sepolia" : raw.chain === "robinhood" ? "robinhood" : "mainnet",
     contractAddress: raw.contractAddress,
     functionSignature: raw.functionSignature,
     quantity,

@@ -165,7 +165,15 @@ const DETECTOR_CHAINS: DetectorChainConfig[] = [
     rpcEnvNames: ["SEPOLIA_RPC_URL", "ETH_SEPOLIA_RPC_URL"],
     reservoirBaseUrl: "https://api-sepolia.reservoir.tools",
     explorerHosts: ["sepolia.etherscan.io"]
-  }
+  },
+{
+name: "robinhood",
+chainId: 4663,
+aliases: ["robinhood", "robinhood_chain", "robinhood-chain"],
+rpcEnvNames: ["ROBINHOOD_MAINNET_RPC_URL"],
+reservoirBaseUrl: "https://api.robinhood.com",
+explorerHosts: ["robinhoodchain.blockscout.com"]
+}
 ];
 
 const MINT_NAME_PATTERNS = [

@@ -10,7 +10,7 @@ import {
 } from "./gasStrategy.js";
 import type { GasStrategy } from "./gasStrategy.js";
 
-export type MintChain = "mainnet" | "sepolia";
+export type MintChain = "mainnet" | "sepolia" | "robinhood";
 
 export type SupportedMintFunctionSignature =
   | "mint(uint256)"
@@ -128,7 +128,15 @@ export function normalizeMintChain(rawChain?: string): MintChain {
     return "sepolia";
   }
 
-  throw new Error("Chain must be mainnet or sepolia.");
+  if (
+    normalized === "robinhood" ||
+    normalized === "robinhood_chain" ||
+    normalized === "robinhood-chain"
+  ) {
+    return "robinhood";
+  }
+
+  throw new Error("Chain must be mainnet, sepolia, or robinhood.");
 }
 
 export function normalizeMintFunctionSignature(
@@ -176,11 +184,24 @@ export function getMintRpcStatus() {
     sepoliaRpcConfigured: Boolean(
       process.env.SEPOLIA_RPC_URL?.trim() ||
         process.env.ETH_SEPOLIA_RPC_URL?.trim()
+    ),
+    robinhoodRpcConfigured: Boolean(
+      process.env.ROBINHOOD_MAINNET_RPC_URL?.trim()
     )
   };
 }
 
 export function getMintProvider(chain: MintChain) {
+  if (chain === "robinhood") {
+    const rpcUrl = process.env.ROBINHOOD_MAINNET_RPC_URL;
+
+    if (!rpcUrl) {
+      throw new Error("Missing ROBINHOOD_MAINNET_RPC_URL");
+    }
+
+    return new ethers.JsonRpcProvider(rpcUrl);
+  }
+
   if (chain === "mainnet") {
     const rpcUrl = process.env.ETH_MAINNET_RPC_URL;
 

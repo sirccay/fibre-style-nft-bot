@@ -40,6 +40,7 @@ export type DetectedChainName =
   | "base"
   | "arbitrum"
   | "polygon"
+  | "robinhood"
   | "unknown";
 
 export type MintFunctionCandidate = {
@@ -178,7 +179,11 @@ const CHAIN_DETAILS: Record<
   sepolia: { chainId: 11155111, aliases: ["sepolia"] },
   base: { chainId: 8453, aliases: ["base"] },
   arbitrum: { chainId: 42161, aliases: ["arbitrum", "arb", "arbitrum-one"] },
-  polygon: { chainId: 137, aliases: ["polygon", "matic"] }
+  polygon: { chainId: 137, aliases: ["polygon", "matic"] },
+  robinhood: {
+    chainId: 4663,
+    aliases: ["robinhood", "robinhood_chain", "robinhood-chain"]
+  }
 };
 
 function normalizeChain(rawChain?: string | null): {
@@ -208,7 +213,11 @@ function normalizeChain(rawChain?: string | null): {
 export function toSupportedMintChain(
   chainName: DetectedChainName
 ): MintChain | null {
-  if (chainName === "mainnet" || chainName === "sepolia") {
+  if (
+    chainName === "mainnet" ||
+    chainName === "sepolia" ||
+    chainName === "robinhood"
+  ) {
     return chainName;
   }
 

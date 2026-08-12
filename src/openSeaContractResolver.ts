@@ -130,6 +130,17 @@ function mapOpenSeaChainToMintChain(rawChain?: string): {
     return { chainName: "sepolia", supportedMintChain: "sepolia" };
   }
 
+  if (
+    normalized === "robinhood" ||
+    normalized === "robinhood_chain" ||
+    normalized === "robinhood-chain"
+  ) {
+    return {
+      chainName: "robinhood",
+      supportedMintChain: "robinhood"
+    };
+  }
+
   return { chainName: normalized };
 }
 
